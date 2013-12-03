@@ -118,6 +118,7 @@ enum bpf_map_type {
 enum bpf_prog_type {
 	BPF_PROG_TYPE_UNSPEC,
 	BPF_PROG_TYPE_SOCKET_FILTER,
+	BPF_PROG_TYPE_TRACING_FILTER,
 };
 
 /* flags for BPF_MAP_UPDATE_ELEM command */
@@ -162,6 +163,13 @@ enum bpf_func_id {
 	BPF_FUNC_map_lookup_elem, /* void *map_lookup_elem(&map, &key) */
 	BPF_FUNC_map_update_elem, /* int map_update_elem(&map, &key, &value, flags) */
 	BPF_FUNC_map_delete_elem, /* int map_delete_elem(&map, &key) */
+	BPF_FUNC_fetch_ptr,       /* void *bpf_fetch_ptr(void *unsafe_ptr) */
+	BPF_FUNC_fetch_u64,       /* u64 bpf_fetch_u64(void *unsafe_ptr) */
+	BPF_FUNC_fetch_u32,       /* u32 bpf_fetch_u32(void *unsafe_ptr) */
+	BPF_FUNC_fetch_u16,       /* u16 bpf_fetch_u16(void *unsafe_ptr) */
+	BPF_FUNC_fetch_u8,        /* u8 bpf_fetch_u8(void *unsafe_ptr) */
+	BPF_FUNC_memcmp,          /* int bpf_memcmp(void *unsafe_ptr, void *safe_ptr, int size) */
+	BPF_FUNC_dump_stack,      /* void bpf_dump_stack(void) */
 	__BPF_FUNC_MAX_ID,
 };
 

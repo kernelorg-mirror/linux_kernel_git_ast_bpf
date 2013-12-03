@@ -62,6 +62,10 @@
 
 #include "qgroup.h"
 #define CREATE_TRACE_POINTS
+/* dummy definition to make compiler happy */
+struct __btrfs_workqueue {
+	char dummy;
+};
 #include <trace/events/btrfs.h>
 
 static const struct super_operations btrfs_super_ops;
