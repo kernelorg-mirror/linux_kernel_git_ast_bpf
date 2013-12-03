@@ -23,6 +23,9 @@
 #include <linux/mutex.h>
 #include <linux/perf_event.h>
 #include <linux/slab.h>
+#include <linux/bpf.h>
+#include <trace/bpf_trace.h>
+#include <linux/filter.h>
 
 #include "trace.h"
 #include "trace_output.h"
@@ -535,6 +538,16 @@ static int filter_match_preds_cb(enum move_type move, struct filter_pred *pred,
 	return WALK_PRED_DEFAULT;
 }
 
+void trace_filter_call_bpf(struct event_filter *filter, struct bpf_context *ctx)
+{
+	BUG_ON(!filter || !filter->prog);
+
+	rcu_read_lock();
+	BPF_PROG_RUN(filter->prog, (void *) ctx);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(trace_filter_call_bpf);
+
 /* return 1 if event matches, 0 otherwise (discard) */
 int filter_match_preds(struct event_filter *filter, void *rec)
 {
@@ -789,6 +802,8 @@ static void __free_filter(struct event_filter *filter)
 	if (!filter)
 		return;
 
+	if (filter->prog)
+		bpf_prog_put(filter->prog);
 	__free_preds(filter);
 	kfree(filter->filter_string);
 	kfree(filter);
@@ -1857,6 +1872,48 @@ static int create_filter_start(char *filter_str, bool set_str,
 	return err;
 }
 
+static int create_filter_bpf(char *filter_str, struct event_filter **filterp)
+{
+	struct event_filter *filter;
+	struct bpf_prog *prog;
+	long ufd;
+	int err = 0;
+
+	*filterp = NULL;
+
+	filter = __alloc_filter();
+	if (!filter)
+		return -ENOMEM;
+
+	err = replace_filter_string(filter, filter_str);
+	if (err)
+		goto free_filter;
+
+	err = kstrtol(filter_str + 4, 0, &ufd);
+	if (err)
+		goto free_filter;
+
+	err = -ESRCH;
+	prog = bpf_prog_get(ufd);
+	if (!prog)
+		goto free_filter;
+
+	filter->prog = prog;
+
+	err = -EINVAL;
+	if (prog->aux->prog_type != BPF_PROG_TYPE_TRACING_FILTER)
+		/* prog_id is valid, but it's not a tracing filter program */
+		goto free_filter;
+
+	*filterp = filter;
+
+	return 0;
+
+free_filter:
+	__free_filter(filter);
+	return err;
+}
+
 static void create_filter_finish(struct filter_parse_state *ps)
 {
 	if (ps) {
@@ -1966,7 +2023,20 @@ int apply_event_filter(struct ftrace_event_file *file, char *filter_string)
 		return 0;
 	}
 
-	err = create_filter(call, filter_string, true, &filter);
+	/*
+	 * 'bpf_123' string is a request to attach eBPF program with id == 123
+	 * also accept 'bpf 123', 'bpf.123', 'bpf-123' variants
+	 */
+	if (memcmp(filter_string, "bpf", 3) == 0 && filter_string[3] != 0 &&
+	    filter_string[4] != 0) {
+		err = create_filter_bpf(filter_string, &filter);
+		if (!err)
+			call->flags |= TRACE_EVENT_FL_BPF;
+	} else {
+		err = create_filter(call, filter_string, true, &filter);
+		if (!err)
+			call->flags &= ~TRACE_EVENT_FL_BPF;
+	}
 
 	/*
 	 * Always swap the call filter with the new filter

@@ -7,6 +7,7 @@
 #include <linux/ftrace.h>
 #include <linux/perf_event.h>
 #include <asm/syscall.h>
+#include <trace/bpf_trace.h>
 
 #include "trace_output.h"
 #include "trace.h"
@@ -299,6 +300,21 @@ static int __init syscall_exit_define_fields(struct ftrace_event_call *call)
 	return ret;
 }
 
+static void populate_bpf_ctx(struct bpf_context *ctx, struct pt_regs *regs)
+{
+	struct task_struct *task = current;
+	unsigned long args[6];
+
+	syscall_get_arguments(task, regs, 0, 6, args);
+	ctx->arg1 = args[0];
+	ctx->arg2 = args[1];
+	ctx->arg3 = args[2];
+	ctx->arg4 = args[3];
+	ctx->arg5 = args[4];
+	ctx->arg6 = args[5];
+	ctx->ret = syscall_get_return_value(task, regs);
+}
+
 static void ftrace_syscall_enter(void *data, struct pt_regs *regs, long id)
 {
 	struct trace_array *tr = data;
@@ -327,6 +343,14 @@ static void ftrace_syscall_enter(void *data, struct pt_regs *regs, long id)
 	sys_data = syscall_nr_to_meta(syscall_nr);
 	if (!sys_data)
 		return;
+
+	if (ftrace_file->event_call->flags & TRACE_EVENT_FL_BPF) {
+		struct bpf_context ctx;
+
+		populate_bpf_ctx(&ctx, regs);
+		trace_filter_call_bpf(ftrace_file->filter, &ctx);
+		return;
+	}
 
 	size = sizeof(*entry) + sizeof(unsigned long) * sys_data->nb_args;
 
@@ -374,6 +398,14 @@ static void ftrace_syscall_exit(void *data, struct pt_regs *regs, long ret)
 	sys_data = syscall_nr_to_meta(syscall_nr);
 	if (!sys_data)
 		return;
+
+	if (ftrace_file->event_call->flags & TRACE_EVENT_FL_BPF) {
+		struct bpf_context ctx;
+
+		populate_bpf_ctx(&ctx, regs);
+		trace_filter_call_bpf(ftrace_file->filter, &ctx);
+		return;
+	}
 
 	local_save_flags(irq_flags);
 	pc = preempt_count();

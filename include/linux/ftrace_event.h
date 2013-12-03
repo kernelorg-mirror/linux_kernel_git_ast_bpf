@@ -237,6 +237,7 @@ enum {
 	TRACE_EVENT_FL_WAS_ENABLED_BIT,
 	TRACE_EVENT_FL_USE_CALL_FILTER_BIT,
 	TRACE_EVENT_FL_TRACEPOINT_BIT,
+	TRACE_EVENT_FL_BPF_BIT,
 };
 
 /*
@@ -259,6 +260,7 @@ enum {
 	TRACE_EVENT_FL_WAS_ENABLED	= (1 << TRACE_EVENT_FL_WAS_ENABLED_BIT),
 	TRACE_EVENT_FL_USE_CALL_FILTER	= (1 << TRACE_EVENT_FL_USE_CALL_FILTER_BIT),
 	TRACE_EVENT_FL_TRACEPOINT	= (1 << TRACE_EVENT_FL_TRACEPOINT_BIT),
+	TRACE_EVENT_FL_BPF		= (1 << TRACE_EVENT_FL_BPF_BIT),
 };
 
 struct ftrace_event_call {
@@ -532,6 +534,9 @@ event_trigger_unlock_commit_regs(struct ftrace_event_file *file,
 	if (tt)
 		event_triggers_post_call(file, tt);
 }
+
+struct bpf_context;
+void trace_filter_call_bpf(struct event_filter *filter, struct bpf_context *ctx);
 
 enum {
 	FILTER_OTHER = 0,

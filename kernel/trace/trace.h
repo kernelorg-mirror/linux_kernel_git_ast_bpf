@@ -986,12 +986,15 @@ struct ftrace_event_field {
 	int			is_signed;
 };
 
+struct bpf_prog;
+
 struct event_filter {
 	int			n_preds;	/* Number assigned */
 	int			a_preds;	/* allocated */
 	struct filter_pred	*preds;
 	struct filter_pred	*root;
 	char			*filter_string;
+	struct bpf_prog		*prog;
 };
 
 struct event_subsystem {
