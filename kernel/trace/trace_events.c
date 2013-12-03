@@ -1084,6 +1084,26 @@ event_filter_read(struct file *filp, char __user *ubuf, size_t cnt,
 	return r;
 }
 
+static int event_filter_release(struct inode *inode, struct file *filp)
+{
+	struct ftrace_event_file *file;
+	char buf[2] = "0";
+
+	mutex_lock(&event_mutex);
+	file = event_file_data(filp);
+	if (file) {
+		if (file->flags & TRACE_EVENT_FL_BPF) {
+			/* auto-disable the filter */
+			ftrace_event_enable_disable(file, 0);
+
+			/* if BPF filter was used, clear it on fd close */
+			apply_event_filter(file, buf);
+		}
+	}
+	mutex_unlock(&event_mutex);
+	return 0;
+}
+
 static ssize_t
 event_filter_write(struct file *filp, const char __user *ubuf, size_t cnt,
 		   loff_t *ppos)
@@ -1107,8 +1127,18 @@ event_filter_write(struct file *filp, const char __user *ubuf, size_t cnt,
 
 	mutex_lock(&event_mutex);
 	file = event_file_data(filp);
-	if (file)
+	if (file) {
+		/*
+		 * note to user space tools:
+		 * write() into debugfs/tracing/events/xxx/filter file
+		 * must be done with the same privilege level as open()
+		 */
 		err = apply_event_filter(file, buf);
+		if (!err && file->flags & TRACE_EVENT_FL_BPF)
+			/* once filter is applied, auto-enable it */
+			ftrace_event_enable_disable(file, 1);
+	}
+
 	mutex_unlock(&event_mutex);
 
 	free_page((unsigned long) buf);
@@ -1363,6 +1393,7 @@ static const struct file_operations ftrace_event_filter_fops = {
 	.open = tracing_open_generic,
 	.read = event_filter_read,
 	.write = event_filter_write,
+	.release = event_filter_release,
 	.llseek = default_llseek,
 };
 
