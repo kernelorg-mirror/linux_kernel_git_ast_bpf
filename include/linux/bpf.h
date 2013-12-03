@@ -130,10 +130,14 @@ struct bpf_prog_aux {
 
 #ifdef CONFIG_BPF_SYSCALL
 void bpf_prog_put(struct bpf_prog *prog);
+struct bpf_prog *bpf_prog_get(u32 ufd);
 #else
 static inline void bpf_prog_put(struct bpf_prog *prog) {}
+static inline struct bpf_prog *bpf_prog_get(u32 ufd)
+{
+	return ERR_PTR(-ENOENT);
+}
 #endif
-struct bpf_prog *bpf_prog_get(u32 ufd);
 /* verify correctness of eBPF program */
 int bpf_check(struct bpf_prog *fp, union bpf_attr *attr);
 

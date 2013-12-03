@@ -7,6 +7,7 @@
 #include <linux/ftrace.h>
 #include <linux/perf_event.h>
 #include <asm/syscall.h>
+#include <trace/bpf_trace.h>
 
 #include "trace_output.h"
 #include "trace.h"
@@ -545,11 +546,26 @@ static DECLARE_BITMAP(enabled_perf_exit_syscalls, NR_syscalls);
 static int sys_perf_refcount_enter;
 static int sys_perf_refcount_exit;
 
+static void populate_bpf_ctx(struct bpf_context *ctx, struct pt_regs *regs)
+{
+	struct task_struct *task = current;
+	unsigned long args[6];
+
+	syscall_get_arguments(task, regs, 0, 6, args);
+	ctx->arg1 = args[0];
+	ctx->arg2 = args[1];
+	ctx->arg3 = args[2];
+	ctx->arg4 = args[3];
+	ctx->arg5 = args[4];
+	ctx->arg6 = args[5];
+}
+
 static void perf_syscall_enter(void *ignore, struct pt_regs *regs, long id)
 {
 	struct syscall_metadata *sys_data;
 	struct syscall_trace_enter *rec;
 	struct hlist_head *head;
+	struct bpf_prog *prog;
 	int syscall_nr;
 	int rctx;
 	int size;
@@ -563,6 +579,15 @@ static void perf_syscall_enter(void *ignore, struct pt_regs *regs, long id)
 	sys_data = syscall_nr_to_meta(syscall_nr);
 	if (!sys_data)
 		return;
+
+	prog = sys_data->enter_event->prog;
+	if (prog) {
+		struct bpf_context ctx;
+
+		populate_bpf_ctx(&ctx, regs);
+		if (!trace_call_bpf(prog, &ctx))
+			return;
+	}
 
 	head = this_cpu_ptr(sys_data->enter_event->perf_events);
 	if (hlist_empty(head))
@@ -624,6 +649,7 @@ static void perf_syscall_exit(void *ignore, struct pt_regs *regs, long ret)
 	struct syscall_metadata *sys_data;
 	struct syscall_trace_exit *rec;
 	struct hlist_head *head;
+	struct bpf_prog *prog;
 	int syscall_nr;
 	int rctx;
 	int size;
@@ -637,6 +663,15 @@ static void perf_syscall_exit(void *ignore, struct pt_regs *regs, long ret)
 	sys_data = syscall_nr_to_meta(syscall_nr);
 	if (!sys_data)
 		return;
+
+	prog = sys_data->exit_event->prog;
+	if (prog) {
+		struct bpf_context ctx = {};
+
+		ctx.arg1 = syscall_get_return_value(current, regs);
+		if (!trace_call_bpf(prog, &ctx))
+			return;
+	}
 
 	head = this_cpu_ptr(sys_data->exit_event->perf_events);
 	if (hlist_empty(head))

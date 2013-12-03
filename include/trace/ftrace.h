@@ -17,6 +17,7 @@
  */
 
 #include <linux/ftrace_event.h>
+#include <trace/bpf_trace.h>
 
 /*
  * DECLARE_EVENT_CLASS can be used to add a generic function
@@ -755,12 +756,32 @@ __attribute__((section("_ftrace_events"))) *__event_##call = &event_##call
 #undef __perf_task
 #define __perf_task(t)	(__task = (t))
 
+/* zero extend integer, pointer or aggregate type to u64 without warnings */
+#define __CAST_TO_U64(EXPR) ({ \
+	u64 ret = 0; \
+	typeof(EXPR) expr = EXPR; \
+	switch (sizeof(expr)) { \
+	case 8: ret = *(u64 *) &expr; break; \
+	case 4: ret = *(u32 *) &expr; break; \
+	case 2: ret = *(u16 *) &expr; break; \
+	case 1: ret = *(u8 *) &expr; break; \
+	} \
+	ret; })
+
+#define __BPF_CAST1(a,...) __CAST_TO_U64(a)
+#define __BPF_CAST2(a,...) __CAST_TO_U64(a), __BPF_CAST1(__VA_ARGS__)
+#define __BPF_CAST3(a,...) __CAST_TO_U64(a), __BPF_CAST2(__VA_ARGS__)
+#define __BPF_CAST4(a,...) __CAST_TO_U64(a), __BPF_CAST3(__VA_ARGS__)
+#define __BPF_CAST5(a,...) __CAST_TO_U64(a), __BPF_CAST4(__VA_ARGS__)
+#define __BPF_CAST6(a,...) __CAST_TO_U64(a), __BPF_CAST5(__VA_ARGS__)
+
 #undef DECLARE_EVENT_CLASS
 #define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\
 static notrace void							\
 perf_trace_##call(void *__data, proto)					\
 {									\
 	struct ftrace_event_call *event_call = __data;			\
+	struct bpf_prog *prog = event_call->prog;			\
 	struct ftrace_data_offsets_##call __maybe_unused __data_offsets;\
 	struct ftrace_raw_##call *entry;				\
 	struct pt_regs __regs;						\
@@ -770,6 +791,16 @@ perf_trace_##call(void *__data, proto)					\
 	int __entry_size;						\
 	int __data_size;						\
 	int rctx;							\
+									\
+	if (prog) {							\
+		__maybe_unused const u64 z = 0;				\
+		struct bpf_context __ctx = ((struct bpf_context) {	\
+				__BPF_CAST6(args, z, z, z, z, z)	\
+			});						\
+									\
+		if (!trace_call_bpf(prog, &__ctx))			\
+			return;						\
+	}								\
 									\
 	__data_size = ftrace_get_offsets_##call(&__data_offsets, args); \
 									\
