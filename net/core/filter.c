@@ -44,6 +44,7 @@
 #include <linux/ratelimit.h>
 #include <linux/seccomp.h>
 #include <linux/if_vlan.h>
+#include <linux/bpf.h>
 
 /**
  *	sk_filter - run a packet through a socket filter
@@ -816,8 +817,12 @@ static void bpf_release_orig_filter(struct bpf_prog *fp)
 
 static void __bpf_prog_release(struct bpf_prog *prog)
 {
-	bpf_release_orig_filter(prog);
-	bpf_prog_free(prog);
+	if (prog->aux->prog_type == BPF_PROG_TYPE_SOCKET_FILTER) {
+		bpf_prog_put(prog);
+	} else {
+		bpf_release_orig_filter(prog);
+		bpf_prog_free(prog);
+	}
 }
 
 static void __sk_filter_release(struct sk_filter *fp)
@@ -1090,6 +1095,132 @@ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(sk_attach_filter);
+
+int sk_attach_filter_ebpf(u32 ufd, struct sock *sk)
+{
+	struct sk_filter *fp, *old_fp;
+	struct bpf_prog *prog;
+
+	if (sock_flag(sk, SOCK_FILTER_LOCKED))
+		return -EPERM;
+
+	prog = bpf_prog_get(ufd);
+	if (!prog)
+		return -EINVAL;
+
+	if (prog->aux->prog_type != BPF_PROG_TYPE_SOCKET_FILTER) {
+		/* valid fd, but invalid program type */
+		bpf_prog_put(prog);
+		return -EINVAL;
+	}
+
+	fp = kmalloc(sizeof(*fp), GFP_KERNEL);
+	if (!fp) {
+		bpf_prog_put(prog);
+		return -ENOMEM;
+	}
+	fp->prog = prog;
+
+	atomic_set(&fp->refcnt, 0);
+
+	if (!sk_filter_charge(sk, fp)) {
+		__sk_filter_release(fp);
+		return -ENOMEM;
+	}
+
+	old_fp = rcu_dereference_protected(sk->sk_filter,
+					   sock_owned_by_user(sk));
+	rcu_assign_pointer(sk->sk_filter, fp);
+
+	if (old_fp)
+		sk_filter_uncharge(sk, old_fp);
+
+	return 0;
+}
+
+static struct bpf_func_proto sock_filter_funcs[] = {
+	[BPF_FUNC_map_lookup_elem] = {
+		.func = bpf_map_lookup_elem,
+		.gpl_only = false,
+		.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
+		.arg1_type = ARG_CONST_MAP_PTR,
+		.arg2_type = ARG_PTR_TO_MAP_KEY,
+	},
+	[BPF_FUNC_map_update_elem] = {
+		.func = bpf_map_update_elem,
+		.gpl_only = false,
+		.ret_type = RET_INTEGER,
+		.arg1_type = ARG_CONST_MAP_PTR,
+		.arg2_type = ARG_PTR_TO_MAP_KEY,
+		.arg3_type = ARG_PTR_TO_MAP_VALUE,
+	},
+	[BPF_FUNC_map_delete_elem] = {
+		.func = bpf_map_delete_elem,
+		.gpl_only = false,
+		.ret_type = RET_INTEGER,
+		.arg1_type = ARG_CONST_MAP_PTR,
+		.arg2_type = ARG_PTR_TO_MAP_KEY,
+	},
+};
+
+/* allow socket filters to call
+ * bpf_map_lookup_elem(), bpf_map_update_elem(), bpf_map_delete_elem()
+ */
+static const struct bpf_func_proto *sock_filter_func_proto(enum bpf_func_id func_id)
+{
+	if (func_id < 0 || func_id >= ARRAY_SIZE(sock_filter_funcs))
+		return NULL;
+	return &sock_filter_funcs[func_id];
+}
+
+static const struct bpf_context_access {
+	int size;
+	enum bpf_access_type type;
+} sock_filter_ctx_access[] = {
+	[offsetof(struct sk_buff, mark)] = {
+		FIELD_SIZEOF(struct sk_buff, mark), BPF_READ
+	},
+	[offsetof(struct sk_buff, protocol)] = {
+		FIELD_SIZEOF(struct sk_buff, protocol), BPF_READ
+	},
+	[offsetof(struct sk_buff, queue_mapping)] = {
+		FIELD_SIZEOF(struct sk_buff, queue_mapping), BPF_READ
+	},
+};
+
+/* allow socket filters to access to 'mark', 'protocol' and 'queue_mapping'
+ * fields of 'struct sk_buff'
+ */
+static bool sock_filter_is_valid_access(int off, int size, enum bpf_access_type type)
+{
+	const struct bpf_context_access *access;
+
+	if (off < 0 || off >= ARRAY_SIZE(sock_filter_ctx_access))
+		return false;
+
+	access = &sock_filter_ctx_access[off];
+	if (access->size == size && (access->type & type))
+		return true;
+
+	return false;
+}
+
+static struct bpf_verifier_ops sock_filter_ops = {
+	.get_func_proto = sock_filter_func_proto,
+	.is_valid_access = sock_filter_is_valid_access,
+};
+
+static struct bpf_prog_type_list tl = {
+	.ops = &sock_filter_ops,
+	.type = BPF_PROG_TYPE_SOCKET_FILTER,
+};
+
+static int __init register_sock_filter_ops(void)
+{
+	bpf_register_prog_type(&tl);
+	return 0;
+}
+late_initcall(register_sock_filter_ops);
 
 int sk_detach_filter(struct sock *sk)
 {

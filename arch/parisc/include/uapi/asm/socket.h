@@ -79,4 +79,6 @@
 
 #define SO_BPF_EXTENSIONS	0x4029
 
+#define SO_ATTACH_FILTER_EBPF	0x402a
+
 #endif /* _UAPI_ASM_SOCKET_H */

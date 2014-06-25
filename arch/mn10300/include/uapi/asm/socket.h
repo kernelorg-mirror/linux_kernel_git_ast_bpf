@@ -80,4 +80,6 @@
 
 #define SO_BPF_EXTENSIONS	48
 
+#define SO_ATTACH_FILTER_EBPF	49
+
 #endif /* _ASM_SOCKET_H */
