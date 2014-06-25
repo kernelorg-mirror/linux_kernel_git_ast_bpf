@@ -2,8 +2,9 @@
 obj- := dummy.o
 
 # List of programs to build
-hostprogs-y := dropmon test_verifier ex1 ex2 ex3
+hostprogs-y := sock_example dropmon test_verifier ex1 ex2 ex3
 
+sock_example-objs := sock_example.o libbpf.o
 dropmon-objs := dropmon.o libbpf.o
 test_verifier-objs := test_verifier.o libbpf.o
 ex1-objs := bpf_load.o libbpf.o ex1_user.o
