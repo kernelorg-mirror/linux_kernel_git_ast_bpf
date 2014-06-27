@@ -2,8 +2,9 @@
 obj- := dummy.o
 
 # List of programs to build
-hostprogs-y := test_verifier
+hostprogs-y := dropmon test_verifier
 
+dropmon-objs := dropmon.o libbpf.o
 test_verifier-objs := test_verifier.o libbpf.o
 
 # Tell kbuild to always build the programs
