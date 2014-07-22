@@ -8,29 +8,47 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <poll.h>
 #include "libbpf.h"
 #include "bpf_helpers.h"
 #include "bpf_load.h"
+
+#define DEBUGFS "/sys/kernel/debug/tracing/"
 
 static char license[128];
 static bool processed_sec[128];
 int map_fd[MAX_MAPS];
 int prog_fd[MAX_PROGS];
+int event_fd[MAX_PROGS];
 int prog_cnt;
 
 static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 {
-	int fd;
 	bool is_socket = strncmp(event, "socket", 6) == 0;
+	enum bpf_prog_type prog_type;
+	char path[256] = DEBUGFS;
+	char buf[32];
+	int fd, efd, err, id;
+	struct perf_event_attr attr;
 
-	if (!is_socket)
-		/* tracing events tbd */
-		return -1;
+	attr.type = PERF_TYPE_TRACEPOINT;
+	attr.sample_type = PERF_SAMPLE_RAW;
+	attr.sample_period = 1;
+	attr.wakeup_events = 1;
 
-	fd = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER,
-			   prog, size, license);
+	if (is_socket)
+		prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+	else
+		prog_type = BPF_PROG_TYPE_TRACEPOINT;
+
+	fd = bpf_prog_load(prog_type, prog, size, license);
 
 	if (fd < 0) {
 		printf("bpf_prog_load() err=%d\n%s", errno, bpf_log_buf);
@@ -38,6 +56,39 @@ static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 	}
 
 	prog_fd[prog_cnt++] = fd;
+
+	if (is_socket)
+		return 0;
+
+	strcat(path, event);
+	strcat(path, "/id");
+
+	efd = open(path, O_RDONLY, 0);
+	if (efd < 0) {
+		printf("failed to open event %s\n", event);
+		return -1;
+	}
+
+	err = read(efd, buf, sizeof(buf));
+	if (err < 0 || err >= sizeof(buf)) {
+		printf("read from '%s' failed '%s'\n", event, strerror(errno));
+		return -1;
+	}
+
+	close(efd);
+
+	buf[err] = 0;
+	id = atoi(buf);
+	attr.config = id;
+
+	efd = perf_event_open(&attr, -1/*pid*/, 0/*cpu*/, -1/*group_fd*/, 0);
+	if (efd < 0) {
+		printf("event %d fd %d err %s\n", id, efd, strerror(errno));
+		return -1;
+	}
+	event_fd[prog_cnt - 1] = efd;
+	ioctl(efd, PERF_EVENT_IOC_ENABLE, 0);
+	ioctl(efd, PERF_EVENT_IOC_SET_BPF, fd);
 
 	return 0;
 }
@@ -200,4 +251,70 @@ int load_bpf_file(char *path)
 
 	close(fd);
 	return 0;
+}
+
+int page_size;
+int page_cnt = 8;
+volatile struct perf_event_mmap_page *header;
+
+int perf_event_mmap(int fd)
+{
+	void *base;
+	int mmap_size;
+
+	page_size = getpagesize();
+	mmap_size = page_size * (page_cnt + 1);
+
+	base = mmap(NULL, mmap_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (base == MAP_FAILED) {
+		printf("mmap err\n");
+		return -1;
+	}
+
+	header = base;
+	return 0;
+}
+
+int perf_event_poll(int fd)
+{
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	return poll(&pfd, 1, -1);
+}
+
+struct perf_event_sample {
+	  struct perf_event_header header;
+	  __u32 size;
+	  char data[];
+};
+
+void perf_event_read(print_fn fn)
+{
+	static __u64 old_data_head = 0;
+	__u64 data_head = header->data_head;
+	__u64 buffer_size = page_cnt * page_size;
+	void *base, *begin, *end;
+
+	if (data_head == old_data_head)
+		return;
+
+	base = ((char *)header) + page_size;
+
+	begin = base + old_data_head % buffer_size;
+	end = base + data_head % buffer_size;
+
+	while (begin < end) {
+		struct perf_event_sample *e;
+
+		e = begin;
+
+		if (e->header.type != PERF_RECORD_SAMPLE) {
+			printf("event is not a sample type %d\n", e->header.type);
+		}
+
+		begin += sizeof(*e) + e->size;
+		fn(e->data, e->size);
+	}
+	/* else when end > begin - the events had wrapped. ignored for now */
+
+	old_data_head = data_head;
 }

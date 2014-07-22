@@ -6,6 +6,7 @@
 
 extern int map_fd[MAX_MAPS];
 extern int prog_fd[MAX_PROGS];
+extern int event_fd[MAX_PROGS];
 
 /* parses elf file compiled by llvm .c->.o
  * . parses 'maps' section and creates maps via BPF syscall
@@ -20,5 +21,16 @@ extern int prog_fd[MAX_PROGS];
  * returns zero on success
  */
 int load_bpf_file(char *path);
+
+int perf_event_mmap(int fd);
+int perf_event_poll(int fd);
+typedef void (*print_fn)(void *data, int size);
+void perf_event_read(print_fn fn);
+struct trace_entry {
+	unsigned short          type;
+	unsigned char           flags;
+	unsigned char           preempt_count;
+	int                     pid;
+};
 
 #endif
