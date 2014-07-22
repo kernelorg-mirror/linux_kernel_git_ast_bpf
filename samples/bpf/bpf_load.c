@@ -14,6 +14,8 @@
 #include "bpf_helpers.h"
 #include "bpf_load.h"
 
+#define DEBUGFS "/sys/kernel/debug/tracing/"
+
 static char license[128];
 static bool processed_sec[128];
 int map_fd[MAX_MAPS];
@@ -22,14 +24,13 @@ int prog_cnt;
 
 static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 {
-	int fd;
 	bool is_socket = strncmp(event, "socket", 6) == 0;
+	char path[256] = DEBUGFS;
+	char fmt[32];
+	int fd, event_fd, err;
 
-	if (!is_socket)
-		/* tracing events tbd */
-		return -1;
-
-	fd = bpf_prog_load(BPF_PROG_TYPE_SOCKET_FILTER,
+	fd = bpf_prog_load(is_socket ? BPF_PROG_TYPE_SOCKET_FILTER :
+				       BPF_PROG_TYPE_TRACING_FILTER,
 			   prog, size, license);
 
 	if (fd < 0) {
@@ -38,6 +39,25 @@ static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 	}
 
 	prog_fd[prog_cnt++] = fd;
+
+	if (is_socket)
+		return 0;
+
+	snprintf(fmt, sizeof(fmt), "bpf-%d", fd);
+
+	strcat(path, event);
+	strcat(path, "/filter");
+
+	printf("writing %s -> %s\n", fmt, path);
+
+	event_fd = open(path, O_WRONLY, 0);
+	if (event_fd < 0) {
+		printf("failed to open event %s\n", event);
+		return -1;
+	}
+
+	err = write(event_fd, fmt, strlen(fmt));
+	(void) err;
 
 	return 0;
 }
@@ -200,4 +220,24 @@ int load_bpf_file(char *path)
 
 	close(fd);
 	return 0;
+}
+
+void read_trace_pipe(void)
+{
+	int trace_fd;
+
+	trace_fd = open(DEBUGFS "trace_pipe", O_RDONLY, 0);
+	if (trace_fd < 0)
+		return;
+
+	while (1) {
+		static char buf[4096];
+		ssize_t sz;
+
+		sz = read(trace_fd, buf, sizeof(buf));
+		if (sz) {
+			buf[sz] = 0;
+			puts(buf);
+		}
+	}
 }

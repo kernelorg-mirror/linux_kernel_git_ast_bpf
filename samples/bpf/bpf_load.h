@@ -21,4 +21,7 @@ extern int prog_fd[MAX_PROGS];
  */
 int load_bpf_file(char *path);
 
+/* forever reads /sys/.../trace_pipe */
+void read_trace_pipe(void);
+
 #endif
