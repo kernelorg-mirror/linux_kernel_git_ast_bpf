@@ -2,12 +2,23 @@
 obj- := dummy.o
 
 # List of programs to build
-hostprogs-y := dropmon test_verifier
+hostprogs-y := dropmon test_verifier ex1
 
 dropmon-objs := dropmon.o libbpf.o
 test_verifier-objs := test_verifier.o libbpf.o
+ex1-objs := bpf_load.o libbpf.o ex1_user.o
 
 # Tell kbuild to always build the programs
-always := $(hostprogs-y)
+always := $(hostprogs-y) ex1_kern.o
 
 HOSTCFLAGS += -I$(objtree)/usr/include
+
+HOSTCFLAGS_bpf_load.o += -I$(objtree)/usr/include -Wno-unused-variable
+HOSTLOADLIBES_ex1 += -lelf
+
+LLC=$(srctree)/tools/bpf/llvm/bld/Debug+Asserts/bin/llc
+
+%.o: %.c
+	clang $(NOSTDINC_FLAGS) $(LINUXINCLUDE) $(EXTRA_CFLAGS) \
+		-D__KERNEL__ -Wno-unused-value -Wno-pointer-sign \
+		-O2 -emit-llvm -c $< -o -| $(LLC) -o $@
