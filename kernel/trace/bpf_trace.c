@@ -137,3 +137,42 @@ static int __init register_tracing_filter_ops(void)
 	return 0;
 }
 late_initcall(register_tracing_filter_ops);
+
+/* check access to fields of 'struct pt_regs' from BPF program */
+static bool kprobe_filter_is_valid_access(int off, int size, enum bpf_access_type type)
+{
+	/* check bounds */
+	if (off < 0 || off >= sizeof(struct pt_regs))
+		return false;
+
+	/* only read is allowed */
+	if (type != BPF_READ)
+		return false;
+
+	/* disallow misaligned access */
+	if (off % size != 0)
+		return false;
+
+	return true;
+}
+/* kprobe filter programs are allowed to call the same helper functions
+ * as tracing filters, but bpf_context is different:
+ * For tracing filters bpf_context is 6 arguments of tracepoints or syscalls
+ * For kprobe filters bpf_context == pt_regs
+ */
+static struct bpf_verifier_ops kprobe_filter_ops = {
+	.get_func_proto = tracing_filter_func_proto,
+	.is_valid_access = kprobe_filter_is_valid_access,
+};
+
+static struct bpf_prog_type_list kprobe_tl = {
+	.ops = &kprobe_filter_ops,
+	.type = BPF_PROG_TYPE_KPROBE_FILTER,
+};
+
+static int __init register_kprobe_filter_ops(void)
+{
+	bpf_register_prog_type(&kprobe_tl);
+	return 0;
+}
+late_initcall(register_kprobe_filter_ops);

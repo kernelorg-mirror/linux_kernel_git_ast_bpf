@@ -19,6 +19,7 @@
 
 #include <linux/module.h>
 #include <linux/uaccess.h>
+#include <trace/bpf_trace.h>
 
 #include "trace_probe.h"
 
@@ -930,6 +931,10 @@ __kprobe_trace_func(struct trace_kprobe *tk, struct pt_regs *regs,
 	if (ftrace_trigger_soft_disabled(ftrace_file))
 		return;
 
+	if (ftrace_file->flags & TRACE_EVENT_FL_BPF)
+		if (!trace_filter_call_bpf(ftrace_file->filter, regs))
+			return;
+
 	local_save_flags(irq_flags);
 	pc = preempt_count();
 
@@ -977,6 +982,10 @@ __kretprobe_trace_func(struct trace_kprobe *tk, struct kretprobe_instance *ri,
 
 	if (ftrace_trigger_soft_disabled(ftrace_file))
 		return;
+
+	if (ftrace_file->flags & TRACE_EVENT_FL_BPF)
+		if (!trace_filter_call_bpf(ftrace_file->filter, regs))
+			return;
 
 	local_save_flags(irq_flags);
 	pc = preempt_count();
@@ -1286,7 +1295,7 @@ static int register_kprobe_event(struct trace_kprobe *tk)
 		kfree(call->print_fmt);
 		return -ENODEV;
 	}
-	call->flags = 0;
+	call->flags = TRACE_EVENT_FL_KPROBE;
 	call->class->reg = kprobe_register;
 	call->data = tk;
 	ret = trace_add_event_call(call);

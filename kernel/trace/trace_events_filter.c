@@ -1894,7 +1894,8 @@ static int create_filter_start(char *filter_str, bool set_str,
 	return err;
 }
 
-static int create_filter_bpf(char *filter_str, struct event_filter **filterp)
+static int create_filter_bpf(struct ftrace_event_call *call, char *filter_str,
+			     struct event_filter **filterp)
 {
 	struct event_filter *filter;
 	struct bpf_prog *prog;
@@ -1923,7 +1924,10 @@ static int create_filter_bpf(char *filter_str, struct event_filter **filterp)
 
 	filter->prog = prog;
 
-	if (prog->aux->prog_type != BPF_PROG_TYPE_TRACING_FILTER) {
+	if (((call->flags & TRACE_EVENT_FL_KPROBE) &&
+	     prog->aux->prog_type != BPF_PROG_TYPE_KPROBE_FILTER) ||
+	    (!(call->flags & TRACE_EVENT_FL_KPROBE) &&
+	     prog->aux->prog_type != BPF_PROG_TYPE_TRACING_FILTER)) {
 		/* valid fd, but invalid bpf program type */
 		err = -EINVAL;
 		goto free_filter;
@@ -2054,7 +2058,7 @@ int apply_event_filter(struct ftrace_event_file *file, char *filter_string)
 	 */
 	if (memcmp(filter_string, "bpf", 3) == 0 && filter_string[3] != 0 &&
 	    filter_string[4] != 0) {
-		err = create_filter_bpf(filter_string, &filter);
+		err = create_filter_bpf(call, filter_string, &filter);
 		if (!err)
 			file->flags |= TRACE_EVENT_FL_BPF;
 	} else {
