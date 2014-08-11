@@ -19,6 +19,7 @@
 
 #include <linux/module.h>
 #include <linux/uaccess.h>
+#include <trace/bpf_trace.h>
 
 #include "trace_probe.h"
 
@@ -930,6 +931,22 @@ __kprobe_trace_func(struct trace_kprobe *tk, struct pt_regs *regs,
 	if (ftrace_trigger_soft_disabled(ftrace_file))
 		return;
 
+	if (call->flags & TRACE_EVENT_FL_BPF) {
+		struct bpf_context ctx = {};
+		unsigned long args[3];
+		/* get first 3 arguments of the function. x64 syscall ABI uses
+		 * the same 3 registers as x64 calling convention.
+		 * todo: implement it cleanly via arch specific
+		 * regs_get_argument_nth() helper
+		 */
+		syscall_get_arguments(current, regs, 0, 3, args);
+		ctx.arg1 = args[0];
+		ctx.arg2 = args[1];
+		ctx.arg3 = args[2];
+		trace_filter_call_bpf(ftrace_file->filter, &ctx);
+		return;
+	}
+
 	local_save_flags(irq_flags);
 	pc = preempt_count();
 
@@ -977,6 +994,17 @@ __kretprobe_trace_func(struct trace_kprobe *tk, struct kretprobe_instance *ri,
 
 	if (ftrace_trigger_soft_disabled(ftrace_file))
 		return;
+
+	if (call->flags & TRACE_EVENT_FL_BPF) {
+		struct bpf_context ctx = {};
+		/* assume that register used to return a value from syscall is
+		 * the same as register used to return a value from a function
+		 * todo: provide arch specific helper
+		 */
+		ctx.ret = syscall_get_return_value(current, regs);
+		trace_filter_call_bpf(ftrace_file->filter, &ctx);
+		return;
+	}
 
 	local_save_flags(irq_flags);
 	pc = preempt_count();
