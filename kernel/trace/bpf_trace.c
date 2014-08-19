@@ -54,6 +54,11 @@ static u64 bpf_memcmp(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
 	return -1;
 }
 
+static u64 bpf_ktime_get_ns(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+{
+	return ktime_get_ns();
+}
+
 static struct bpf_func_proto tracing_filter_funcs[] = {
 #define FETCH(SIZE)				\
 	[BPF_FUNC_fetch_##SIZE] = {		\
@@ -74,6 +79,11 @@ static struct bpf_func_proto tracing_filter_funcs[] = {
 		.arg1_type = ARG_ANYTHING,
 		.arg2_type = ARG_PTR_TO_STACK,
 		.arg3_type = ARG_CONST_STACK_SIZE,
+	},
+	[BPF_FUNC_ktime_get_ns] = {
+		.func = bpf_ktime_get_ns,
+		.gpl_only = true,
+		.ret_type = RET_INTEGER,
 	},
 };
 
