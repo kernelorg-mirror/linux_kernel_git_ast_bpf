@@ -114,6 +114,16 @@ static u64 bpf_printk(u64 r1, u64 fmt_size, u64 r3, u64 r4, u64 r5)
 			      mod_l[2] ? r5 : (u32) r5);
 }
 
+static u64 bpf_ktime_get_ns(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+{
+	return ktime_get_ns();
+}
+
+static u64 bpf_get_current(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+{
+	return (u64) (long) current;
+}
+
 static struct bpf_func_proto tracing_filter_funcs[] = {
 #define FETCH(SIZE)				\
 	[BPF_FUNC_fetch_##SIZE] = {		\
@@ -146,6 +156,16 @@ static struct bpf_func_proto tracing_filter_funcs[] = {
 		.ret_type = RET_INTEGER,
 		.arg1_type = ARG_PTR_TO_STACK,
 		.arg2_type = ARG_CONST_STACK_SIZE,
+	},
+	[BPF_FUNC_ktime_get_ns] = {
+		.func = bpf_ktime_get_ns,
+		.gpl_only = true,
+		.ret_type = RET_INTEGER,
+	},
+	[BPF_FUNC_get_current] = {
+		.func = bpf_get_current,
+		.gpl_only = true,
+		.ret_type = RET_INTEGER,
 	},
 };
 

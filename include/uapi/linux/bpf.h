@@ -171,6 +171,8 @@ enum bpf_func_id {
 	BPF_FUNC_memcmp,          /* int bpf_memcmp(void *unsafe_ptr, void *safe_ptr, int size) */
 	BPF_FUNC_dump_stack,      /* void bpf_dump_stack(void) */
 	BPF_FUNC_printk,          /* int bpf_printk(const char *fmt, int fmt_size, ...) */
+	BPF_FUNC_ktime_get_ns,    /* u64 bpf_ktime_get_ns(void) */
+	BPF_FUNC_get_current,     /* struct task_struct *bpf_get_current(void) */
 	__BPF_FUNC_MAX_ID,
 };
 
