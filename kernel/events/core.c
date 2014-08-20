@@ -44,6 +44,7 @@
 #include <linux/compat.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
+#include <../trace/trace.h>
 
 #include "internal.h"
 
@@ -6296,6 +6297,12 @@ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
 		bpf_prog_put(prog);
 		return -EINVAL;
 	}
+
+	/*
+	 * allocate per-cpu printk buffers, since programs
+	 * might be calling bpf_printk
+	 */
+	trace_printk_init_buffers();
 
 	event->tp_event->prog = prog;
 
