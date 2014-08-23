@@ -333,6 +333,9 @@ config SECCOMP_FILTER
 
 	  See Documentation/prctl/seccomp_filter.txt for details.
 
+config BPF
+	boolean
+
 config HAVE_CC_STACKPROTECTOR
 	bool
 	help
