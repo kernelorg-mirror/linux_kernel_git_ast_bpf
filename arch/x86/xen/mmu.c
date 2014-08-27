@@ -198,7 +198,7 @@ void xen_set_domain_pte(pte_t *ptep, pte_t pteval, unsigned domid)
 	struct multicall_space mcs;
 	struct mmu_update *u;
 
-	trace_xen_mmu_set_domain_pte(ptep, pteval, domid);
+	trace_xen_mmu_set_domain_pte(ptep, pteval.pte, domid);
 
 	mcs = xen_mc_entry(sizeof(*u));
 	u = mcs.args;
@@ -269,7 +269,7 @@ static void xen_set_pmd_hyper(pmd_t *ptr, pmd_t val)
 
 static void xen_set_pmd(pmd_t *ptr, pmd_t val)
 {
-	trace_xen_mmu_set_pmd(ptr, val);
+	trace_xen_mmu_set_pmd(ptr, val.pmd);
 
 	/* If page is not pinned, we can just update the entry
 	   directly */
@@ -328,14 +328,14 @@ static inline void __xen_set_pte(pte_t *ptep, pte_t pteval)
 
 static void xen_set_pte(pte_t *ptep, pte_t pteval)
 {
-	trace_xen_mmu_set_pte(ptep, pteval);
+	trace_xen_mmu_set_pte(ptep, pteval.pte);
 	__xen_set_pte(ptep, pteval);
 }
 
 static void xen_set_pte_at(struct mm_struct *mm, unsigned long addr,
 		    pte_t *ptep, pte_t pteval)
 {
-	trace_xen_mmu_set_pte_at(mm, addr, ptep, pteval);
+	trace_xen_mmu_set_pte_at(mm, addr, ptep, pteval.pte);
 	__xen_set_pte(ptep, pteval);
 }
 
@@ -343,7 +343,7 @@ pte_t xen_ptep_modify_prot_start(struct mm_struct *mm,
 				 unsigned long addr, pte_t *ptep)
 {
 	/* Just return the pte as-is.  We preserve the bits on commit */
-	trace_xen_mmu_ptep_modify_prot_start(mm, addr, ptep, *ptep);
+	trace_xen_mmu_ptep_modify_prot_start(mm, addr, ptep, ptep->pte);
 	return *ptep;
 }
 
@@ -352,7 +352,7 @@ void xen_ptep_modify_prot_commit(struct mm_struct *mm, unsigned long addr,
 {
 	struct mmu_update u;
 
-	trace_xen_mmu_ptep_modify_prot_commit(mm, addr, ptep, pte);
+	trace_xen_mmu_ptep_modify_prot_commit(mm, addr, ptep, pte.pte);
 	xen_mc_batch();
 
 	u.ptr = virt_to_machine(ptep).maddr | MMU_PT_UPDATE_PRESERVE_AD;
@@ -462,7 +462,7 @@ static void xen_set_pud_hyper(pud_t *ptr, pud_t val)
 
 static void xen_set_pud(pud_t *ptr, pud_t val)
 {
-	trace_xen_mmu_set_pud(ptr, val);
+	trace_xen_mmu_set_pud(ptr, native_pud_val(val));
 
 	/* If page is not pinned, we can just update the entry
 	   directly */
@@ -566,7 +566,7 @@ static void xen_set_pgd(pgd_t *ptr, pgd_t val)
 {
 	pgd_t *user_ptr = xen_get_user_pgd(ptr);
 
-	trace_xen_mmu_set_pgd(ptr, user_ptr, val);
+	trace_xen_mmu_set_pgd(ptr, user_ptr, val.pgd);
 
 	/* If page is not pinned, we can just update the entry
 	   directly */
