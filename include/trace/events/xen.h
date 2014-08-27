@@ -124,14 +124,14 @@ TRACE_EVENT(xen_mc_extend_args,
 
 /* mmu */
 DECLARE_EVENT_CLASS(xen_mmu__set_pte,
-	    TP_PROTO(pte_t *ptep, pte_t pteval),
+	    TP_PROTO(pte_t *ptep, pteval_t pteval),
 	    TP_ARGS(ptep, pteval),
 	    TP_STRUCT__entry(
 		    __field(pte_t *, ptep)
 		    __field(pteval_t, pteval)
 		    ),
 	    TP_fast_assign(__entry->ptep = ptep;
-			   __entry->pteval = pteval.pte),
+			   __entry->pteval = pteval),
 	    TP_printk("ptep %p pteval %0*llx (raw %0*llx)",
 		      __entry->ptep,
 		      (int)sizeof(pteval_t) * 2, (unsigned long long)pte_val(native_make_pte(__entry->pteval)),
@@ -140,14 +140,14 @@ DECLARE_EVENT_CLASS(xen_mmu__set_pte,
 
 #define DEFINE_XEN_MMU_SET_PTE(name)				\
 	DEFINE_EVENT(xen_mmu__set_pte, name,			\
-		     TP_PROTO(pte_t *ptep, pte_t pteval),	\
+		     TP_PROTO(pte_t *ptep, pteval_t pteval),	\
 		     TP_ARGS(ptep, pteval))
 
 DEFINE_XEN_MMU_SET_PTE(xen_mmu_set_pte);
 DEFINE_XEN_MMU_SET_PTE(xen_mmu_set_pte_atomic);
 
 TRACE_EVENT(xen_mmu_set_domain_pte,
-	    TP_PROTO(pte_t *ptep, pte_t pteval, unsigned domid),
+	    TP_PROTO(pte_t *ptep, pteval_t pteval, unsigned domid),
 	    TP_ARGS(ptep, pteval, domid),
 	    TP_STRUCT__entry(
 		    __field(pte_t *, ptep)
@@ -155,7 +155,7 @@ TRACE_EVENT(xen_mmu_set_domain_pte,
 		    __field(unsigned, domid)
 		    ),
 	    TP_fast_assign(__entry->ptep = ptep;
-			   __entry->pteval = pteval.pte;
+			   __entry->pteval = pteval;
 			   __entry->domid = domid),
 	    TP_printk("ptep %p pteval %0*llx (raw %0*llx) domid %u",
 		      __entry->ptep,
@@ -166,7 +166,7 @@ TRACE_EVENT(xen_mmu_set_domain_pte,
 
 TRACE_EVENT(xen_mmu_set_pte_at,
 	    TP_PROTO(struct mm_struct *mm, unsigned long addr,
-		     pte_t *ptep, pte_t pteval),
+		     pte_t *ptep, pteval_t pteval),
 	    TP_ARGS(mm, addr, ptep, pteval),
 	    TP_STRUCT__entry(
 		    __field(struct mm_struct *, mm)
@@ -177,7 +177,7 @@ TRACE_EVENT(xen_mmu_set_pte_at,
 	    TP_fast_assign(__entry->mm = mm;
 			   __entry->addr = addr;
 			   __entry->ptep = ptep;
-			   __entry->pteval = pteval.pte),
+			   __entry->pteval = pteval),
 	    TP_printk("mm %p addr %lx ptep %p pteval %0*llx (raw %0*llx)",
 		      __entry->mm, __entry->addr, __entry->ptep,
 		      (int)sizeof(pteval_t) * 2, (unsigned long long)pte_val(native_make_pte(__entry->pteval)),
@@ -200,14 +200,14 @@ TRACE_EVENT(xen_mmu_pte_clear,
 	);
 
 TRACE_EVENT(xen_mmu_set_pmd,
-	    TP_PROTO(pmd_t *pmdp, pmd_t pmdval),
+	    TP_PROTO(pmd_t *pmdp, pmdval_t pmdval),
 	    TP_ARGS(pmdp, pmdval),
 	    TP_STRUCT__entry(
 		    __field(pmd_t *, pmdp)
 		    __field(pmdval_t, pmdval)
 		    ),
 	    TP_fast_assign(__entry->pmdp = pmdp;
-			   __entry->pmdval = pmdval.pmd),
+			   __entry->pmdval = pmdval),
 	    TP_printk("pmdp %p pmdval %0*llx (raw %0*llx)",
 		      __entry->pmdp,
 		      (int)sizeof(pmdval_t) * 2, (unsigned long long)pmd_val(native_make_pmd(__entry->pmdval)),
@@ -227,14 +227,14 @@ TRACE_EVENT(xen_mmu_pmd_clear,
 #if PAGETABLE_LEVELS >= 4
 
 TRACE_EVENT(xen_mmu_set_pud,
-	    TP_PROTO(pud_t *pudp, pud_t pudval),
+	    TP_PROTO(pud_t *pudp, pudval_t pudval),
 	    TP_ARGS(pudp, pudval),
 	    TP_STRUCT__entry(
 		    __field(pud_t *, pudp)
 		    __field(pudval_t, pudval)
 		    ),
 	    TP_fast_assign(__entry->pudp = pudp;
-			   __entry->pudval = native_pud_val(pudval)),
+			   __entry->pudval = pudval),
 	    TP_printk("pudp %p pudval %0*llx (raw %0*llx)",
 		      __entry->pudp,
 		      (int)sizeof(pudval_t) * 2, (unsigned long long)pud_val(native_make_pud(__entry->pudval)),
@@ -242,7 +242,7 @@ TRACE_EVENT(xen_mmu_set_pud,
 	);
 
 TRACE_EVENT(xen_mmu_set_pgd,
-	    TP_PROTO(pgd_t *pgdp, pgd_t *user_pgdp, pgd_t pgdval),
+	    TP_PROTO(pgd_t *pgdp, pgd_t *user_pgdp, pgdval_t pgdval),
 	    TP_ARGS(pgdp, user_pgdp, pgdval),
 	    TP_STRUCT__entry(
 		    __field(pgd_t *, pgdp)
@@ -251,7 +251,7 @@ TRACE_EVENT(xen_mmu_set_pgd,
 		    ),
 	    TP_fast_assign(__entry->pgdp = pgdp;
 			   __entry->user_pgdp = user_pgdp;
-			   __entry->pgdval = pgdval.pgd),
+			   __entry->pgdval = pgdval),
 	    TP_printk("pgdp %p user_pgdp %p pgdval %0*llx (raw %0*llx)",
 		      __entry->pgdp, __entry->user_pgdp,
 		      (int)sizeof(pgdval_t) * 2, (unsigned long long)pgd_val(native_make_pgd(__entry->pgdval)),
@@ -298,7 +298,7 @@ TRACE_EVENT(xen_mmu_pgd_clear,
 
 DECLARE_EVENT_CLASS(xen_mmu_ptep_modify_prot,
 	    TP_PROTO(struct mm_struct *mm, unsigned long addr,
-		     pte_t *ptep, pte_t pteval),
+		     pte_t *ptep, pteval_t pteval),
 	    TP_ARGS(mm, addr, ptep, pteval),
 	    TP_STRUCT__entry(
 		    __field(struct mm_struct *, mm)
@@ -309,7 +309,7 @@ DECLARE_EVENT_CLASS(xen_mmu_ptep_modify_prot,
 	    TP_fast_assign(__entry->mm = mm;
 			   __entry->addr = addr;
 			   __entry->ptep = ptep;
-			   __entry->pteval = pteval.pte),
+			   __entry->pteval = pteval),
 	    TP_printk("mm %p addr %lx ptep %p pteval %0*llx (raw %0*llx)",
 		      __entry->mm, __entry->addr, __entry->ptep,
 		      (int)sizeof(pteval_t) * 2, (unsigned long long)pte_val(native_make_pte(__entry->pteval)),
@@ -318,7 +318,7 @@ DECLARE_EVENT_CLASS(xen_mmu_ptep_modify_prot,
 #define DEFINE_XEN_MMU_PTEP_MODIFY_PROT(name)				\
 	DEFINE_EVENT(xen_mmu_ptep_modify_prot, name,			\
 		     TP_PROTO(struct mm_struct *mm, unsigned long addr,	\
-			      pte_t *ptep, pte_t pteval),		\
+			      pte_t *ptep, pteval_t pteval),		\
 		     TP_ARGS(mm, addr, ptep, pteval))
 
 DEFINE_XEN_MMU_PTEP_MODIFY_PROT(xen_mmu_ptep_modify_prot_start);
