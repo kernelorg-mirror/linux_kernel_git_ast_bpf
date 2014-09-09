@@ -114,6 +114,7 @@ enum bpf_map_type {
 
 enum bpf_prog_type {
 	BPF_PROG_TYPE_UNSPEC,
+	BPF_PROG_TYPE_SOCKET_FILTER,
 };
 
 union bpf_attr {
