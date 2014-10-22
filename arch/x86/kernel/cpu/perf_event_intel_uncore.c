@@ -891,6 +891,8 @@ static int __init uncore_pci_init(void)
 {
 	int ret;
 
+	printk("uncore_pci_init %d\n", boot_cpu_data.x86_model);
+	return -ENODEV;
 	switch (boot_cpu_data.x86_model) {
 	case 45: /* Sandy Bridge-EP */
 		ret = snbep_uncore_pci_init();
