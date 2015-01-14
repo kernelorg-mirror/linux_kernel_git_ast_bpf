@@ -32,6 +32,7 @@ int prog_cnt;
 static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 {
 	bool is_socket = strncmp(event, "socket", 6) == 0;
+	bool is_kprobe = strncmp(event, "events/kprobes/", 15) == 0;
 	enum bpf_prog_type prog_type;
 	char path[256] = DEBUGFS;
 	char buf[32];
@@ -45,6 +46,8 @@ static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 
 	if (is_socket)
 		prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+	else if (is_kprobe)
+		prog_type = BPF_PROG_TYPE_KPROBE;
 	else
 		prog_type = BPF_PROG_TYPE_TRACEPOINT;
 
