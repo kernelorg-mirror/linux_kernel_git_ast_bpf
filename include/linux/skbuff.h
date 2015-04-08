@@ -2592,6 +2592,19 @@ static inline void skb_postpull_rcsum(struct sk_buff *skb,
 		skb->csum = csum_sub(skb->csum, csum_partial(start, len, 0));
 }
 
+/**
+ *	skb_postpush_rcsum - update checksum for skb after push
+ *	@skb: buffer to update
+ *	@start: start of data after push
+ *	@len: length of data pushed
+ */
+static inline void skb_postpush_rcsum(struct sk_buff *skb,
+				      const void *start, unsigned int len)
+{
+	if (skb->ip_summed == CHECKSUM_COMPLETE)
+		skb->csum = csum_add(skb->csum, csum_partial(start, len, 0));
+}
+
 unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int len);
 
 /**
