@@ -1175,12 +1175,22 @@ int sk_attach_bpf(u32 ufd, struct sock *sk)
 	return 0;
 }
 
+/* version of skb_cloned() && !skb_clone_writable() that works with
+ * negative 'len'
+ */
+static bool is_not_writeable(const struct sk_buff *skb, int len)
+{
+	return skb_cloned(skb) &&
+		(skb_header_cloned(skb) ||
+		 (int) skb_headroom(skb) + len > skb->hdr_len);
+}
+
 #define BPF_RECOMPUTE_CSUM(flags)	((flags) & 1)
 
 static u64 bpf_skb_store_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
 {
 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
-	unsigned int offset = (unsigned int) r2;
+	int offset = (int) r2;
 	void *from = (void *) (long) r3;
 	unsigned int len = (unsigned int) r4;
 	char buf[16];
@@ -1194,10 +1204,12 @@ static u64 bpf_skb_store_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
 	 *
 	 * so check for invalid 'offset' and too large 'len'
 	 */
-	if (unlikely(offset > 0xffff || len > sizeof(buf)))
+	if (unlikely((u32) offset > 0xffff || len > sizeof(buf)))
 		return -EFAULT;
 
-	if (skb_cloned(skb) && !skb_clone_writable(skb, offset + len))
+	offset -= skb->data - skb_mac_header(skb);
+
+	if (unlikely(is_not_writeable(skb, offset + len)))
 		return -EFAULT;
 
 	ptr = skb_header_pointer(skb, offset, len, buf);
@@ -1229,18 +1241,47 @@ const struct bpf_func_proto bpf_skb_store_bytes_proto = {
 	.arg5_type	= ARG_ANYTHING,
 };
 
+static u64 bpf_skb_copy_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
+{
+	struct sk_buff *skb = (struct sk_buff *) (long) r1;
+	int offset = (int) r2;
+	void *to = (void *) (long) r3;
+	unsigned int len = (unsigned int) r4;
+
+	if (unlikely((u32) offset > 0xffff || len > MAX_BPF_STACK))
+		return -EFAULT;
+
+	offset -= skb->data - skb_mac_header(skb);
+
+	return skb_copy_bits(skb, offset, to, len);
+}
+
+const struct bpf_func_proto bpf_skb_copy_bytes_proto = {
+	.func		= bpf_skb_copy_bytes,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_PTR_TO_STACK,
+	.arg4_type	= ARG_CONST_STACK_SIZE,
+	.arg5_type	= ARG_ANYTHING,
+};
+
 #define BPF_HEADER_FIELD_SIZE(flags)	((flags) & 0x0f)
 #define BPF_IS_PSEUDO_HEADER(flags)	((flags) & 0x10)
 
-static u64 bpf_l3_csum_replace(u64 r1, u64 offset, u64 from, u64 to, u64 flags)
+static u64 bpf_l3_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
 {
 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
+	int offset = (int) r2;
 	__sum16 sum, *ptr;
 
-	if (unlikely(offset > 0xffff))
+	if (unlikely((u32) offset > 0xffff))
 		return -EFAULT;
 
-	if (skb_cloned(skb) && !skb_clone_writable(skb, offset + sizeof(sum)))
+	offset -= skb->data - skb_mac_header(skb);
+
+	if (unlikely(is_not_writeable(skb, offset + sizeof(sum))))
 		return -EFAULT;
 
 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
@@ -1276,16 +1317,19 @@ const struct bpf_func_proto bpf_l3_csum_replace_proto = {
 	.arg5_type	= ARG_ANYTHING,
 };
 
-static u64 bpf_l4_csum_replace(u64 r1, u64 offset, u64 from, u64 to, u64 flags)
+static u64 bpf_l4_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
 {
 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
 	u32 is_pseudo = BPF_IS_PSEUDO_HEADER(flags);
+	int offset = (int) r2;
 	__sum16 sum, *ptr;
 
-	if (unlikely(offset > 0xffff))
+	if (unlikely((u32) offset > 0xffff))
 		return -EFAULT;
 
-	if (skb_cloned(skb) && !skb_clone_writable(skb, offset + sizeof(sum)))
+	offset -= skb->data - skb_mac_header(skb);
+
+	if (unlikely(is_not_writeable(skb, offset + sizeof(sum))))
 		return -EFAULT;
 
 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
@@ -1350,6 +1394,8 @@ tc_cls_act_func_proto(enum bpf_func_id func_id)
 		return &bpf_l3_csum_replace_proto;
 	case BPF_FUNC_l4_csum_replace:
 		return &bpf_l4_csum_replace_proto;
+	case BPF_FUNC_skb_copy_bytes:
+		return &bpf_skb_copy_bytes_proto;
 	default:
 		return sk_filter_func_proto(func_id);
 	}
