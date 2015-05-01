@@ -203,6 +203,7 @@
 #define F_NODE          (1<<15)	/* Node memory alloc*/
 #define F_UDPCSUM       (1<<16)	/* Include UDP checksum */
 #define F_NO_TIMESTAMP  (1<<17)	/* Don't timestamp packets (default TS) */
+#define F_DO_RX		(1<<18)	/* generate packets for RX */
 
 /* Thread control flag bits */
 #define T_STOP        (1<<0)	/* Stop run */
@@ -1081,12 +1082,19 @@ static ssize_t pktgen_if_write(struct file *file,
 		if (len < 0)
 			return len;
 		if ((value > 0) &&
-		    (!(pkt_dev->odev->priv_flags & IFF_TX_SKB_SHARING)))
+		    ((pkt_dev->flags & F_DO_RX) ||
+		     !(pkt_dev->odev->priv_flags & IFF_TX_SKB_SHARING)))
 			return -ENOTSUPP;
 		i += len;
 		pkt_dev->clone_skb = value;
 
 		sprintf(pg_result, "OK: clone_skb=%d", pkt_dev->clone_skb);
+		return count;
+	}
+	if (!strcmp(name, "rx")) {
+		pkt_dev->flags |= F_DO_RX;
+
+		sprintf(pg_result, "OK: RX is ON");
 		return count;
 	}
 	if (!strcmp(name, "count")) {
@@ -1134,7 +1142,7 @@ static ssize_t pktgen_if_write(struct file *file,
 			return len;
 
 		i += len;
-		if ((value > 1) &&
+		if ((value > 1) && !(pkt_dev->flags & F_DO_RX) &&
 		    (!(pkt_dev->odev->priv_flags & IFF_TX_SKB_SHARING)))
 			return -ENOTSUPP;
 		pkt_dev->burst = value < 1 ? 1 : value;
@@ -3317,6 +3325,7 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
 	unsigned int burst = ACCESS_ONCE(pkt_dev->burst);
 	struct net_device *odev = pkt_dev->odev;
 	struct netdev_queue *txq;
+	struct sk_buff *skb;
 	int ret;
 
 	/* If device is offline, then don't send */
@@ -3349,10 +3358,45 @@ static void pktgen_xmit(struct pktgen_dev *pkt_dev)
 		pkt_dev->last_pkt_size = pkt_dev->skb->len;
 		pkt_dev->allocated_skbs++;
 		pkt_dev->clone_count = 0;	/* reset counter */
+		if (pkt_dev->flags & F_DO_RX)
+			pkt_dev->skb->protocol = eth_type_trans(pkt_dev->skb,
+								pkt_dev->skb->dev);
 	}
 
 	if (pkt_dev->delay && pkt_dev->last_ok)
 		spin(pkt_dev, pkt_dev->next_tx);
+
+	if (pkt_dev->flags & F_DO_RX) {
+		skb = pkt_dev->skb;
+		atomic_add(burst, &skb->users);
+		local_bh_disable();
+		do {
+			ret = netif_receive_skb(skb);
+			if (ret == NET_RX_DROP)
+				pkt_dev->errors++;
+			pkt_dev->sofar++;
+			pkt_dev->seq_num++;
+			if (atomic_read(&skb->users) != burst) {
+				/* skb was queued by rps/rfs or taps,
+				 * so cannot reuse this skb
+				 */
+				atomic_sub(burst - 1, &skb->users);
+				/* get out of the loop and wait
+				 * until skb is consumed
+				 */
+				pkt_dev->last_ok = 1;
+				pkt_dev->clone_skb = 0;
+				break;
+			}
+			/* skb was 'freed' by stack, so clean few
+			 * bits and reuse it
+			 */
+#ifdef CONFIG_NET_CLS_ACT
+			skb->tc_verd = 0; /* reset reclass/redir ttl */
+#endif
+		} while (--burst > 0);
+		goto out;
+	}
 
 	txq = skb_get_tx_queue(odev, pkt_dev->skb);
 
@@ -3401,6 +3445,7 @@ xmit_more:
 unlock:
 	HARD_TX_UNLOCK(odev, txq);
 
+out:
 	local_bh_enable();
 
 	/* If pkt_dev->count is zero, then run forever */
