@@ -330,6 +330,39 @@ struct sk_filter {
 
 #define BPF_PROG_RUN(filter, ctx)  (*filter->bpf_func)(ctx, filter->insnsi)
 
+DECLARE_PER_CPU(struct bpf_prog *, next_bpf_prog);
+DECLARE_PER_CPU(u32, bpf_loop_count);
+#define MAX_BPF_LOOPS 32
+
+static __always_inline u32 bpf_prog_run(struct bpf_prog *prog, void *ctx)
+{
+	struct bpf_prog *next_prog;
+	u32 ret, initial_count;
+
+	initial_count = __this_cpu_read(bpf_loop_count);
+
+run_next_program:
+	__this_cpu_write(next_bpf_prog, NULL);
+
+	/* execute BPF program which may call bpf_run_next() helper */
+	ret = (*prog->bpf_func)(ctx, prog->insnsi);
+
+	next_prog = __this_cpu_read(next_bpf_prog);
+
+	if (likely(!next_prog))
+		goto out;
+
+	if (next_prog->type != prog->type)
+		goto out;
+
+	prog = next_prog;
+	if (__this_cpu_inc_return(bpf_loop_count) - initial_count < MAX_BPF_LOOPS)
+		goto run_next_program;
+
+out:
+	return ret;
+}
+
 static inline unsigned int bpf_prog_size(unsigned int proglen)
 {
 	return max(sizeof(struct bpf_prog),

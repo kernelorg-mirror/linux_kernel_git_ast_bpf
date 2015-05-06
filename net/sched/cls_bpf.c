@@ -72,7 +72,7 @@ static int cls_bpf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	/* Needed here for accessing maps. */
 	rcu_read_lock();
 	list_for_each_entry_rcu(prog, &head->plist, link) {
-		int filter_res = BPF_PROG_RUN(prog->filter, skb);
+		int filter_res = bpf_prog_run(prog->filter, skb);
 
 		if (filter_res == 0)
 			continue;

@@ -13,6 +13,7 @@
 #include <linux/rcupdate.h>
 #include <linux/random.h>
 #include <linux/smp.h>
+#include <linux/filter.h>
 
 /* If kernel subsystem is allowing eBPF programs to call this function,
  * inside its own verifier_ops->get_func_proto() callback it should return
@@ -110,4 +111,26 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
 	.func		= bpf_get_smp_processor_id,
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
+};
+
+static u64 bpf_run_next(u64 r1, u64 index, u64 r3, u64 r4, u64 r5)
+{
+	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	struct bpf_prog **progs = (struct bpf_prog **) array->value;
+
+	if (index >= array->map.max_entries)
+		return -E2BIG;
+
+	__this_cpu_write(next_bpf_prog, progs[index]);
+
+	return 0;
+}
+
+const struct bpf_func_proto bpf_run_next_proto = {
+	.func = bpf_run_next,
+	.gpl_only = false,
+	.ret_type = RET_INTEGER,
+	.arg1_type = ARG_CONST_MAP_PTR,
+	.arg2_type = ARG_ANYTHING,
 };
