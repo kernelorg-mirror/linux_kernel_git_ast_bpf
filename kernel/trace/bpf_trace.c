@@ -50,7 +50,7 @@ unsigned int trace_call_bpf(struct bpf_prog *prog, void *ctx)
 	}
 
 	rcu_read_lock();
-	ret = BPF_PROG_RUN(prog, ctx);
+	ret = bpf_prog_run(prog, ctx);
 	rcu_read_unlock();
 
  out:
@@ -172,6 +172,8 @@ static const struct bpf_func_proto *kprobe_prog_func_proto(enum bpf_func_id func
 		return &bpf_probe_read_proto;
 	case BPF_FUNC_ktime_get_ns:
 		return &bpf_ktime_get_ns_proto;
+	case BPF_FUNC_tail_call:
+		return &bpf_tail_call_proto;
 
 	case BPF_FUNC_trace_printk:
 		/*

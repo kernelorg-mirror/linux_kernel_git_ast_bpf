@@ -176,6 +176,37 @@ noinline u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
 	return 0;
 }
 
+#define MAX_TAIL_CALL_CNT 32
+DEFINE_PER_CPU(u32, bpf_tail_call_cnt);
+EXPORT_PER_CPU_SYMBOL(bpf_tail_call_cnt);
+
+u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5)
+{
+	struct bpf_map *map = (struct bpf_map *) (unsigned long) r2;
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	struct bpf_prog **progs = (struct bpf_prog **) array->value;
+	struct bpf_prog *prog;
+
+	if (index >= array->map.max_entries)
+		return 0;
+
+	if (__this_cpu_inc_return(bpf_tail_call_cnt) > MAX_TAIL_CALL_CNT)
+		return 0;
+
+	prog = READ_ONCE(progs[index]);
+
+	return (u64) (long) prog;
+}
+
+const struct bpf_func_proto bpf_tail_call_proto = {
+	.func = bpf_tail_call,
+	.gpl_only = false,
+	.ret_type = RET_INTEGER,
+	.arg1_type = ARG_PTR_TO_CTX,
+	.arg2_type = ARG_CONST_MAP_PTR,
+	.arg3_type = ARG_ANYTHING,
+};
+
 /**
  *	__bpf_prog_run - run eBPF program on a given context
  *	@ctx: is the data we are operating on
@@ -429,6 +460,11 @@ select_insn:
 		 */
 		BPF_R0 = (__bpf_call_base + insn->imm)(BPF_R1, BPF_R2, BPF_R3,
 						       BPF_R4, BPF_R5);
+		if (insn->imm == bpf_tail_call - __bpf_call_base && BPF_R0) {
+			ARG1 = BPF_R1;
+			insn = ((struct bpf_prog *) (long) BPF_R0)->insnsi;
+			goto select_insn;
+		}
 		CONT;
 
 	/* JMP */

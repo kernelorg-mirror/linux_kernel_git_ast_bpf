@@ -330,6 +330,16 @@ struct sk_filter {
 
 #define BPF_PROG_RUN(filter, ctx)  (*filter->bpf_func)(ctx, filter->insnsi)
 
+u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5);
+
+DECLARE_PER_CPU(u32, bpf_tail_call_cnt);
+
+static __always_inline u32 bpf_prog_run(struct bpf_prog *prog, void *ctx)
+{
+	__this_cpu_write(bpf_tail_call_cnt, 0);
+	return (*prog->bpf_func)(ctx, prog->insnsi);
+}
+
 static inline unsigned int bpf_prog_size(unsigned int proglen)
 {
 	return max(sizeof(struct bpf_prog),

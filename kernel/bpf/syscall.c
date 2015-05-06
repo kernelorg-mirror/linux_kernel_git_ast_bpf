@@ -68,6 +68,9 @@ static int bpf_map_release(struct inode *inode, struct file *filp)
 {
 	struct bpf_map *map = filp->private_data;
 
+	if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY)
+		bpf_prog_array_map_clear(map);
+
 	bpf_map_put(map);
 	return 0;
 }

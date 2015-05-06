@@ -691,6 +691,12 @@ xadd:			if (is_imm8(insn->off))
 		case BPF_JMP | BPF_CALL:
 			func = (u8 *) __bpf_call_base + imm32;
 			jmp_offset = func - (image + addrs[i]);
+			if (func == (void *) bpf_tail_call) {
+				EMIT1(0x57); /* push %rdi */
+
+				/* cost of register restore and jump */
+				jmp_offset += 1 + 4 + 2 + 7 * 4 + 1 + 4 + 4 + 2;
+			}
 			if (seen_ld_abs) {
 				EMIT2(0x41, 0x52); /* push %r10 */
 				EMIT2(0x41, 0x51); /* push %r9 */
@@ -708,6 +714,38 @@ xadd:			if (is_imm8(insn->off))
 			if (seen_ld_abs) {
 				EMIT2(0x41, 0x59); /* pop %r9 */
 				EMIT2(0x41, 0x5A); /* pop %r10 */
+			}
+			if (func == (void *) bpf_tail_call) {
+				EMIT1(0x5F); /* pop %rdi */
+
+				/* cmp rax, 0 */
+				EMIT4(0x48, 0x83, 0xF8, 0x00);
+
+				/* if bpf_prog == NULL, skip over jump */
+				EMIT2(X86_JE, 7 * 4 + 1 + 4 + 4 + 2);
+
+				/* restore rbx, r13, r14, r15 and frame */
+				EMIT3_off32(0x48, 0x8B, 0x9D, -stacksize);
+				EMIT3_off32(0x4C, 0x8B, 0xAD, -stacksize + 8);
+				EMIT3_off32(0x4C, 0x8B, 0xB5, -stacksize + 16);
+				EMIT3_off32(0x4C, 0x8B, 0xBD, -stacksize + 24);
+				EMIT1(0xC9); /* leave */
+
+				/* need to populate rsi, if we're jumping from
+				 * JITed program into non-JITed
+				 */
+				/* lea rsi, [rax + 40] */
+				EMIT4(0x48, 0x8D, 0x70, offsetof(struct bpf_prog, insnsi));
+
+				/* mov rax, qword ptr [rax + 32] */
+				EMIT4(0x48, 0x8B, 0x40, offsetof(struct bpf_prog, bpf_func));
+
+				/* now we're ready to jump into next BPF program
+				 * rdi == ctx (1st arg)
+				 * rsi == prog->insnsi (2nd arg)
+				 * rax == prog->bpf_func
+				 */
+				EMIT2(0xFF, 0xE0); /* jmp rax */
 			}
 			break;
 

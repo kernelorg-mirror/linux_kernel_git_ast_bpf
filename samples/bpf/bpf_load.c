@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <ctype.h>
 #include "libbpf.h"
 #include "bpf_helpers.h"
 #include "bpf_load.h"
@@ -29,6 +30,7 @@ int map_fd[MAX_MAPS];
 int prog_fd[MAX_PROGS];
 int event_fd[MAX_PROGS];
 int prog_cnt;
+int prog_array_fd = -1;
 
 static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 {
@@ -54,23 +56,6 @@ static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 		return -1;
 	}
 
-	if (is_kprobe || is_kretprobe) {
-		if (is_kprobe)
-			event += 7;
-		else
-			event += 10;
-
-		snprintf(buf, sizeof(buf),
-			 "echo '%c:%s %s' >> /sys/kernel/debug/tracing/kprobe_events",
-			 is_kprobe ? 'p' : 'r', event, event);
-		err = system(buf);
-		if (err < 0) {
-			printf("failed to create kprobe '%s' error '%s'\n",
-			       event, strerror(errno));
-			return -1;
-		}
-	}
-
 	fd = bpf_prog_load(prog_type, prog, size, license, kern_version);
 
 	if (fd < 0) {
@@ -82,6 +67,39 @@ static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 
 	if (is_socket)
 		return 0;
+
+	if (is_kprobe || is_kretprobe) {
+		if (is_kprobe)
+			event += 7;
+		else
+			event += 10;
+
+		if (*event == 0) {
+			printf("event name cannot be empty\n");
+			return -1;
+		}
+
+		if (isdigit(*event)) {
+			int ind = atoi(event);
+
+			err = bpf_update_elem(prog_array_fd, &ind, &fd, BPF_ANY);
+			if (err < 0) {
+				printf("failed to store prog_fd in prog_array\n");
+				return -1;
+			}
+			return 0;
+		}
+
+		snprintf(buf, sizeof(buf),
+			 "echo '%c:%s %s' >> /sys/kernel/debug/tracing/kprobe_events",
+			 is_kprobe ? 'p' : 'r', event, event);
+		err = system(buf);
+		if (err < 0) {
+			printf("failed to create kprobe '%s' error '%s'\n",
+			       event, strerror(errno));
+			return -1;
+		}
+	}
 
 	strcpy(buf, DEBUGFS);
 	strcat(buf, "events/kprobes/");
@@ -130,6 +148,9 @@ static int load_maps(struct bpf_map_def *maps, int len)
 					   maps[i].max_entries);
 		if (map_fd[i] < 0)
 			return 1;
+
+		if (maps[i].type == BPF_MAP_TYPE_PROG_ARRAY)
+			prog_array_fd = map_fd[i];
 	}
 	return 0;
 }
@@ -288,6 +309,7 @@ int load_bpf_file(char *path)
 	}
 
 	close(fd);
+
 	return 0;
 }
 

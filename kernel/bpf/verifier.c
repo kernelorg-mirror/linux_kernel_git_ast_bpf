@@ -907,6 +907,14 @@ static int check_call(struct verifier_env *env, int func_id)
 			fn->ret_type, func_id);
 		return -EINVAL;
 	}
+
+	if (map && map->map_type == BPF_MAP_TYPE_PROG_ARRAY) {
+		/* prog_array map type needs extra care:
+		 * bpf_map_update_elem() call is only allowed via syscall
+		 */
+		if (func_id == BPF_FUNC_map_update_elem)
+			return -EINVAL;
+	}
 	return 0;
 }
 
