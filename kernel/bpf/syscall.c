@@ -68,6 +68,9 @@ static int bpf_map_release(struct inode *inode, struct file *filp)
 {
 	struct bpf_map *map = filp->private_data;
 
+	if (map->map_type == BPF_MAP_TYPE_PROG_ARRAY)
+		bpf_prog_array_map_clear(map);
+
 	bpf_map_put(map);
 	return 0;
 }
@@ -532,7 +535,9 @@ static int bpf_prog_load(union bpf_attr *attr)
 	fixup_bpf_calls(prog);
 
 	/* eBPF program is ready to be JITed */
-	bpf_prog_select_runtime(prog);
+	err = bpf_prog_select_runtime(prog);
+	if (err < 0)
+		goto free_used_maps;
 
 	err = anon_inode_getfd("bpf-prog", &bpf_prog_fops, prog, O_RDWR | O_CLOEXEC);
 	if (err < 0)

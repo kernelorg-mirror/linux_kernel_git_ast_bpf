@@ -176,6 +176,21 @@ noinline u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
 	return 0;
 }
 
+/* dummy helper */
+u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5)
+{
+	return 0;
+}
+
+const struct bpf_func_proto bpf_tail_call_proto = {
+	.func = bpf_tail_call,
+	.gpl_only = false,
+	.ret_type = RET_INTEGER,
+	.arg1_type = ARG_PTR_TO_CTX,
+	.arg2_type = ARG_CONST_MAP_PTR,
+	.arg3_type = ARG_ANYTHING,
+};
+
 /**
  *	__bpf_prog_run - run eBPF program on a given context
  *	@ctx: is the data we are operating on
@@ -287,6 +302,7 @@ static unsigned int __bpf_prog_run(void *ctx, const struct bpf_insn *insn)
 		[BPF_LD | BPF_IMM | BPF_DW] = &&LD_IMM_DW,
 	};
 	void *ptr;
+	u32 tail_call_cnt = 0;
 	int off;
 
 #define CONT	 ({ insn++; goto select_insn; })
@@ -423,12 +439,34 @@ select_insn:
 
 	/* CALL */
 	JMP_CALL:
+		if (insn->imm == bpf_tail_call - __bpf_call_base) {
+			struct bpf_map *map = (struct bpf_map *) (unsigned long) BPF_R2;
+			struct bpf_array *array = container_of(map, struct bpf_array, map);
+			struct bpf_prog *prog;
+			u64 index = BPF_R3;
+
+			if (index >= array->map.max_entries)
+				goto out;
+
+			if (tail_call_cnt > MAX_TAIL_CALL_CNT)
+				goto out;
+			tail_call_cnt++;
+
+			prog = READ_ONCE(array->prog[index]);
+			if (!prog)
+				goto out;
+
+			ARG1 = BPF_R1;
+			insn = prog->insnsi;
+			goto select_insn;
+		}
 		/* Function call scratches BPF_R1-BPF_R5 registers,
 		 * preserves BPF_R6-BPF_R9, and stores return value
 		 * into BPF_R0.
 		 */
 		BPF_R0 = (__bpf_call_base + insn->imm)(BPF_R1, BPF_R2, BPF_R3,
 						       BPF_R4, BPF_R5);
+out:
 		CONT;
 
 	/* JMP */
@@ -619,6 +657,40 @@ void __weak bpf_int_jit_compile(struct bpf_prog *prog)
 {
 }
 
+bool bpf_prog_array_compatible(struct bpf_array *array, struct bpf_prog *fp)
+{
+	if (array->required_prog_type) {
+		if (array->required_prog_type != fp->type)
+			return false;
+		if (array->required_jited != fp->jited)
+			return false;
+	} else {
+		array->required_prog_type = fp->type;
+		array->required_jited = fp->jited;
+	}
+	return true;
+}
+
+static int check_tail_call(struct bpf_prog *fp)
+{
+	struct bpf_prog_aux *aux = fp->aux;
+	int i;
+
+	for (i = 0; i < aux->used_map_cnt; i++) {
+		struct bpf_array *array;
+		struct bpf_map *map;
+
+		map = aux->used_maps[i];
+		if (map->map_type != BPF_MAP_TYPE_PROG_ARRAY)
+			continue;
+		array = container_of(map, struct bpf_array, map);
+		if (!bpf_prog_array_compatible(array, fp))
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
 /**
  *	bpf_prog_select_runtime - select execution runtime for BPF program
  *	@fp: bpf_prog populated with internal BPF program
@@ -626,7 +698,7 @@ void __weak bpf_int_jit_compile(struct bpf_prog *prog)
  * try to JIT internal BPF program, if JIT is not available select interpreter
  * BPF program will be executed via BPF_PROG_RUN() macro
  */
-void bpf_prog_select_runtime(struct bpf_prog *fp)
+int bpf_prog_select_runtime(struct bpf_prog *fp)
 {
 	fp->bpf_func = (void *) __bpf_prog_run;
 
@@ -634,6 +706,8 @@ void bpf_prog_select_runtime(struct bpf_prog *fp)
 	bpf_int_jit_compile(fp);
 	/* Lock whole bpf_prog as read-only */
 	bpf_prog_lock_ro(fp);
+
+	return check_tail_call(fp);
 }
 EXPORT_SYMBOL_GPL(bpf_prog_select_runtime);
 
