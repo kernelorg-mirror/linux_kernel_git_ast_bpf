@@ -65,6 +65,7 @@ enum bpf_arg_type {
 
 	ARG_PTR_TO_CTX,		/* pointer to context */
 	ARG_ANYTHING,		/* any (initialized) argument is ok */
+	ARG_VARARG,		/* optional argument */
 };
 
 /* type of values returned from helper functions */
@@ -166,6 +167,8 @@ void bpf_prog_put_rcu(struct bpf_prog *prog);
 
 struct bpf_map *bpf_map_get(struct fd f);
 void bpf_map_put(struct bpf_map *map);
+
+extern int sysctl_unprivileged_bpf_disabled;
 
 /* verify correctness of eBPF program */
 int bpf_check(struct bpf_prog **fp, union bpf_attr *attr);

@@ -173,6 +173,9 @@ static const struct bpf_func_proto bpf_trace_printk_proto = {
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_STACK,
 	.arg2_type	= ARG_CONST_STACK_SIZE,
+	.arg3_type	= ARG_VARARG,
+	.arg4_type	= ARG_VARARG,
+	.arg5_type	= ARG_VARARG,
 };
 
 const struct bpf_func_proto *bpf_get_trace_printk_proto(void)
