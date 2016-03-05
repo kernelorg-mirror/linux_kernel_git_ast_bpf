@@ -15,6 +15,7 @@
 #include <linux/filter.h>
 #include <linux/vmalloc.h>
 #include <linux/percpu_ida.h>
+#include "bittag.h"
 
 struct bucket {
 	struct hlist_head head;
@@ -25,7 +26,9 @@ struct bpf_htab {
 	struct bpf_map map;
 	struct bucket *buckets;
 	void *elems;
-	struct percpu_ida tag_pool;
+//	struct percpu_ida tag_pool;
+	struct bitmap_tags tag_pool;
+	atomic_t count;	/* number of elements in this hashtable */
 	u32 n_buckets;	/* number of hash buckets */
 	u32 elem_size;	/* size of each element in bytes */
 };
@@ -102,6 +105,7 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	htab->map.key_size = attr->key_size;
 	htab->map.value_size = attr->value_size;
 	htab->map.max_entries = attr->max_entries;
+	htab->map.map_flags = attr->map_flags;
 
 	/* check sanity of attributes.
 	 * value_size == 0 may be allowed in the future to use map as a set
@@ -178,6 +182,9 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 		raw_spin_lock_init(&htab->buckets[i].lock);
 	}
 
+	if (attr->map_flags & BPF_F_NO_PREALLOC)
+		goto done;
+
 	htab->elems = vzalloc(htab->elem_size * htab->map.max_entries);
 	if (!htab->elems)
 		goto free_buckets;
@@ -197,9 +204,11 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	}
 
 alloc_ida:
-	err = percpu_ida_init(&htab->tag_pool, htab->map.max_entries);
+//	err = percpu_ida_init(&htab->tag_pool, htab->map.max_entries);
+	err = bt_init(&htab->tag_pool, htab->map.max_entries);
 	if (err)
 		goto free_elems;
+done:
 	return &htab->map;
 
 free_elems:
@@ -328,6 +337,23 @@ find_first_elem:
 	return -ENOENT;
 }
 
+static void htab_elem_free(struct bpf_htab *htab, struct htab_elem *l)
+{
+	if (!(htab->map.map_flags & BPF_F_NO_PREALLOC)) {
+//		printk("free cpu %d tag %d\n", raw_smp_processor_id(),
+//				((void *)l - htab->elems) / htab->elem_size);
+		bt_free_tag(&htab->tag_pool,
+			    ((void *)l - htab->elems) / htab->elem_size);
+//		percpu_ida_free(&htab->tag_pool,
+//				((void *)l - htab->elems) / htab->elem_size);
+	} else {
+		atomic_dec(&htab->count);
+		if (htab->map.map_type == BPF_MAP_TYPE_PERCPU_HASH)
+			free_percpu(htab_elem_get_ptr(l, htab->map.key_size));
+		kfree(l);
+	}
+}
+
 static void htab_elem_free_rcu(struct rcu_head *head)
 {
 	struct htab_elem *l = container_of(head, struct htab_elem, rcu);
@@ -339,15 +365,22 @@ static void htab_elem_free_rcu(struct rcu_head *head)
 	 */
 	preempt_disable();
 	__this_cpu_inc(bpf_prog_active);
-	percpu_ida_free(&htab->tag_pool, ((void *)l - htab->elems) / htab->elem_size);
+	htab_elem_free(htab, l);
 	__this_cpu_dec(bpf_prog_active);
 	preempt_enable();
 }
 
 static void free_htab_elem(struct bpf_htab *htab, struct htab_elem *l)
 {
-	l->htab = htab;
-	call_rcu(&l->rcu, htab_elem_free_rcu);
+	if (!(htab->map.map_flags & BPF_F_NO_PREALLOC)) {
+		bt_free_tag(&htab->tag_pool,
+			    ((void *)l - htab->elems) / htab->elem_size);
+//		percpu_ida_free(&htab->tag_pool,
+//				((void *)l - htab->elems) / htab->elem_size);
+	} else {
+		l->htab = htab;
+		call_rcu(&l->rcu, htab_elem_free_rcu);
+	}
 }
 
 static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
@@ -355,22 +388,47 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
 					 bool percpu, bool onallcpus)
 {
 	u32 size = htab->map.value_size;
+	bool prealloc = !(htab->map.map_flags & BPF_F_NO_PREALLOC);
 	struct htab_elem *l_new;
 	void __percpu *pptr;
 	int tag;
 
-	tag = percpu_ida_alloc(&htab->tag_pool, TASK_RUNNING);
-	if (tag < 0)
-		return NULL;
+	if (prealloc) {
+		tag = bt_alloc_tag(&htab->tag_pool);
+//		tag = percpu_ida_alloc(&htab->tag_pool, TASK_RUNNING);
+		if (tag < 0) {
+			//printk("out of tags\n");
+			return ERR_PTR(-E2BIG);
+		}
 
-	l_new = (struct htab_elem *)(htab->elems + tag * htab->elem_size);
+//		printk("alloc cpu %d tag %d\n", raw_smp_processor_id(), tag);
+		l_new = (struct htab_elem *)(htab->elems + tag * htab->elem_size);
+	} else {
+		if (atomic_inc_return(&htab->count) > htab->map.max_entries) {
+			atomic_dec(&htab->count);
+			return ERR_PTR(-E2BIG);
+		}
+		l_new = kmalloc(htab->elem_size, GFP_ATOMIC | __GFP_NOWARN);
+		if (!l_new)
+			return ERR_PTR(-ENOMEM);
+	}
 
 	memcpy(l_new->key, key, key_size);
 	if (percpu) {
 		/* round up value_size to 8 bytes */
 		size = round_up(size, 8);
 
-		pptr = htab_elem_get_ptr(l_new, key_size);
+		if (prealloc) {
+			pptr = htab_elem_get_ptr(l_new, key_size);
+		} else {
+			/* alloc_percpu zero-fills */
+			pptr = __alloc_percpu_gfp(size, 8,
+						  GFP_ATOMIC | __GFP_NOWARN);
+			if (!pptr) {
+				kfree(l_new);
+				return ERR_PTR(-ENOMEM);
+			}
+		}
 
 		if (!onallcpus) {
 			/* copy true value_size bytes */
@@ -384,6 +442,8 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
 				off += size;
 			}
 		}
+		if (!prealloc)
+			htab_elem_set_ptr(l_new, key_size, pptr);
 	} else {
 		memcpy(l_new->key + round_up(key_size, 8), value, size);
 	}
@@ -441,9 +501,9 @@ static int htab_map_update_elem(struct bpf_map *map, void *key, void *value,
 		goto err;
 
 	l_new = alloc_htab_elem(htab, key, value, key_size, hash, false, false);
-	if (!l_new) {
-		/* all pre-allocated elements are in use */
-		ret = -E2BIG;
+	if (IS_ERR(l_new)) {
+		/* all pre-allocated elements are in use or memory exhausted */
+		ret = PTR_ERR(l_new);
 		goto err;
 	}
 
@@ -515,8 +575,8 @@ static int __htab_percpu_map_update_elem(struct bpf_map *map, void *key,
 	} else {
 		l_new = alloc_htab_elem(htab, key, value, key_size,
 					hash, true, onallcpus);
-		if (!l_new) {
-			ret = -E2BIG;
+		if (IS_ERR(l_new)) {
+			ret = PTR_ERR(l_new);
 			goto err;
 		}
 		hlist_add_head_rcu(&l_new->hash_node, head);
@@ -566,6 +626,21 @@ static int htab_map_delete_elem(struct bpf_map *map, void *key)
 	return ret;
 }
 
+static void delete_all_elements(struct bpf_htab *htab)
+{
+	int i;
+
+	for (i = 0; i < htab->n_buckets; i++) {
+		struct hlist_head *head = select_bucket(htab, i);
+		struct hlist_node *n;
+		struct htab_elem *l;
+
+		hlist_for_each_entry_safe(l, n, head, hash_node) {
+			hlist_del_rcu(&l->hash_node);
+			htab_elem_free(htab, l);
+		}
+	}
+}
 /* Called when map->refcnt goes to zero, either from workqueue or from syscall */
 static void htab_map_free(struct bpf_map *map)
 {
@@ -582,8 +657,13 @@ static void htab_map_free(struct bpf_map *map)
 	 * not have executed. Wait for them.
 	 */
 	rcu_barrier();
-	htab_free_elems(htab);
-	percpu_ida_destroy(&htab->tag_pool);
+	if (htab->map.map_flags & BPF_F_NO_PREALLOC) {
+		delete_all_elements(htab);
+	} else {
+		htab_free_elems(htab);
+		bt_destroy(&htab->tag_pool);
+//		percpu_ida_destroy(&htab->tag_pool);
+	}
 	kvfree(htab->buckets);
 	kfree(htab);
 }

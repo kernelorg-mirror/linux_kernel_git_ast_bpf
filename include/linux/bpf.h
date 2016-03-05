@@ -37,6 +37,7 @@ struct bpf_map {
 	u32 key_size;
 	u32 value_size;
 	u32 max_entries;
+	u32 map_flags;
 	u32 pages;
 	struct user_struct *user;
 	const struct bpf_map_ops *ops;
