@@ -111,6 +111,7 @@ static void bpf_flush_icache(void *start, void *end)
 
 /* pick a register outside of BPF range for JIT internal work */
 #define AUX_REG (MAX_BPF_REG + 1)
+#define X64_R9 (AUX_REG + 1)
 
 /* the following table maps BPF registers to x64 registers.
  * x64 register r12 is unused, since if used as base address register
@@ -129,6 +130,7 @@ static const int reg2hex[] = {
 	[BPF_REG_9] = 7,  /* r15 callee saved */
 	[BPF_REG_FP] = 5, /* rbp readonly */
 	[AUX_REG] = 3,    /* r11 temp register */
+	[X64_R9] = 1,     /* r9 skb_headlen */
 };
 
 /* is_ereg() == true if BPF register 'reg' maps to x64 r8..r15
@@ -139,6 +141,7 @@ static bool is_ereg(u32 reg)
 {
 	return (1 << reg) & (BIT(BPF_REG_5) |
 			     BIT(AUX_REG) |
+			     BIT(X64_R9) |
 			     BIT(BPF_REG_7) |
 			     BIT(BPF_REG_8) |
 			     BIT(BPF_REG_9));
@@ -337,6 +340,50 @@ static void emit_load_skb_data_hlen(u8 **pprog)
 	/* mov %r10, off32(%rdi) */
 	EMIT3_off32(0x4c, 0x8b, 0x97, offsetof(struct sk_buff, data));
 	*pprog = prog;
+}
+
+static int emit_bpf_ld_dw(u8 **pprog, struct bpf_insn *insn, s64 jmp_offset)
+{
+	u32 last_byte = (u32) insn->imm + (u16) insn->off;
+	u32 dst_reg = insn->dst_reg;
+	u32 src_reg = insn->src_reg;
+	u8 *prog = *pprog;
+	int cnt = 0;
+
+	if (BPF_MODE(insn->code) == BPF_ABS) {
+		/* cmp %r9d, insn->off + insn->imm */
+		EMIT3_off32(0x41, 0x81, 0xf9, last_byte);
+	} else {
+		/* lea dst_reg, [src_reg + insn->off + imm] */
+		EMIT3_off32(add_2mod(0x48, src_reg, dst_reg), 0x8d,
+			    add_2reg(0x80, src_reg, dst_reg), last_byte);
+		/* cmp %r9, dst_reg */
+		EMIT3(add_2mod(0x48, X64_R9, dst_reg), 0x39,
+		      add_2reg(0xC0, X64_R9, dst_reg));
+	}
+	if (is_imm8(jmp_offset)) {
+		EMIT2(X86_JB, jmp_offset);
+	} else if (is_simm32(jmp_offset)) {
+		EMIT2_off32(0x0F, X86_JB + 0x10, jmp_offset);
+	} else {
+		return -EFAULT;
+	}
+
+	if (BPF_MODE(insn->code) == BPF_ABS) {
+		/* lea dst_reg, [%r10 + insn->off] */
+		EMIT3_off32(add_2mod(0x49, 0, dst_reg), 0x8d,
+			    add_2reg(0x82, 0, dst_reg),
+			    (u16) insn->off);
+	} else {
+		/* lea dst_reg, [%r10 + src_reg + insn->off] */
+		EMIT4_off32(add_2mod(0x49, 0, dst_reg), 0x8d,
+			    add_2reg(0x84, 0, dst_reg),
+			    add_2reg(0x02, 0, src_reg),
+			    (u16) insn->off);
+	}
+
+	*pprog = prog;
+	return 0;
 }
 
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,
@@ -1017,6 +1064,13 @@ common_load:
 		case BPF_LD | BPF_ABS | BPF_B:
 			func = CHOOSE_LOAD_FUNC(imm32, sk_load_byte);
 			goto common_load;
+
+		case BPF_LD | BPF_IND | BPF_DW:
+		case BPF_LD | BPF_ABS | BPF_DW:
+			ctx->seen_ld_abs = seen_ld_abs = true;
+			jmp_offset = ctx->cleanup_addr - addrs[i];
+			emit_bpf_ld_dw(&prog, insn, jmp_offset);
+			break;
 
 		case BPF_JMP | BPF_EXIT:
 			if (seen_exit) {
