@@ -136,12 +136,13 @@ enum bpf_reg_type {
 	FRAME_PTR,		 /* reg == frame_pointer */
 	PTR_TO_STACK,		 /* reg == frame_pointer + imm */
 	CONST_IMM,		 /* constant integer value */
+	PTR_TO_PACKET,		 /* pointer to linear part of the packet */
 };
 
 struct reg_state {
 	enum bpf_reg_type type;
 	union {
-		/* valid when type == CONST_IMM | PTR_TO_STACK */
+		/* valid when type == CONST_IMM | PTR_TO_STACK | PTR_TO_PACKET */
 		long imm;
 
 		/* valid when type == CONST_PTR_TO_MAP | PTR_TO_MAP_VALUE |
@@ -648,6 +649,19 @@ static int check_map_access(struct verifier_env *env, u32 regno, int off,
 	return 0;
 }
 
+static int check_packet_access(struct verifier_env *env, u32 regno, int off,
+			       int size)
+{
+	long linear_size = env->cur_state.regs[regno].imm;
+
+	if (off < 0 || off + size > linear_size) {
+		verbose("invalid access to packet, off=%d size=%d, allowed=%ld\n",
+			off, size, linear_size);
+		return -EACCES;
+	}
+	return 0;
+}
+
 /* check access to 'struct bpf_context' fields */
 static int check_ctx_access(struct verifier_env *env, int off, int size,
 			    enum bpf_access_type t)
@@ -698,7 +712,13 @@ static int check_mem_access(struct verifier_env *env, u32 regno, int off,
 	if (size < 0)
 		return size;
 
-	if (off % size != 0) {
+	if (state->regs[regno].type == PTR_TO_PACKET) {
+		if (!IS_ENABLED(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS) &&
+		    size != 1) {
+			verbose("only byte-sized access allowed\n");
+			return -EACCES;
+			}
+	} else if (off % size != 0) {
 		verbose("misaligned access off %d size %d\n", off, size);
 		return -EACCES;
 	}
@@ -740,6 +760,14 @@ static int check_mem_access(struct verifier_env *env, u32 regno, int off,
 		} else {
 			err = check_stack_read(state, off, size, value_regno);
 		}
+	} else if (state->regs[regno].type == PTR_TO_PACKET) {
+		if (t == BPF_WRITE) {
+			verbose("ld_abs_dw cannot be used to write into packet\n");
+			return -EACCES;
+		}
+		err = check_packet_access(env, regno, off, size);
+		if (!err && t == BPF_READ && value_regno >= 0)
+			mark_reg_unknown_value(state->regs, value_regno);
 	} else {
 		verbose("R%d invalid mem access '%s'\n",
 			regno, reg_type_str[state->regs[regno].type]);
@@ -1374,14 +1402,25 @@ static int check_ld_abs(struct verifier_env *env, struct bpf_insn *insn)
 	int i, err;
 
 	if (!may_access_skb(env->prog->type)) {
-		verbose("BPF_LD_ABS|IND instructions not allowed for this program type\n");
+		verbose("BPF_LD_[ABS|IND] instructions not allowed for this program type\n");
 		return -EINVAL;
 	}
 
-	if (insn->dst_reg != BPF_REG_0 || insn->off != 0 ||
-	    (mode == BPF_ABS && insn->src_reg != BPF_REG_0)) {
-		verbose("BPF_LD_ABS uses reserved fields\n");
-		return -EINVAL;
+	if (BPF_SIZE(insn->code) == BPF_DW) {
+		if ((mode == BPF_ABS && insn->src_reg != BPF_REG_0) ||
+		    insn->imm == 0) {
+			verbose("BPF_LD_[ABS|IND]_DW uses reserved fields\n");
+			return -EINVAL;
+		}
+		err = check_reg_arg(regs, insn->dst_reg, DST_OP_NO_MARK);
+		if (err)
+			return err;
+	} else {
+		if (insn->dst_reg != BPF_REG_0 || insn->off != 0 ||
+		    (mode == BPF_ABS && insn->src_reg != BPF_REG_0)) {
+			verbose("BPF_LD_[ABS|IND] uses reserved fields\n");
+			return -EINVAL;
+		}
 	}
 
 	/* check whether implicit source operand (register R6) is readable */
@@ -1399,6 +1438,12 @@ static int check_ld_abs(struct verifier_env *env, struct bpf_insn *insn)
 		err = check_reg_arg(regs, insn->src_reg, SRC_OP);
 		if (err)
 			return err;
+	}
+
+	if (BPF_SIZE(insn->code) == BPF_DW) {
+		regs[insn->dst_reg].type = PTR_TO_PACKET;
+		regs[insn->dst_reg].imm = insn->imm;
+		return 0;
 	}
 
 	/* reset caller saved regs to unreadable */

@@ -289,9 +289,11 @@ static unsigned int __bpf_prog_run(void *ctx, const struct bpf_insn *insn)
 		[BPF_LDX | BPF_MEM | BPF_H] = &&LDX_MEM_H,
 		[BPF_LDX | BPF_MEM | BPF_W] = &&LDX_MEM_W,
 		[BPF_LDX | BPF_MEM | BPF_DW] = &&LDX_MEM_DW,
+		[BPF_LD | BPF_ABS | BPF_DW] = &&LD_ABS_DW,
 		[BPF_LD | BPF_ABS | BPF_W] = &&LD_ABS_W,
 		[BPF_LD | BPF_ABS | BPF_H] = &&LD_ABS_H,
 		[BPF_LD | BPF_ABS | BPF_B] = &&LD_ABS_B,
+		[BPF_LD | BPF_IND | BPF_DW] = &&LD_IND_DW,
 		[BPF_LD | BPF_IND | BPF_W] = &&LD_IND_W,
 		[BPF_LD | BPF_IND | BPF_H] = &&LD_IND_H,
 		[BPF_LD | BPF_IND | BPF_B] = &&LD_IND_B,
@@ -644,6 +646,20 @@ load_byte:
 	LD_IND_B: /* BPF_R0 = *(u8 *) (skb->data + src_reg + imm32) */
 		off = IMM + SRC;
 		goto load_byte;
+
+	LD_IND_DW: /* dst_reg = skb->data + src_reg + insn->off */
+		tmp = SRC + insn->off;
+		goto header_pointer;
+	LD_ABS_DW: /* dst_reg = skb->data + insn->off */
+		tmp = insn->off;
+header_pointer:
+		{
+		struct sk_buff *skb = (void *) (long) CTX;
+		if (unlikely(tmp + IMM > skb_headlen(skb)))
+			return 0;
+		DST = skb->data + tmp;
+		}
+		CONT;
 
 	default_label:
 		/* If we ever reach this, we have a bug somewhere. */
