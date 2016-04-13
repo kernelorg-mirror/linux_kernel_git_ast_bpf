@@ -1180,6 +1180,48 @@ static struct bpf_test tests[] = {
 		.result_unpriv = REJECT,
 		.result = ACCEPT,
 	},
+	{
+		"ld_abs_dw: test 1",
+		.insns = {
+			BPF_MOV64_REG(BPF_REG_6, BPF_REG_1),
+			BPF_RAW_INSN(BPF_LD | BPF_ABS | BPF_DW, 1, 0, 14, 1),
+			BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_1, 0),
+			BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_1, 1),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.errstr = "invalid access to packet, off=1",
+		.result = REJECT,
+	},
+	{
+		"ld_abs_dw: test 2",
+		.insns = {
+			BPF_MOV64_REG(BPF_REG_6, BPF_REG_1),
+			BPF_RAW_INSN(BPF_LD | BPF_ABS | BPF_DW, 1, 0, 1, 7),
+			BPF_LDX_MEM(BPF_H, BPF_REG_0, BPF_REG_1, 2),
+			BPF_LDX_MEM(BPF_H, BPF_REG_0, BPF_REG_1, 1),
+			BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.errstr = "invalid access to packet, off=0",
+		.result = REJECT,
+	},
+	{
+		"ld_abs_dw: test 3",
+		.insns = {
+			BPF_MOV64_REG(BPF_REG_6, BPF_REG_1),
+			BPF_MOV64_IMM(BPF_REG_2, 10),
+			BPF_RAW_INSN(BPF_LD | BPF_IND | BPF_DW, 1, 2, 1, 7),
+			BPF_LDX_MEM(BPF_H, BPF_REG_0, BPF_REG_1, 2),
+			BPF_LDX_MEM(BPF_H, BPF_REG_0, BPF_REG_1, 1),
+			BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.errstr = "invalid access to packet, off=0",
+		.result = REJECT,
+	},
 };
 
 static int probe_filter_length(struct bpf_insn *fp)
