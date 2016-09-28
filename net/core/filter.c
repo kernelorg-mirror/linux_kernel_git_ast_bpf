@@ -2478,6 +2478,24 @@ static const struct bpf_func_proto bpf_xdp_event_output_proto = {
 	.arg5_type	= ARG_CONST_STACK_SIZE,
 };
 
+BPF_CALL_3(bpf_change_packet_head_tail, struct xdp_buff *, xdp, int, head_delta,
+	   int, tail_delta)
+{
+	/* TODO: validate that delta < XDP_PACKET_HEADROOM */
+	xdp->data += head_delta;
+	xdp->data_end += tail_delta;
+	return 0;
+}
+
+static const struct bpf_func_proto bpf_change_packet_head_tail_proto = {
+	.func		= bpf_change_packet_head_tail,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_ANYTHING,
+};
+
 static const struct bpf_func_proto *
 sk_filter_func_proto(enum bpf_func_id func_id)
 {
@@ -2571,6 +2589,8 @@ xdp_func_proto(enum bpf_func_id func_id)
 		return &bpf_xdp_event_output_proto;
 	case BPF_FUNC_get_smp_processor_id:
 		return &bpf_get_smp_processor_id_proto;
+	case BPF_FUNC_change_packet_head_tail:
+		return &bpf_change_packet_head_tail_proto;
 	default:
 		return sk_filter_func_proto(func_id);
 	}

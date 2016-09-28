@@ -426,6 +426,14 @@ enum bpf_func_id {
 	 */
 	BPF_FUNC_set_hash_invalid,
 
+	/**
+	 * bpf_change_packet_head_tail(xdp_md, head_delta, tail_delta)
+	 * xdp.data += head_delta
+	 * xdp.dat_end += tail_delta
+	 * @xdp: pointer to struct xdp_md
+	 */
+	BPF_FUNC_change_packet_head_tail,
+
 	__BPF_FUNC_MAX_ID,
 };
 
@@ -520,5 +528,6 @@ struct xdp_md {
 	__u32 data;
 	__u32 data_end;
 };
+#define XDP_PACKET_HEADROOM 256
 
 #endif /* _UAPI__LINUX_BPF_H__ */
