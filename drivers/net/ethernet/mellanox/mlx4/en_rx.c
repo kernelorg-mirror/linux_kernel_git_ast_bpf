@@ -79,7 +79,7 @@ static int mlx4_alloc_pages(struct mlx4_en_priv *priv,
 	page_alloc->page_size = PAGE_SIZE << order;
 	page_alloc->page = page;
 	page_alloc->dma = dma;
-	page_alloc->page_offset = 0;
+	page_alloc->page_offset = frag_info->page_offset;
 	/* Not doing get_page() for each frag is a big win
 	 * on asymetric workloads. Note we can not use atomic_set().
 	 */
@@ -886,7 +886,9 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 		 * read bytes but not past the end of the frag.
 		 */
 		if (xdp_prog) {
+			void *orig_data, *orig_data_end;
 			struct xdp_buff xdp;
+			ptrdiff_t delta;
 			dma_addr_t dma;
 			u32 act;
 
@@ -895,15 +897,22 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 						priv->frag_info[0].frag_size,
 						DMA_FROM_DEVICE);
 
-			xdp.data = page_address(frags[0].page) +
+			orig_data = xdp.data = page_address(frags[0].page) +
 							frags[0].page_offset;
-			xdp.data_end = xdp.data + length;
+			orig_data_end = xdp.data_end = xdp.data + length;
 
 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
 			switch (act) {
 			case XDP_PASS:
 				break;
 			case XDP_TX:
+				/* adjust head */
+				delta = xdp.data - orig_data;
+				frags->dma += delta;
+				length -= delta;
+				/* adjust tail */
+				delta = xdp.data_end - orig_data_end;
+				length += delta;
 				if (likely(!mlx4_en_xmit_frame(frags, dev,
 							length, tx_index,
 							&doorbell_pending)))
@@ -1154,7 +1163,8 @@ void mlx4_en_calc_rx_buf(struct net_device *dev)
 	enum dma_data_direction dma_dir = PCI_DMA_FROMDEVICE;
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	int eff_mtu = MLX4_EN_EFF_MTU(dev->mtu);
-	int order = MLX4_EN_ALLOC_PREFER_ORDER;
+	u16 order = MLX4_EN_ALLOC_PREFER_ORDER;
+	u16 page_offset = 0;
 	u32 align = SMP_CACHE_BYTES;
 	int buf_size = 0;
 	int i = 0;
@@ -1169,6 +1179,7 @@ void mlx4_en_calc_rx_buf(struct net_device *dev)
 		 */
 		align = PAGE_SIZE;
 		order = 0;
+		page_offset = XDP_PACKET_HEADROOM;
 	}
 
 	while (buf_size < eff_mtu) {

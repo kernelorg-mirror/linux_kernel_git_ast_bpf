@@ -465,7 +465,8 @@ struct mlx4_en_frag_info {
 	u16 frag_prefix_size;
 	u32 frag_stride;
 	enum dma_data_direction dma_dir;
-	int order;
+	u16 order;
+	u16 page_offset;
 };
 
 #ifdef CONFIG_MLX4_EN_DCB

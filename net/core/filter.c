@@ -2138,6 +2138,24 @@ static const struct bpf_func_proto bpf_skb_change_tail_proto = {
 	.arg3_type	= ARG_ANYTHING,
 };
 
+BPF_CALL_3(bpf_change_pkt_head_tail, struct xdp_buff *, xdp, int, head_delta,
+	   int, tail_delta)
+{
+	/* TODO: validate that delta < XDP_PACKET_HEADROOM */
+	xdp->data += head_delta;
+	xdp->data_end += tail_delta;
+	return 0;
+}
+
+static const struct bpf_func_proto bpf_change_pkt_head_tail_proto = {
+	.func		= bpf_change_pkt_head_tail,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+	.arg3_type	= ARG_ANYTHING,
+};
+
 bool bpf_helper_changes_skb_data(void *func)
 {
 	if (func == bpf_skb_vlan_push ||
@@ -2146,6 +2164,7 @@ bool bpf_helper_changes_skb_data(void *func)
 	    func == bpf_skb_change_proto ||
 	    func == bpf_skb_change_tail ||
 	    func == bpf_skb_pull_data ||
+	    func == bpf_change_pkt_head_tail ||
 	    func == bpf_l3_csum_replace ||
 	    func == bpf_l4_csum_replace)
 		return true;
@@ -2571,6 +2590,8 @@ xdp_func_proto(enum bpf_func_id func_id)
 		return &bpf_xdp_event_output_proto;
 	case BPF_FUNC_get_smp_processor_id:
 		return &bpf_get_smp_processor_id_proto;
+	case BPF_FUNC_change_pkt_head_tail:
+		return &bpf_change_pkt_head_tail_proto;
 	default:
 		return sk_filter_func_proto(func_id);
 	}
