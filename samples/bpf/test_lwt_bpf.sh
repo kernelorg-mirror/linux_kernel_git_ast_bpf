@@ -159,11 +159,11 @@ function test_ctx_out {
 		failure "test_ctx out: packets are dropped"
 	}
 	match_trace "$(get_trace)" "
-len 84 hash 0 protocol 0
+len 84 hash 0 protocol 8
 cb 1234 ingress_ifindex 0 ifindex 0
-len 84 hash 0 protocol 0
+len 84 hash 0 protocol 8
 cb 1234 ingress_ifindex 0 ifindex 0
-len 84 hash 0 protocol 0
+len 84 hash 0 protocol 8
 cb 1234 ingress_ifindex 0 ifindex 0" || exit 1
 	remove_prog out
 }
@@ -266,7 +266,7 @@ cb3: 0 cb4: 0" || exit 1
 function test_drop_all {
 	test_start "test_drop_all on lwt $1"
 	install_test $1 drop_all
-	ping -c 3 $IPVETH1 && {
+	ping -c 3 -w 3 $IPVETH1 && {
 		failure "test_drop_all ${1}: Unexpected success of ping"
 	}
 	match_trace "$(get_trace)" "
@@ -279,7 +279,7 @@ dropping with: 2" || exit 1
 function test_drop_all_in {
 	test_start "test_drop_all on lwt in"
 	install_test in drop_all
-	ping -c 3 $IP_LOCAL && {
+	ping -c 3 -w 3 $IP_LOCAL && {
 		failure "test_drop_all in: Unexpected success of ping"
 	}
 	match_trace "$(get_trace)" "
@@ -371,7 +371,7 @@ DST_MAC=$(lookup_mac $VETH1 $NS1)
 SRC_MAC=$(lookup_mac $VETH0)
 DST_IFINDEX=$(cat /sys/class/net/$VETH0/ifindex)
 
-CLANG_OPTS="-O2 -target bpf -I ../include/"
+CLANG_OPTS="-O2 -target bpf -I../../usr/include/ -D__x86_64__"
 CLANG_OPTS+=" -DSRC_MAC=$SRC_MAC -DDST_MAC=$DST_MAC -DDST_IFINDEX=$DST_IFINDEX"
 clang $CLANG_OPTS -c test_lwt_bpf.c -o test_lwt_bpf.o
 
