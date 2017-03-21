@@ -80,8 +80,9 @@ static void test_hashmap(int task, void *data)
 	assert(bpf_map_update_elem(fd, &key, &value, BPF_EXIST) == 0);
 	key = 2;
 	assert(bpf_map_update_elem(fd, &key, &value, BPF_ANY) == 0);
-	key = 1;
-	assert(bpf_map_update_elem(fd, &key, &value, BPF_ANY) == 0);
+	key = 3;
+	assert(bpf_map_update_elem(fd, &key, &value, BPF_NOEXIST) == -1 &&
+	       errno == E2BIG);
 
 	/* Check that key = 0 doesn't exist. */
 	key = 0;
