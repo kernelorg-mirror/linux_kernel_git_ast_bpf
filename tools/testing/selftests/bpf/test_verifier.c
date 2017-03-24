@@ -4524,6 +4524,26 @@ static struct bpf_test tests[] = {
 		.errstr = "R1 type=map_value_or_null expected=map_ptr",
 		.result = REJECT,
 	},
+	{
+		"overlapping checks for direct packet access",
+		.insns = {
+			BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_1,
+				    offsetof(struct __sk_buff, data)),
+			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1,
+				    offsetof(struct __sk_buff, data_end)),
+			BPF_MOV64_REG(BPF_REG_0, BPF_REG_2),
+			BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, 8),
+			BPF_JMP_REG(BPF_JGT, BPF_REG_0, BPF_REG_3, 4),
+			BPF_MOV64_REG(BPF_REG_1, BPF_REG_2),
+			BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 6),
+			BPF_JMP_REG(BPF_JGT, BPF_REG_1, BPF_REG_3, 1),
+			BPF_LDX_MEM(BPF_H, BPF_REG_0, BPF_REG_2, 6),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.result = ACCEPT,
+		.prog_type = BPF_PROG_TYPE_LWT_XMIT,
+	},
 };
 
 static int probe_filter_length(const struct bpf_insn *fp)
