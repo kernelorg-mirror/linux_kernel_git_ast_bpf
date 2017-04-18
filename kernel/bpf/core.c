@@ -1017,19 +1017,23 @@ select_insn:
 		CONT;
 
 	JMP_TAIL_CALL: {
+		struct bpf_prog **next_prog = (struct bpf_prog **) (unsigned long) BPF_R2;
 		struct bpf_map *map = (struct bpf_map *) (unsigned long) BPF_R2;
 		struct bpf_array *array = container_of(map, struct bpf_array, map);
 		struct bpf_prog *prog;
 		u64 index = BPF_R3;
 
-		if (unlikely(index >= array->map.max_entries))
-			goto out;
 		if (unlikely(tail_call_cnt > MAX_TAIL_CALL_CNT))
 			goto out;
 
+		if (insn->imm == 1) {
+			prog = READ_ONCE(*next_prog);
+		} else {
+			if (unlikely(index >= array->map.max_entries))
+				goto out;
+			prog = READ_ONCE(array->ptrs[index]);
+		}
 		tail_call_cnt++;
-
-		prog = READ_ONCE(array->ptrs[index]);
 		if (!prog)
 			goto out;
 
@@ -1375,6 +1379,13 @@ const struct bpf_func_proto bpf_tail_call_proto = {
 	.arg1_type	= ARG_PTR_TO_CTX,
 	.arg2_type	= ARG_CONST_MAP_PTR,
 	.arg3_type	= ARG_ANYTHING,
+};
+
+const struct bpf_func_proto bpf_tail_call_next_proto = {
+	.func		= NULL,
+	.gpl_only	= false,
+	.ret_type	= RET_VOID,
+	.arg1_type	= ARG_PTR_TO_CTX,
 };
 
 /* Stub for JITs that only support cBPF. eBPF programs are interpreted.

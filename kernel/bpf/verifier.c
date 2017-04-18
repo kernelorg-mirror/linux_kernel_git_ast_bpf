@@ -3333,9 +3333,12 @@ static int fixup_bpf_calls(struct bpf_verifier_env *env)
 	struct bpf_insn *insn = prog->insnsi;
 	const struct bpf_func_proto *fn;
 	const int insn_cnt = prog->len;
-	struct bpf_insn insn_buf[16];
+	struct bpf_insn insn_buf[16], *new_insns;
 	struct bpf_prog *new_prog;
 	struct bpf_map *map_ptr;
+	struct bpf_insn call_next[3] = {
+		BPF_LD_IMM64(BPF_REG_2, (long) &prog->aux->next_prog)
+	};
 	int i, cnt, delta = 0;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
@@ -3358,6 +3361,14 @@ static int fixup_bpf_calls(struct bpf_verifier_env *env)
 			insn->code |= BPF_X;
 			continue;
 		}
+		if (insn->imm == BPF_FUNC_tail_call_next) {
+			call_next[2] = *insn;
+			call_next[2].imm = 1;
+			call_next[2].code |= BPF_X;
+			cnt = 3;
+			new_insns = call_next;
+			goto patch;
+		}
 
 		if (ebpf_jit_enabled() && insn->imm == BPF_FUNC_map_lookup_elem) {
 			map_ptr = env->insn_aux_data[i + delta].map_ptr;
@@ -3370,8 +3381,9 @@ static int fixup_bpf_calls(struct bpf_verifier_env *env)
 				verbose("bpf verifier is misconfigured\n");
 				return -EINVAL;
 			}
-
-			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf,
+			new_insns = insn_buf;
+patch:
+			new_prog = bpf_patch_insn_data(env, i + delta, new_insns,
 						       cnt);
 			if (!new_prog)
 				return -ENOMEM;

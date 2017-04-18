@@ -82,6 +82,9 @@ enum bpf_cmd {
 	BPF_PROG_ATTACH,
 	BPF_PROG_DETACH,
 	BPF_PROG_TEST_RUN,
+	BPF_PROG_CHAIN_ADD,
+	BPF_PROG_CHAIN_DEL,
+	BPF_PROG_CHAIN_GET,
 };
 
 enum bpf_map_type {
@@ -201,6 +204,12 @@ union bpf_attr {
 		__u32		repeat;
 		__u32		duration;
 	} test;
+
+	struct { /* anonymous struct used by BPF_PROG_CHAIN_* commands */
+		__u32		root_prog_fd;
+		__u32		next_prog_fd;
+		__u32		priority;
+	};
 } __attribute__((aligned(8)));
 
 /* BPF helper function descriptions:
@@ -532,7 +541,8 @@ union bpf_attr {
 	FN(xdp_adjust_head),		\
 	FN(probe_read_str),		\
 	FN(get_socket_cookie),		\
-	FN(get_socket_uid),
+	FN(get_socket_uid),		\
+	FN(tail_call_next),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call

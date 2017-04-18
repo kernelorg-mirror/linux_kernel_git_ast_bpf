@@ -991,6 +991,62 @@ static int bpf_prog_test_run(const union bpf_attr *attr,
 	return ret;
 }
 
+#define BPF_PROG_CHAIN_LAST_FIELD priority
+
+static int bpf_prog_chain(int cmd, const union bpf_attr *attr,
+			  union bpf_attr __user *uattr)
+{
+	struct bpf_prog *prog, *next_prog, **pprog;
+	int ret = -ENOTSUPP;
+
+	if (CHECK_ATTR(BPF_PROG_CHAIN))
+		return -EINVAL;
+
+	prog = bpf_prog_get(attr->root_prog_fd);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	switch (cmd) {
+	case BPF_PROG_CHAIN_ADD:
+		next_prog = bpf_prog_get(attr->next_prog_fd);
+		if (IS_ERR(next_prog)) {
+			ret = PTR_ERR(next_prog);
+			break;
+		}
+		pprog = &prog->aux->next_prog;
+		while (*pprog && (*pprog)->aux->priority > attr->priority)
+			pprog = &(*pprog)->aux->next_prog;
+		next_prog->aux->next_prog = *pprog;
+		next_prog->aux->priority = attr->priority;
+		*pprog = next_prog;
+		ret = 0;
+		break;
+	case BPF_PROG_CHAIN_DEL:
+		next_prog = bpf_prog_get(attr->next_prog_fd);
+		if (IS_ERR(next_prog)) {
+			ret = PTR_ERR(next_prog);
+			break;
+		}
+		pprog = &prog->aux->next_prog;
+		while (*pprog && (*pprog) != next_prog)
+			pprog = &(*pprog)->aux->next_prog;
+		if (!(*pprog)) {
+			ret = -ENOENT;
+			bpf_prog_put(next_prog);
+			break;
+		}
+		*pprog = next_prog->aux->next_prog;
+		next_prog->aux->priority = 0;
+		bpf_prog_put(next_prog);
+		ret = 0;
+		break;
+	case BPF_PROG_CHAIN_GET:
+		break;
+	}
+	bpf_prog_put(prog);
+	return ret;
+}
+
 SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
 {
 	union bpf_attr attr = {};
@@ -1067,6 +1123,11 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 #endif
 	case BPF_PROG_TEST_RUN:
 		err = bpf_prog_test_run(&attr, uattr);
+		break;
+	case BPF_PROG_CHAIN_ADD:
+	case BPF_PROG_CHAIN_DEL:
+	case BPF_PROG_CHAIN_GET:
+		err = bpf_prog_chain(cmd, &attr, uattr);
 		break;
 	default:
 		err = -EINVAL;

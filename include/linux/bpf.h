@@ -168,6 +168,8 @@ struct bpf_verifier_ops {
 };
 
 struct bpf_prog_aux {
+	struct bpf_prog *next_prog;
+	u32 priority;
 	atomic_t refcnt;
 	u32 used_map_cnt;
 	u32 max_ctx_offset;
@@ -347,6 +349,7 @@ extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
 extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
 extern const struct bpf_func_proto bpf_get_numa_node_id_proto;
 extern const struct bpf_func_proto bpf_tail_call_proto;
+extern const struct bpf_func_proto bpf_tail_call_next_proto;
 extern const struct bpf_func_proto bpf_ktime_get_ns_proto;
 extern const struct bpf_func_proto bpf_get_current_pid_tgid_proto;
 extern const struct bpf_func_proto bpf_get_current_uid_gid_proto;

@@ -440,6 +440,8 @@ static const struct bpf_func_proto *tracing_func_proto(enum bpf_func_id func_id)
 		return &bpf_ktime_get_ns_proto;
 	case BPF_FUNC_tail_call:
 		return &bpf_tail_call_proto;
+	case BPF_FUNC_tail_call_next:
+		return &bpf_tail_call_next_proto;
 	case BPF_FUNC_get_current_pid_tgid:
 		return &bpf_get_current_pid_tgid_proto;
 	case BPF_FUNC_get_current_task:

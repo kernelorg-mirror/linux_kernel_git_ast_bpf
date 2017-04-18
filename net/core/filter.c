@@ -2660,6 +2660,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 		return &bpf_get_numa_node_id_proto;
 	case BPF_FUNC_tail_call:
 		return &bpf_tail_call_proto;
+	case BPF_FUNC_tail_call_next:
+		return &bpf_tail_call_next_proto;
 	case BPF_FUNC_ktime_get_ns:
 		return &bpf_ktime_get_ns_proto;
 	case BPF_FUNC_trace_printk:
