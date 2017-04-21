@@ -233,3 +233,25 @@ int bpf_prog_test_run(int prog_fd, int repeat, void *data, __u32 size,
 		*duration = attr.test.duration;
 	return ret;
 }
+
+int bpf_prog_chain_add(int root_prog_fd, int next_prog_fd, int priority)
+{
+	union bpf_attr attr;
+
+	bzero(&attr, sizeof(attr));
+	attr.root_prog_fd = root_prog_fd;
+	attr.next_prog_fd = next_prog_fd;
+	attr.priority = priority;
+	return sys_bpf(BPF_PROG_CHAIN_ADD, &attr, sizeof(attr));
+}
+
+int bpf_prog_chain_del(int root_prog_fd, int next_prog_fd, int priority)
+{
+	union bpf_attr attr;
+
+	bzero(&attr, sizeof(attr));
+	attr.root_prog_fd = root_prog_fd;
+	attr.next_prog_fd = next_prog_fd;
+	attr.priority = priority;
+	return sys_bpf(BPF_PROG_CHAIN_DEL, &attr, sizeof(attr));
+}

@@ -50,5 +50,7 @@ int bpf_prog_detach(int attachable_fd, enum bpf_attach_type type);
 int bpf_prog_test_run(int prog_fd, int repeat, void *data, __u32 size,
 		      void *data_out, __u32 *size_out, __u32 *retval,
 		      __u32 *duration);
+int bpf_prog_chain_add(int root_prog_fd, int next_prog_fd, int priority);
+int bpf_prog_chain_del(int root_prog_fd, int next_prog_fd, int priority);
 
 #endif

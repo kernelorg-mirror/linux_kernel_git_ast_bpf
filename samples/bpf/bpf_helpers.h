@@ -23,6 +23,8 @@ static int (*bpf_trace_printk)(const char *fmt, int fmt_size, ...) =
 	(void *) BPF_FUNC_trace_printk;
 static void (*bpf_tail_call)(void *ctx, void *map, int index) =
 	(void *) BPF_FUNC_tail_call;
+static void (*bpf_tail_call_next)(void *ctx) =
+	(void *) BPF_FUNC_tail_call_next;
 static unsigned long long (*bpf_get_smp_processor_id)(void) =
 	(void *) BPF_FUNC_get_smp_processor_id;
 static unsigned long long (*bpf_get_current_pid_tgid)(void) =

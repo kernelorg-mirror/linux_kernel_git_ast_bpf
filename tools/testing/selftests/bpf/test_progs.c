@@ -78,7 +78,7 @@ static int bpf_prog_load(const char *file, enum bpf_prog_type type,
 {
 	struct bpf_program *prog;
 	struct bpf_object *obj;
-	int err;
+	int err, i = 0;
 
 	obj = bpf_object__open(file);
 	if (IS_ERR(obj)) {
@@ -86,14 +86,14 @@ static int bpf_prog_load(const char *file, enum bpf_prog_type type,
 		return -ENOENT;
 	}
 
-	prog = bpf_program__next(NULL, obj);
-	if (!prog) {
+	bpf_object__for_each_program(prog, obj)
+		bpf_program__set_type(prog, type);
+/*	if (!prog) {
 		bpf_object__close(obj);
 		error_cnt++;
 		return -ENOENT;
-	}
+	}*/
 
-	bpf_program__set_type(prog, type);
 	err = bpf_object__load(obj);
 	if (err) {
 		bpf_object__close(obj);
@@ -102,7 +102,8 @@ static int bpf_prog_load(const char *file, enum bpf_prog_type type,
 	}
 
 	*pobj = obj;
-	*prog_fd = bpf_program__fd(prog);
+	bpf_object__for_each_program(prog, obj)
+		prog_fd[i++] = bpf_program__fd(prog);
 	return 0;
 }
 
@@ -269,6 +270,77 @@ out:
 	bpf_object__close(obj);
 }
 
+static void test_chain(void)
+{
+	const char *file = "./test_chain.o";
+	struct bpf_object *obj;
+	__u32 duration, retval;
+	int err, prog_fd[3];
+
+	err = bpf_prog_load(file, BPF_PROG_TYPE_XDP, &obj, prog_fd);
+	if (err)
+		return;
+
+	err = bpf_prog_chain_add(prog_fd[0], prog_fd[1], 10);
+	if (err) {
+		printf("chain_add fail\n");
+		error_cnt++;
+	}
+	err = bpf_prog_chain_add(prog_fd[0], prog_fd[2], 100);
+	if (err) {
+		printf("chain_add fail\n");
+		error_cnt++;
+	}
+	err = bpf_prog_test_run(prog_fd[0], 100000, &pkt_v4, sizeof(pkt_v4),
+				NULL, NULL, &retval, &duration);
+	CHECK(err || errno || retval != 3, "ipv4_p100",
+	      "err %d errno %d retval %d duration %d\n",
+	      err, errno, retval, duration);
+	err = bpf_prog_test_run(prog_fd[0], 100000, &pkt_v6, sizeof(pkt_v6),
+				NULL, NULL, &retval, &duration);
+	CHECK(err || errno || retval != 2, "ipv6_p10",
+	      "err %d errno %d retval %d duration %d\n",
+	      err, errno, retval, duration);
+
+	err = bpf_prog_chain_del(prog_fd[0], prog_fd[1], 0);
+	if (err) {
+		printf("chain_del fail\n");
+		error_cnt++;
+	}
+	err = bpf_prog_chain_del(prog_fd[0], prog_fd[2], 0);
+	if (err) {
+		printf("chain_del fail\n");
+		error_cnt++;
+	}
+	err = bpf_prog_test_run(prog_fd[0], 100000, &pkt_v4, sizeof(pkt_v4),
+				NULL, NULL, &retval, &duration);
+	CHECK(err || errno || retval != 1, "nop",
+	      "err %d errno %d retval %d duration %d\n",
+	      err, errno, retval, duration);
+
+	err = bpf_prog_chain_add(prog_fd[0], prog_fd[1], 100);
+	if (err) {
+		printf("chain_add fail\n");
+		error_cnt++;
+	}
+	err = bpf_prog_chain_add(prog_fd[0], prog_fd[2], 10);
+	if (err) {
+		printf("chain_add fail\n");
+		error_cnt++;
+	}
+	err = bpf_prog_test_run(prog_fd[0], 100000, &pkt_v4, sizeof(pkt_v4),
+				NULL, NULL, &retval, &duration);
+	CHECK(err || errno || retval != 3, "ipv4_p10",
+	      "err %d errno %d retval %d duration %d\n",
+	      err, errno, retval, duration);
+	err = bpf_prog_test_run(prog_fd[0], 100000, &pkt_v6, sizeof(pkt_v6),
+				NULL, NULL, &retval, &duration);
+	CHECK(err || errno || retval != 2, "ipv6_p100",
+	      "err %d errno %d retval %d duration %d\n",
+	      err, errno, retval, duration);
+	bpf_object__close(obj);
+}
+
 int main(void)
 {
 	struct rlimit rinf = { RLIM_INFINITY, RLIM_INFINITY };
@@ -278,6 +350,7 @@ int main(void)
 	test_pkt_access();
 	test_xdp();
 	test_l4lb();
+	test_chain();
 
 	printf("Summary: %d PASSED, %d FAILED\n", pass_cnt, error_cnt);
 	return 0;
