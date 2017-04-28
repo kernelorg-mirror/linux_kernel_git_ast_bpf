@@ -269,6 +269,19 @@ out:
 	bpf_object__close(obj);
 }
 
+static void test_c_verifier_1(void)
+{
+	const char *file = "./test_c_verifier_1.o";
+	int err, prog_fd;
+	struct bpf_object *obj;
+
+	err = bpf_prog_load(file, BPF_PROG_TYPE_KPROBE, &obj, &prog_fd);
+	if (err)
+		return;
+
+	bpf_object__close(obj);
+}
+
 int main(void)
 {
 	struct rlimit rinf = { RLIM_INFINITY, RLIM_INFINITY };
@@ -278,6 +291,7 @@ int main(void)
 	test_pkt_access();
 	test_xdp();
 	test_l4lb();
+	test_c_verifier_1();
 
 	printf("Summary: %d PASSED, %d FAILED\n", pass_cnt, error_cnt);
 	return 0;
