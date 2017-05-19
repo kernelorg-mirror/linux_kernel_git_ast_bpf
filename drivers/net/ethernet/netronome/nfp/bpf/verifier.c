@@ -78,7 +78,7 @@ static int
 nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
 		   const struct bpf_verifier_env *env)
 {
-	const struct bpf_reg_state *reg0 = &env->cur_state.regs[0];
+	const struct bpf_reg_state *reg0 = &env->cur_state.frame[env->cur_state.curframe].regs[0];
 	u64 imm;
 
 	if (nfp_prog->act == NN_ACT_XDP)
@@ -113,17 +113,19 @@ nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
 
 static int
 nfp_bpf_check_ptr(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
-		  const struct bpf_verifier_env *env, u8 reg)
+		  const struct bpf_verifier_env *env, u8 regno)
 {
-	if (env->cur_state.regs[reg].type != PTR_TO_CTX &&
-	    env->cur_state.regs[reg].type != PTR_TO_PACKET)
+	const struct bpf_reg_state *reg;
+
+	reg = &env->cur_state.frame[env->cur_state.curframe].regs[regno];
+	if (reg->type != PTR_TO_CTX && reg->type != PTR_TO_PACKET)
 		return -EINVAL;
 
 	if (meta->ptr.type != NOT_INIT &&
-	    meta->ptr.type != env->cur_state.regs[reg].type)
+	    meta->ptr.type != reg->type)
 		return -EINVAL;
 
-	meta->ptr = env->cur_state.regs[reg];
+	meta->ptr = *reg;
 
 	return 0;
 }
