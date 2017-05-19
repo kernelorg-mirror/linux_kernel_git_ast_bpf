@@ -40,6 +40,8 @@ enum bpf_reg_liveness {
 	REG_LIVE_WRITTEN, /* reg was written first, screening off later reads */
 };
 
+struct bpf_func_state;
+
 struct bpf_reg_state {
 	enum bpf_reg_type type;
 	union {
@@ -78,6 +80,13 @@ struct bpf_reg_state {
 	u64 umax_value; /* maximum possible (u64)value */
 	/* This field must be last, for states_equal() reasons. */
 	enum bpf_reg_liveness live;
+	/* For PTR_TO_STACK 'func' is a pointer to func_state which stack
+	 * is referenced by this pointer.
+	 * A nested function can have R1=fp-8 and R2=fp-8,
+	 * but one of them can point to this function stack and another
+	 * to caller's stack.
+	 */
+	struct bpf_func_state *func;
 };
 
 enum bpf_stack_slot_type {
@@ -91,11 +100,27 @@ enum bpf_stack_slot_type {
 /* state of the program:
  * type of all registers and stack info
  */
-struct bpf_verifier_state {
+struct bpf_func_state {
 	struct bpf_reg_state regs[MAX_BPF_REG];
 	u8 stack_slot_type[MAX_BPF_STACK];
 	struct bpf_reg_state spilled_regs[MAX_BPF_STACK / BPF_REG_SIZE];
+	/* max stack depth in this function */
+	u32 stack_depth:10;
+	/* index of call instruction that called into this func */
+	u32 callsite:16;
+	/* stack frame number of this function state from pov of
+	 * enclosing bpf_verifier_state. It's only used to adjust
+	 * bpf_reg_state->func pointer while copying bpf_verifier_state
+	 */
+	u32 frameno:6;
+};
+
+#define MAX_CALL_FRAMES 8
+struct bpf_verifier_state {
+	/* call stack tracking */
+	struct bpf_func_state frame[MAX_CALL_FRAMES];
 	struct bpf_verifier_state *parent;
+	u32 curframe;
 };
 
 /* linked list of verifier states used to prune search */
@@ -121,6 +146,8 @@ struct bpf_ext_analyzer_ops {
 			 int insn_idx, int prev_insn_idx);
 };
 
+#define BPF_MAX_SUBPROGS 64
+
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
@@ -139,6 +166,8 @@ struct bpf_verifier_env {
 	bool allow_ptr_leaks;
 	bool seen_direct_write;
 	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
+	u32 subprog_starts[BPF_MAX_SUBPROGS];
+	u32 subprog_cnt;
 };
 
 int bpf_analyzer(struct bpf_prog *prog, const struct bpf_ext_analyzer_ops *ops,

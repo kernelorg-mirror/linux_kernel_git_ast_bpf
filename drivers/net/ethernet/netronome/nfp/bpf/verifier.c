@@ -78,7 +78,7 @@ static int
 nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
 		   const struct bpf_verifier_env *env)
 {
-	const struct bpf_reg_state *reg0 = &env->cur_state.regs[0];
+	const struct bpf_reg_state *reg0 = &env->cur_state.frame[env->cur_state.curframe].regs[0];
 	u64 imm;
 
 	if (nfp_prog->act == NN_ACT_XDP)
@@ -115,7 +115,7 @@ static int
 nfp_bpf_check_ctx_ptr(struct nfp_prog *nfp_prog,
 		      const struct bpf_verifier_env *env, u8 reg)
 {
-	if (env->cur_state.regs[reg].type != PTR_TO_CTX)
+	if (env->cur_state.frame[env->cur_state.curframe].regs[reg].type != PTR_TO_CTX)
 		return -EINVAL;
 
 	return 0;
