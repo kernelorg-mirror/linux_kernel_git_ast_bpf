@@ -237,6 +237,39 @@ int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
 int bpf_prog_test_run_skb(struct bpf_prog *prog, const union bpf_attr *kattr,
 			  union bpf_attr __user *uattr);
 
+/* an array of programs to be executed under rcu_lock.
+ * Typical usage:
+ * struct bpf_prog **prog;
+ * rcu_read_lock();
+ * prog = rcu_dereference(bpf_prog_array *)->progs;
+ * for (; *prog; prog++)
+ *   BPF_PROG_RUN(*prog, ctx);
+ * rcu_read_unlock();
+ *
+ * the structure returned by bpf_prog_array_alloc() should be populated
+ * with program pointers and the last pointer must be NULL.
+ * The user has to keep refcnt on the program and make sure the program
+ * is removed from the array before bpf_prog_put().
+ * bpf_prog_array_delete_safe()/replace_with() will atomically replace
+ * the program either with nop program or some other program.
+ * The 'struct bpf_prog_array *' should only be replaced with xchg()
+ * since other cpus are walking the array of pointers in parallel.
+ * Once bpf_prog_array is active the in-place modification of progs[]
+ * pointers should only be done bpf_prog_array_delete_safe()/replace_with()
+ */
+struct bpf_prog_array {
+	struct rcu_head rcu;
+	struct bpf_prog *progs[0];
+};
+
+struct bpf_prog_array __rcu *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags);
+void bpf_prog_array_free(struct bpf_prog_array __rcu *progs);
+void bpf_prog_array_delete_safe(struct bpf_prog_array __rcu *progs,
+				struct bpf_prog *old_prog);
+void bpf_prog_array_replace_with(struct bpf_prog_array __rcu *progs,
+				 struct bpf_prog *old_prog,
+				 struct bpf_prog *new_prog);
+
 #ifdef CONFIG_BPF_SYSCALL
 DECLARE_PER_CPU(int, bpf_prog_active);
 
