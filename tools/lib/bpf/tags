@@ -1,0 +1,254 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_PROGRAM_AUTHOR	Darren Hiebert	/dhiebert@users.sourceforge.net/
+!_TAG_PROGRAM_NAME	Exuberant Ctags	//
+!_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
+!_TAG_PROGRAM_VERSION	5.8	//
+BPF_EXTRAVERSION	Makefile	/^BPF_EXTRAVERSION = 1$/;"	m
+BPF_FS_MAGIC	libbpf.c	52;"	d	file:
+BPF_IN	Makefile	/^BPF_IN    := $(OUTPUT)libbpf-in.o$/;"	m
+BPF_LOG_BUF_SIZE	bpf.h	43;"	d
+BPF_PATCHLEVEL	Makefile	/^BPF_PATCHLEVEL = 0$/;"	m
+BPF_PROG_TYPE_FNS	libbpf.c	1702;"	d	file:
+BPF_VERSION	Makefile	/^BPF_VERSION = 0$/;"	m
+CFLAGS	Makefile	/^  CFLAGS := $(EXTRA_CFLAGS)$/;"	m
+CFLAGS	Makefile	/^  CFLAGS := -g -Wall$/;"	m
+CHECK_ERR	libbpf.c	140;"	d	file:
+CMD_TARGETS	Makefile	/^CMD_TARGETS = $(LIB_FILE)$/;"	m
+DESTDIR	Makefile	/^DESTDIR ?=$/;"	m
+DESTDIR_SQ	Makefile	/^DESTDIR_SQ = '$(subst ','\\'',$(DESTDIR))'$/;"	m
+EM_BPF	libbpf.c	48;"	d	file:
+ERRCODE_OFFSET	libbpf.c	95;"	d	file:
+ERRNO_OFFSET	libbpf.c	94;"	d	file:
+EXTRAVERSION	Makefile	/^EXTRAVERSION	= $(BPF_EXTRAVERSION)$/;"	m
+FEATURE_CHECK_CFLAGS-bpf	Makefile	/^FEATURE_CHECK_CFLAGS-bpf = $(INCLUDES)$/;"	m
+FEATURE_DISPLAY	Makefile	/^FEATURE_DISPLAY = libelf bpf$/;"	m
+FEATURE_TESTS	Makefile	/^FEATURE_TESTS = libelf libelf-getphdrnum libelf-mmap bpf$/;"	m
+FEATURE_USER	Makefile	/^FEATURE_USER = .libbpf$/;"	m
+INCLUDES	Makefile	/^INCLUDES = -I. -I$(srctree)\/tools\/include -I$(srctree)\/tools\/arch\/$(ARCH)\/include\/uapi -I$(srctree)\/tools\/include\/uapi$/;"	m
+INSTALL	Makefile	/^INSTALL = install$/;"	m
+LIBBPF_ELF_C_READ_MMAP	libbpf.c	162;"	d	file:
+LIBBPF_ELF_C_READ_MMAP	libbpf.c	164;"	d	file:
+LIBBPF_ERRNO__ENDIAN	libbpf.h	/^	LIBBPF_ERRNO__ENDIAN,	\/* Endian mismatch *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__FORMAT	libbpf.h	/^	LIBBPF_ERRNO__FORMAT,	\/* BPF object format invalid *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__INTERNAL	libbpf.h	/^	LIBBPF_ERRNO__INTERNAL,	\/* Internal error in libbpf *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__KVER	libbpf.h	/^	LIBBPF_ERRNO__KVER,	\/* Incorrect kernel version *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__KVERSION	libbpf.h	/^	LIBBPF_ERRNO__KVERSION,	\/* Incorrect or no 'version' section *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__LIBELF	libbpf.h	/^	LIBBPF_ERRNO__LIBELF = __LIBBPF_ERRNO__START,$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__LOAD	libbpf.h	/^	LIBBPF_ERRNO__LOAD,	\/* Load program failure for unknown reason *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__PROG2BIG	libbpf.h	/^	LIBBPF_ERRNO__PROG2BIG,	\/* Program too big *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__PROGTYPE	libbpf.h	/^	LIBBPF_ERRNO__PROGTYPE,	\/* Kernel doesn't support this program type *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__RELOC	libbpf.h	/^	LIBBPF_ERRNO__RELOC,	\/* Relocation failed *\/$/;"	e	enum:libbpf_errno
+LIBBPF_ERRNO__VERIFY	libbpf.h	/^	LIBBPF_ERRNO__VERIFY,	\/* Kernel verifier blocks program loading *\/$/;"	e	enum:libbpf_errno
+LIBBPF_VERSION	Makefile	/^LIBBPF_VERSION = $(BPF_VERSION).$(BPF_PATCHLEVEL).$(BPF_EXTRAVERSION)$/;"	m
+LIB_FILE	Makefile	/^LIB_FILE := $(addprefix $(OUTPUT),$(LIB_FILE))$/;"	m
+LIB_FILE	Makefile	/^LIB_FILE = libbpf.a libbpf.so$/;"	m
+MAKEOVERRIDES	Makefile	/^MAKEOVERRIDES=$/;"	m
+N	Makefile	/^N		=$/;"	m
+NON_CHECK_FEAT_TARGETS	Makefile	/^NON_CHECK_FEAT_TARGETS := clean TAGS tags cscope help$/;"	m
+NR_ERRNO	libbpf.c	96;"	d	file:
+OBJ	Makefile	/^OBJ		= $@$/;"	m
+PATCHLEVEL	Makefile	/^PATCHLEVEL	= $(BPF_PATCHLEVEL)$/;"	m
+Q	Makefile	/^  Q = @$/;"	m
+Q	Makefile	/^  Q =$/;"	m
+STRERR_BUFSIZE	libbpf.c	92;"	d	file:
+TARGETS	Makefile	/^TARGETS = $(CMD_TARGETS)$/;"	m
+VERBOSE	Makefile	/^  VERBOSE = $(V)$/;"	m
+VERBOSE	Makefile	/^  VERBOSE = 0$/;"	m
+VERSION	Makefile	/^VERSION		= $(BPF_VERSION)$/;"	m
+__BPF_BPF_H	bpf.h	22;"	d
+__BPF_LIBBPF_H	libbpf.h	22;"	d
+__LIBBPF_ERRNO__END	libbpf.h	/^	__LIBBPF_ERRNO__END,$/;"	e	enum:libbpf_errno
+__LIBBPF_ERRNO__START	libbpf.h	/^	__LIBBPF_ERRNO__START = 4000,$/;"	e	enum:libbpf_errno
+__NR_bpf	bpf.c	35;"	d	file:
+__NR_bpf	bpf.c	37;"	d	file:
+__NR_bpf	bpf.c	39;"	d	file:
+__NR_bpf	bpf.c	41;"	d	file:
+__NR_bpf	bpf.c	43;"	d	file:
+__base_pr	libbpf.c	/^static int __base_pr(const char *format, ...)$/;"	f	file:
+__bpf_object__open	libbpf.c	/^__bpf_object__open(const char *path, void *obj_buf, size_t obj_buf_sz)$/;"	f	file:
+__pr	libbpf.c	73;"	d	file:
+__pr_debug	libbpf.c	/^static __printf(1, 2) libbpf_print_fn_t __pr_debug;$/;"	v
+__pr_info	libbpf.c	/^static __printf(1, 2) libbpf_print_fn_t __pr_info = __base_pr;$/;"	v
+__pr_warning	libbpf.c	/^static __printf(1, 2) libbpf_print_fn_t __pr_warning = __base_pr;$/;"	v
+__printf	libbpf.c	55;"	d	file:
+allow-override	Makefile	/^define allow-override$/;"	m
+bpf_create_map	bpf.c	/^int bpf_create_map(enum bpf_map_type map_type, int key_size,$/;"	f
+bpf_create_map_in_map	bpf.c	/^int bpf_create_map_in_map(enum bpf_map_type map_type, const char *name,$/;"	f
+bpf_create_map_in_map_node	bpf.c	/^int bpf_create_map_in_map_node(enum bpf_map_type map_type, const char *name,$/;"	f
+bpf_create_map_name	bpf.c	/^int bpf_create_map_name(enum bpf_map_type map_type, const char *name,$/;"	f
+bpf_create_map_node	bpf.c	/^int bpf_create_map_node(enum bpf_map_type map_type, const char *name,$/;"	f
+bpf_load_program	bpf.c	/^int bpf_load_program(enum bpf_prog_type type, const struct bpf_insn *insns,$/;"	f
+bpf_load_program_name	bpf.c	/^int bpf_load_program_name(enum bpf_prog_type type, const char *name,$/;"	f
+bpf_map	libbpf.c	/^struct bpf_map {$/;"	s	file:
+bpf_map__def	libbpf.c	/^const struct bpf_map_def *bpf_map__def(struct bpf_map *map)$/;"	f
+bpf_map__fd	libbpf.c	/^int bpf_map__fd(struct bpf_map *map)$/;"	f
+bpf_map__for_each	libbpf.h	230;"	d
+bpf_map__name	libbpf.c	/^const char *bpf_map__name(struct bpf_map *map)$/;"	f
+bpf_map__next	libbpf.c	/^bpf_map__next(struct bpf_map *prev, struct bpf_object *obj)$/;"	f
+bpf_map__pin	libbpf.c	/^int bpf_map__pin(struct bpf_map *map, const char *path)$/;"	f
+bpf_map__priv	libbpf.c	/^void *bpf_map__priv(struct bpf_map *map)$/;"	f
+bpf_map__set_priv	libbpf.c	/^int bpf_map__set_priv(struct bpf_map *map, void *priv,$/;"	f
+bpf_map_clear_priv_t	libbpf.h	/^typedef void (*bpf_map_clear_priv_t)(struct bpf_map *, void *);$/;"	t
+bpf_map_def	libbpf.h	/^struct bpf_map_def {$/;"	s
+bpf_map_delete_elem	bpf.c	/^int bpf_map_delete_elem(int fd, const void *key)$/;"	f
+bpf_map_get_fd_by_id	bpf.c	/^int bpf_map_get_fd_by_id(__u32 id)$/;"	f
+bpf_map_get_next_id	bpf.c	/^int bpf_map_get_next_id(__u32 start_id, __u32 *next_id)$/;"	f
+bpf_map_get_next_key	bpf.c	/^int bpf_map_get_next_key(int fd, const void *key, void *next_key)$/;"	f
+bpf_map_lookup_elem	bpf.c	/^int bpf_map_lookup_elem(int fd, const void *key, void *value)$/;"	f
+bpf_map_update_elem	bpf.c	/^int bpf_map_update_elem(int fd, const void *key, const void *value,$/;"	f
+bpf_obj_get	bpf.c	/^int bpf_obj_get(const char *pathname)$/;"	f
+bpf_obj_get_info_by_fd	bpf.c	/^int bpf_obj_get_info_by_fd(int prog_fd, void *info, __u32 *info_len)$/;"	f
+bpf_obj_pin	bpf.c	/^int bpf_obj_pin(int fd, const char *pathname)$/;"	f
+bpf_object	libbpf.c	/^struct bpf_object {$/;"	s	file:
+bpf_object__add_program	libbpf.c	/^bpf_object__add_program(struct bpf_object *obj, void *data, size_t size,$/;"	f	file:
+bpf_object__check_endianness	libbpf.c	/^bpf_object__check_endianness(struct bpf_object *obj)$/;"	f	file:
+bpf_object__close	libbpf.c	/^void bpf_object__close(struct bpf_object *obj)$/;"	f
+bpf_object__collect_reloc	libbpf.c	/^static int bpf_object__collect_reloc(struct bpf_object *obj)$/;"	f	file:
+bpf_object__create_maps	libbpf.c	/^bpf_object__create_maps(struct bpf_object *obj)$/;"	f	file:
+bpf_object__elf_collect	libbpf.c	/^static int bpf_object__elf_collect(struct bpf_object *obj)$/;"	f	file:
+bpf_object__elf_finish	libbpf.c	/^static void bpf_object__elf_finish(struct bpf_object *obj)$/;"	f	file:
+bpf_object__elf_init	libbpf.c	/^static int bpf_object__elf_init(struct bpf_object *obj)$/;"	f	file:
+bpf_object__find_map_by_name	libbpf.c	/^bpf_object__find_map_by_name(struct bpf_object *obj, const char *name)$/;"	f
+bpf_object__find_map_by_offset	libbpf.c	/^bpf_object__find_map_by_offset(struct bpf_object *obj, size_t offset)$/;"	f
+bpf_object__find_prog_by_idx	libbpf.c	/^bpf_object__find_prog_by_idx(struct bpf_object *obj, int idx)$/;"	f	file:
+bpf_object__for_each_program	libbpf.h	95;"	d
+bpf_object__for_each_safe	libbpf.h	79;"	d
+bpf_object__init_kversion	libbpf.c	/^bpf_object__init_kversion(struct bpf_object *obj,$/;"	f	file:
+bpf_object__init_license	libbpf.c	/^bpf_object__init_license(struct bpf_object *obj,$/;"	f	file:
+bpf_object__init_maps	libbpf.c	/^bpf_object__init_maps(struct bpf_object *obj)$/;"	f	file:
+bpf_object__init_prog_names	libbpf.c	/^bpf_object__init_prog_names(struct bpf_object *obj)$/;"	f	file:
+bpf_object__kversion	libbpf.c	/^unsigned int bpf_object__kversion(struct bpf_object *obj)$/;"	f
+bpf_object__load	libbpf.c	/^int bpf_object__load(struct bpf_object *obj)$/;"	f
+bpf_object__load_progs	libbpf.c	/^bpf_object__load_progs(struct bpf_object *obj)$/;"	f	file:
+bpf_object__name	libbpf.c	/^const char *bpf_object__name(struct bpf_object *obj)$/;"	f
+bpf_object__new	libbpf.c	/^static struct bpf_object *bpf_object__new(const char *path,$/;"	f	file:
+bpf_object__next	libbpf.c	/^bpf_object__next(struct bpf_object *prev)$/;"	f
+bpf_object__open	libbpf.c	/^struct bpf_object *bpf_object__open(const char *path)$/;"	f
+bpf_object__open_buffer	libbpf.c	/^struct bpf_object *bpf_object__open_buffer(void *obj_buf,$/;"	f
+bpf_object__pin	libbpf.c	/^int bpf_object__pin(struct bpf_object *obj, const char *path)$/;"	f
+bpf_object__priv	libbpf.c	/^void *bpf_object__priv(struct bpf_object *obj)$/;"	f
+bpf_object__relocate	libbpf.c	/^bpf_object__relocate(struct bpf_object *obj)$/;"	f	file:
+bpf_object__set_priv	libbpf.c	/^int bpf_object__set_priv(struct bpf_object *obj, void *priv,$/;"	f
+bpf_object__unload	libbpf.c	/^int bpf_object__unload(struct bpf_object *obj)$/;"	f
+bpf_object__validate	libbpf.c	/^static int bpf_object__validate(struct bpf_object *obj)$/;"	f	file:
+bpf_object_clear_priv_t	libbpf.h	/^typedef void (*bpf_object_clear_priv_t)(struct bpf_object *, void *);$/;"	t
+bpf_prog_attach	bpf.c	/^int bpf_prog_attach(int prog_fd, int target_fd, enum bpf_attach_type type,$/;"	f
+bpf_prog_detach	bpf.c	/^int bpf_prog_detach(int target_fd, enum bpf_attach_type type)$/;"	f
+bpf_prog_detach2	bpf.c	/^int bpf_prog_detach2(int prog_fd, int target_fd, enum bpf_attach_type type)$/;"	f
+bpf_prog_get_fd_by_id	bpf.c	/^int bpf_prog_get_fd_by_id(__u32 id)$/;"	f
+bpf_prog_get_next_id	bpf.c	/^int bpf_prog_get_next_id(__u32 start_id, __u32 *next_id)$/;"	f
+bpf_prog_load	libbpf.c	/^int bpf_prog_load(const char *file, enum bpf_prog_type type,$/;"	f
+bpf_prog_prep_result	libbpf.h	/^struct bpf_prog_prep_result {$/;"	s
+bpf_prog_query	bpf.c	/^int bpf_prog_query(int target_fd, enum bpf_attach_type type, __u32 query_flags,$/;"	f
+bpf_prog_test_run	bpf.c	/^int bpf_prog_test_run(int prog_fd, int repeat, void *data, __u32 size,$/;"	f
+bpf_program	libbpf.c	/^struct bpf_program {$/;"	s	file:
+bpf_program__collect_reloc	libbpf.c	/^bpf_program__collect_reloc(struct bpf_program *prog,$/;"	f	file:
+bpf_program__exit	libbpf.c	/^static void bpf_program__exit(struct bpf_program *prog)$/;"	f	file:
+bpf_program__fd	libbpf.c	/^int bpf_program__fd(struct bpf_program *prog)$/;"	f
+bpf_program__init	libbpf.c	/^bpf_program__init(void *data, size_t size, char *section_name, int idx,$/;"	f	file:
+bpf_program__is_type	libbpf.c	/^static bool bpf_program__is_type(struct bpf_program *prog,$/;"	f	file:
+bpf_program__load	libbpf.c	/^bpf_program__load(struct bpf_program *prog,$/;"	f	file:
+bpf_program__next	libbpf.c	/^bpf_program__next(struct bpf_program *prev, struct bpf_object *obj)$/;"	f
+bpf_program__nth_fd	libbpf.c	/^int bpf_program__nth_fd(struct bpf_program *prog, int n)$/;"	f
+bpf_program__pin	libbpf.c	/^int bpf_program__pin(struct bpf_program *prog, const char *path)$/;"	f
+bpf_program__pin_instance	libbpf.c	/^int bpf_program__pin_instance(struct bpf_program *prog, const char *path,$/;"	f
+bpf_program__priv	libbpf.c	/^void *bpf_program__priv(struct bpf_program *prog)$/;"	f
+bpf_program__relocate	libbpf.c	/^bpf_program__relocate(struct bpf_program *prog, struct bpf_object *obj)$/;"	f	file:
+bpf_program__set_prep	libbpf.c	/^int bpf_program__set_prep(struct bpf_program *prog, int nr_instances,$/;"	f
+bpf_program__set_priv	libbpf.c	/^int bpf_program__set_priv(struct bpf_program *prog, void *priv,$/;"	f
+bpf_program__set_type	libbpf.c	/^void bpf_program__set_type(struct bpf_program *prog, enum bpf_prog_type type)$/;"	f
+bpf_program__title	libbpf.c	/^const char *bpf_program__title(struct bpf_program *prog, bool needs_copy)$/;"	f
+bpf_program__unload	libbpf.c	/^static void bpf_program__unload(struct bpf_program *prog)$/;"	f	file:
+bpf_program_clear_priv_t	libbpf.h	/^typedef void (*bpf_program_clear_priv_t)(struct bpf_program *,$/;"	t
+bpf_program_prep_t	libbpf.h	/^typedef int (*bpf_program_prep_t)(struct bpf_program *prog, int n,$/;"	t
+bpf_verify_program	bpf.c	/^int bpf_verify_program(enum bpf_prog_type type, const struct bpf_insn *insns,$/;"	f
+check_feat	Makefile	/^  check_feat := 0$/;"	m
+check_feat	Makefile	/^check_feat := 1$/;"	m
+check_path	libbpf.c	/^static int check_path(const char *path)$/;"	f	file:
+clear_priv	libbpf.c	/^	bpf_map_clear_priv_t clear_priv;$/;"	m	struct:bpf_map	file:
+clear_priv	libbpf.c	/^	bpf_object_clear_priv_t clear_priv;$/;"	m	struct:bpf_object	file:
+clear_priv	libbpf.c	/^	bpf_program_clear_priv_t clear_priv;$/;"	m	struct:bpf_program	file:
+compare_bpf_map	libbpf.c	/^static int compare_bpf_map(const void *_a, const void *_b)$/;"	f	file:
+data	libbpf.c	/^			Elf_Data *data;$/;"	m	struct:bpf_object::__anon3::__anon4	file:
+def	libbpf.c	/^	struct bpf_map_def def;$/;"	m	struct:bpf_map	typeref:struct:bpf_map::bpf_map_def	file:
+do_install	Makefile	/^define do_install$/;"	m
+efile	libbpf.c	/^	} efile;$/;"	m	struct:bpf_object	typeref:struct:bpf_object::__anon3	file:
+ehdr	libbpf.c	/^		GElf_Ehdr ehdr;$/;"	m	struct:bpf_object::__anon3	file:
+elf	libbpf.c	/^		Elf *elf;$/;"	m	struct:bpf_object::__anon3	file:
+fd	libbpf.c	/^		int fd;$/;"	m	struct:bpf_object::__anon3	file:
+fd	libbpf.c	/^	int fd;$/;"	m	struct:bpf_map	file:
+fds	libbpf.c	/^		int *fds;$/;"	m	struct:bpf_program::__anon2	file:
+idx	libbpf.c	/^	int idx;$/;"	m	struct:bpf_program	file:
+insn_idx	libbpf.c	/^		int insn_idx;$/;"	m	struct:bpf_program::__anon1	file:
+insns	libbpf.c	/^	struct bpf_insn *insns;$/;"	m	struct:bpf_program	typeref:struct:bpf_program::bpf_insn	file:
+insns_cnt	libbpf.c	/^	size_t insns_cnt;$/;"	m	struct:bpf_program	file:
+instances	libbpf.c	/^	} instances;$/;"	m	struct:bpf_program	typeref:struct:bpf_program::__anon2	file:
+kern_version	libbpf.c	/^	u32 kern_version;$/;"	m	struct:bpf_object	file:
+key_size	libbpf.h	/^	unsigned int key_size;$/;"	m	struct:bpf_map_def
+libbpf_errno	libbpf.h	/^enum libbpf_errno {$/;"	g
+libbpf_get_error	libbpf.c	/^long libbpf_get_error(const void *ptr)$/;"	f
+libbpf_print_fn_t	libbpf.h	/^typedef int (*libbpf_print_fn_t)(const char *, ...)$/;"	t
+libbpf_set_print	libbpf.c	/^void libbpf_set_print(libbpf_print_fn_t warn,$/;"	f
+libbpf_strerror	libbpf.c	/^int libbpf_strerror(int err, char *buf, size_t size)$/;"	f
+libbpf_strerror_table	libbpf.c	/^static const char *libbpf_strerror_table[NR_ERRNO] = {$/;"	v	file:
+libdir	Makefile	/^libdir = $(prefix)\/$(libdir_relative)$/;"	m
+libdir_SQ	Makefile	/^libdir_SQ = $(subst ','\\'',$(libdir))$/;"	m
+libdir_relative	Makefile	/^  libdir_relative = lib$/;"	m
+libdir_relative	Makefile	/^  libdir_relative = lib64$/;"	m
+libdir_relative_SQ	Makefile	/^libdir_relative_SQ = $(subst ','\\'',$(libdir_relative))$/;"	m
+license	libbpf.c	/^	char license[64];$/;"	m	struct:bpf_object	file:
+list	libbpf.c	/^	struct list_head list;$/;"	m	struct:bpf_object	typeref:struct:bpf_object::list_head	file:
+load_program	libbpf.c	/^load_program(enum bpf_prog_type type, const char *name, struct bpf_insn *insns,$/;"	f	file:
+loaded	libbpf.c	/^	bool loaded;$/;"	m	struct:bpf_object	file:
+make_dir	libbpf.c	/^static int make_dir(const char *path)$/;"	f	file:
+man_dir	Makefile	/^man_dir = $(prefix)\/share\/man$/;"	m
+man_dir_SQ	Makefile	/^man_dir_SQ = '$(subst ','\\'',$(man_dir))'$/;"	m
+map_flags	libbpf.h	/^	unsigned int map_flags;$/;"	m	struct:bpf_map_def
+map_idx	libbpf.c	/^		int map_idx;$/;"	m	struct:bpf_program::__anon1	file:
+maps	libbpf.c	/^	struct bpf_map *maps;$/;"	m	struct:bpf_object	typeref:struct:bpf_object::bpf_map	file:
+maps_shndx	libbpf.c	/^		int maps_shndx;$/;"	m	struct:bpf_object::__anon3	file:
+max_entries	libbpf.h	/^	unsigned int max_entries;$/;"	m	struct:bpf_map_def
+min	bpf.c	49;"	d	file:
+name	libbpf.c	/^	char *name;$/;"	m	struct:bpf_map	file:
+name	libbpf.c	/^	char *name;$/;"	m	struct:bpf_program	file:
+new_insn_cnt	libbpf.h	/^	int new_insn_cnt;$/;"	m	struct:bpf_prog_prep_result
+new_insn_ptr	libbpf.h	/^	struct bpf_insn *new_insn_ptr;$/;"	m	struct:bpf_prog_prep_result	typeref:struct:bpf_prog_prep_result::bpf_insn
+nr	libbpf.c	/^		int nr;$/;"	m	struct:bpf_program::__anon2	file:
+nr_maps	libbpf.c	/^	size_t nr_maps;$/;"	m	struct:bpf_object	file:
+nr_programs	libbpf.c	/^	size_t nr_programs;$/;"	m	struct:bpf_object	file:
+nr_reloc	libbpf.c	/^		int nr_reloc;$/;"	m	struct:bpf_object::__anon3	file:
+nr_reloc	libbpf.c	/^	int nr_reloc;$/;"	m	struct:bpf_program	file:
+obj	libbpf.c	/^	struct bpf_object *obj;$/;"	m	struct:bpf_program	typeref:struct:bpf_program::bpf_object	file:
+obj_buf	libbpf.c	/^		void *obj_buf;$/;"	m	struct:bpf_object::__anon3	file:
+obj_buf_sz	libbpf.c	/^		size_t obj_buf_sz;$/;"	m	struct:bpf_object::__anon3	file:
+obj_elf_valid	libbpf.c	250;"	d	file:
+offset	libbpf.c	/^	size_t offset;$/;"	m	struct:bpf_map	file:
+path	libbpf.c	/^	char path[];$/;"	m	struct:bpf_object	file:
+pfd	libbpf.h	/^	int *pfd;$/;"	m	struct:bpf_prog_prep_result
+plugin_dir_SQ	Makefile	/^plugin_dir_SQ = $(subst ','\\'',$(plugin_dir))$/;"	m
+pr_debug	libbpf.c	81;"	d	file:
+pr_info	libbpf.c	80;"	d	file:
+pr_warning	libbpf.c	79;"	d	file:
+prefix	Makefile	/^prefix ?= \/usr\/local$/;"	m
+preprocessor	libbpf.c	/^	bpf_program_prep_t preprocessor;$/;"	m	struct:bpf_program	file:
+priv	libbpf.c	/^	void *priv;$/;"	m	struct:bpf_map	file:
+priv	libbpf.c	/^	void *priv;$/;"	m	struct:bpf_object	file:
+priv	libbpf.c	/^	void *priv;$/;"	m	struct:bpf_program	file:
+programs	libbpf.c	/^	struct bpf_program *programs;$/;"	m	struct:bpf_object	typeref:struct:bpf_object::bpf_program	file:
+ptr_to_u64	bpf.c	/^static inline __u64 ptr_to_u64(const void *ptr)$/;"	f	file:
+reloc	libbpf.c	/^		} *reloc;$/;"	m	struct:bpf_object::__anon3	typeref:struct:bpf_object::__anon3::__anon4	file:
+reloc_desc	libbpf.c	/^	} *reloc_desc;$/;"	m	struct:bpf_program	typeref:struct:bpf_program::__anon1	file:
+section_name	libbpf.c	/^	char *section_name;$/;"	m	struct:bpf_program	file:
+shdr	libbpf.c	/^			GElf_Shdr shdr;$/;"	m	struct:bpf_object::__anon3::__anon4	file:
+srctree	Makefile	/^srctree := $(patsubst %\/,%,$(dir $(CURDIR)))$/;"	m
+srctree	Makefile	/^srctree := $(patsubst %\/,%,$(dir $(srctree)))$/;"	m
+strtabidx	libbpf.c	/^		size_t strtabidx;$/;"	m	struct:bpf_object::__anon3	file:
+symbols	libbpf.c	/^		Elf_Data *symbols;$/;"	m	struct:bpf_object::__anon3	file:
+sys_bpf	bpf.c	/^static inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,$/;"	f	file:
+type	libbpf.c	/^	enum bpf_prog_type type;$/;"	m	struct:bpf_program	typeref:enum:bpf_program::bpf_prog_type	file:
+type	libbpf.h	/^	unsigned int type;$/;"	m	struct:bpf_map_def
+update_dir	Makefile	/^define update_dir$/;"	m
+value_size	libbpf.h	/^	unsigned int value_size;$/;"	m	struct:bpf_map_def
+zclose	libbpf.c	153;"	d	file:
+zfree	libbpf.c	149;"	d	file:
