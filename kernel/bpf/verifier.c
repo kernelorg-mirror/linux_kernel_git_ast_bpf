@@ -1350,6 +1350,21 @@ update:
 		env->subprog_stack_depth[subprog] = -off;
 }
 
+static int get_callee_stack_depth(struct bpf_verifier_env *env,
+				  const struct bpf_insn *insn, int idx)
+{
+	int start = idx + insn->imm + 1, subprog;
+
+	subprog = find_subprog(env, start);
+	if (subprog < 0) {
+		WARN_ONCE(1, "verifier bug. No program starts at insn %d\n",
+			  start);
+		return -EFAULT;
+	}
+	subprog++;
+	return env->subprog_stack_depth[subprog];
+}
+
 /* check whether memory at (regno + off) is accessible for t = (read | write)
  * if t==write, value_regno is a register which value is stored into memory
  * if t==read, value_regno is a register which will receive the value from memory
@@ -4659,6 +4674,19 @@ static int adjust_insn_aux_data(struct bpf_verifier_env *env, u32 prog_len,
 	return 0;
 }
 
+static void adjust_subprog_starts(struct bpf_verifier_env *env, u32 off, u32 len)
+{
+	int i;
+
+	if (len == 1)
+		return;
+	for (i = 0; i < env->subprog_cnt; i++) {
+		if (env->subprog_starts[i] < off)
+			continue;
+		env->subprog_starts[i] += len - 1;
+	}
+}
+
 static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 					    const struct bpf_insn *patch, u32 len)
 {
@@ -4669,6 +4697,7 @@ static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 of
 		return NULL;
 	if (adjust_insn_aux_data(env, new_prog->len, off, len))
 		return NULL;
+	adjust_subprog_starts(env, off, len);
 	return new_prog;
 }
 
@@ -4781,6 +4810,24 @@ static int convert_ctx_accesses(struct bpf_verifier_env *env)
 		insn      = new_prog->insnsi + i + delta;
 	}
 
+	return 0;
+}
+
+static int fixup_call_args(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	struct bpf_insn *insn = prog->insnsi;
+	int i, depth;
+
+	for (i = 0; i < prog->len; i++, insn++) {
+		if (insn->code != (BPF_JMP | BPF_CALL) ||
+		    insn->src_reg != BPF_PSEUDO_CALL)
+			continue;
+		depth = get_callee_stack_depth(env, insn, i);
+		if (depth < 0)
+			return depth;
+		bpf_patch_call_args(insn, depth);
+	}
 	return 0;
 }
 
@@ -4990,6 +5037,9 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = fixup_bpf_calls(env);
+
+	if (ret == 0)
+		ret = fixup_call_args(env);
 
 	if (log->level && bpf_verifier_log_full(log))
 		ret = -ENOSPC;
