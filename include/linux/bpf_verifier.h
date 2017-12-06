@@ -13,11 +13,11 @@
 
 /* Maximum variable offset umax_value permitted when resolving memory accesses.
  * In practice this is far bigger than any realistic pointer offset; this limit
- * ensures that umax_value + (int)off + (int)size cannot overflow a u64.
+ * ensures that max_value + (int)off + (int)size cannot overflow a u64.
  */
-#define BPF_MAX_VAR_OFF	(1ULL << 31)
+#define BPF_MAX_VAR_OFF	INT_MAX
 /* Maximum variable size permitted for ARG_CONST_SIZE[_OR_ZERO].  This ensures
- * that converting umax_value to int cannot overflow.
+ * that converting max_value to int cannot overflow.
  */
 #define BPF_MAX_VAR_SIZ	INT_MAX
 
@@ -67,15 +67,8 @@ struct bpf_reg_state {
 	 * with the same id as us.
 	 */
 	struct tnum var_off;
-	/* Used to determine if any memory access using this register will
-	 * result in a bad access.
-	 * These refer to the same value as var_off, not necessarily the actual
-	 * contents of the register.
-	 */
-	s64 smin_value; /* minimum possible (s64)value */
-	s64 smax_value; /* maximum possible (s64)value */
-	u64 umin_value; /* minimum possible (u64)value */
-	u64 umax_value; /* maximum possible (u64)value */
+	u64 max_value;
+	bool maybe_negative;
 	/* This field must be last, for states_equal() reasons. */
 	enum bpf_reg_liveness live;
 };
