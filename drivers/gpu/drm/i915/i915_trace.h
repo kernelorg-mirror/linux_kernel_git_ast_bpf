@@ -849,8 +849,8 @@ TRACE_EVENT(i915_flip_complete,
 	    TP_printk("plane=%d, obj=%p", __entry->plane, __entry->obj)
 );
 
-TRACE_EVENT_CONDITION(i915_reg_rw,
-	TP_PROTO(bool write, i915_reg_t reg, u64 val, int len, bool trace),
+TRACE_EVENT_CONDITION(i915_reg_rw__,
+	TP_PROTO(bool write, u32 reg, u64 val, int len, bool trace),
 
 	TP_ARGS(write, reg, val, len, trace),
 
@@ -865,7 +865,7 @@ TRACE_EVENT_CONDITION(i915_reg_rw,
 
 	TP_fast_assign(
 		__entry->val = (u64)val;
-		__entry->reg = i915_mmio_reg_offset(reg);
+		__entry->reg = reg;
 		__entry->write = write;
 		__entry->len = len;
 		),
@@ -876,6 +876,13 @@ TRACE_EVENT_CONDITION(i915_reg_rw,
 		(u32)(__entry->val & 0xffffffff),
 		(u32)(__entry->val >> 32))
 );
+#if !defined(CREATE_TRACE_POINTS) && !defined(TRACE_HEADER_MULTI_READ)
+static inline void trace_i915_reg_rw(bool write, i915_reg_t reg, u64 val,
+				     int len, bool trace)
+{
+	trace_i915_reg_rw__(write, i915_mmio_reg_offset(reg), val, len, trace);
+}
+#endif
 
 TRACE_EVENT(intel_gpu_freq_change,
 	    TP_PROTO(u32 freq),
