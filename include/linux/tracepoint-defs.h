@@ -36,4 +36,9 @@ struct tracepoint {
 	u32 num_args;
 };
 
+struct bpf_raw_event_map {
+	struct tracepoint	*tp;
+	void			*bpf_func;
+};
+
 #endif
