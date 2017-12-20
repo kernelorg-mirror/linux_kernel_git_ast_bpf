@@ -723,6 +723,86 @@ const struct bpf_verifier_ops tracepoint_verifier_ops = {
 const struct bpf_prog_ops tracepoint_prog_ops = {
 };
 
+/*
+ * bpf_raw_tp_regs are separate from bpf_pt_regs used from skb/xdp
+ * to avoid potential recursive reuse issue when/if tracepoints are added
+ * inside bpf_*_event_output and/or bpf_get_stack_id
+ */
+static DEFINE_PER_CPU(struct pt_regs, bpf_raw_tp_regs);
+BPF_CALL_5(bpf_perf_event_output_raw_tp, struct bpf_raw_tracepoint_args *, args,
+	   struct bpf_map *, map, u64, flags, void *, data, u64, size)
+{
+	struct pt_regs *regs = this_cpu_ptr(&bpf_raw_tp_regs);
+
+	perf_fetch_caller_regs(regs);
+	return ____bpf_perf_event_output(regs, map, flags, data, size);
+}
+
+static const struct bpf_func_proto bpf_perf_event_output_proto_raw_tp = {
+	.func		= bpf_perf_event_output_raw_tp,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_CONST_MAP_PTR,
+	.arg3_type	= ARG_ANYTHING,
+	.arg4_type	= ARG_PTR_TO_MEM,
+	.arg5_type	= ARG_CONST_SIZE_OR_ZERO,
+};
+
+BPF_CALL_3(bpf_get_stackid_raw_tp, struct bpf_raw_tracepoint_args *, args,
+	   struct bpf_map *, map, u64, flags)
+{
+	struct pt_regs *regs = this_cpu_ptr(&bpf_raw_tp_regs);
+
+	perf_fetch_caller_regs(regs);
+	/* similar to bpf_perf_event_output_tp, but pt_regs fetched differently */
+	return bpf_get_stackid((unsigned long) regs, (unsigned long) map,
+			       flags, 0, 0);
+}
+
+static const struct bpf_func_proto bpf_get_stackid_proto_raw_tp = {
+	.func		= bpf_get_stackid_raw_tp,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_CONST_MAP_PTR,
+	.arg3_type	= ARG_ANYTHING,
+};
+
+static const struct bpf_func_proto *raw_tp_prog_func_proto(enum bpf_func_id func_id)
+{
+	switch (func_id) {
+	case BPF_FUNC_perf_event_output:
+		return &bpf_perf_event_output_proto_raw_tp;
+	case BPF_FUNC_get_stackid:
+		return &bpf_get_stackid_proto_raw_tp;
+	default:
+		return tracing_func_proto(func_id);
+	}
+}
+
+static bool raw_tp_prog_is_valid_access(int off, int size,
+					enum bpf_access_type type,
+					struct bpf_insn_access_aux *info)
+{
+	/* largest tracepoint in the kernel has 12 args */
+	if (off < 0 || off >= sizeof(__u64) * 12)
+		return false;
+	if (type != BPF_READ)
+		return false;
+	if (off % size != 0)
+		return false;
+	return true;
+}
+
+const struct bpf_verifier_ops raw_tracepoint_verifier_ops = {
+	.get_func_proto  = raw_tp_prog_func_proto,
+	.is_valid_access = raw_tp_prog_is_valid_access,
+};
+
+const struct bpf_prog_ops raw_tracepoint_prog_ops = {
+};
+
 static bool pe_prog_is_valid_access(int off, int size, enum bpf_access_type type,
 				    struct bpf_insn_access_aux *info)
 {
@@ -895,4 +975,194 @@ int perf_event_query_prog_array(struct perf_event *event, void __user *info)
 	mutex_unlock(&bpf_event_mutex);
 
 	return ret;
+}
+
+static __always_inline
+void __bpf_trace_run(struct bpf_prog *prog, u64 *args)
+{
+	rcu_read_lock();
+	preempt_disable();
+	(void) BPF_PROG_RUN(prog, args);
+	preempt_enable();
+	rcu_read_unlock();
+}
+
+#define EVAL1(FN, X) FN(X)
+#define EVAL2(FN, X, Y...) FN(X) EVAL1(FN, Y)
+#define EVAL3(FN, X, Y...) FN(X) EVAL2(FN, Y)
+#define EVAL4(FN, X, Y...) FN(X) EVAL3(FN, Y)
+#define EVAL5(FN, X, Y...) FN(X) EVAL4(FN, Y)
+#define EVAL6(FN, X, Y...) FN(X) EVAL5(FN, Y)
+
+#define COPY(X) args[X - 1] = arg##X;
+
+void bpf_trace_run1(struct bpf_prog *prog, u64 arg1)
+{
+	u64 args[1];
+
+	EVAL1(COPY, 1);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run1);
+void bpf_trace_run2(struct bpf_prog *prog, u64 arg1, u64 arg2)
+{
+	u64 args[2];
+
+	EVAL2(COPY, 1, 2);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run2);
+void bpf_trace_run3(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3)
+{
+	u64 args[3];
+
+	EVAL3(COPY, 1, 2, 3);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run3);
+void bpf_trace_run4(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3, u64 arg4)
+{
+	u64 args[4];
+
+	EVAL4(COPY, 1, 2, 3, 4);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run4);
+void bpf_trace_run5(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3, u64 arg4, u64 arg5)
+{
+	u64 args[5];
+
+	EVAL5(COPY, 1, 2, 3, 4, 5);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run5);
+void bpf_trace_run6(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3, u64 arg4, u64 arg5, u64 arg6)
+{
+	u64 args[6];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run6);
+void bpf_trace_run7(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7)
+{
+	u64 args[7];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	EVAL1(COPY, 7);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run7);
+void bpf_trace_run8(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7,
+		    u64 arg8)
+{
+	u64 args[8];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	EVAL2(COPY, 7, 8);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run8);
+void bpf_trace_run9(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		    u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7,
+		    u64 arg8, u64 arg9)
+{
+	u64 args[9];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	EVAL3(COPY, 7, 8, 9);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run9);
+void bpf_trace_run10(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		     u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7,
+		     u64 arg8, u64 arg9, u64 arg10)
+{
+	u64 args[10];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	EVAL4(COPY, 7, 8, 9, 10);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run10);
+void bpf_trace_run11(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		     u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7,
+		     u64 arg8, u64 arg9, u64 arg10, u64 arg11)
+{
+	u64 args[11];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	EVAL5(COPY, 7, 8, 9, 10, 11);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run11);
+void bpf_trace_run12(struct bpf_prog *prog, u64 arg1, u64 arg2,
+		     u64 arg3, u64 arg4, u64 arg5, u64 arg6, u64 arg7,
+		     u64 arg8, u64 arg9, u64 arg10, u64 arg11, u64 arg12)
+{
+	u64 args[12];
+
+	EVAL6(COPY, 1, 2, 3, 4, 5, 6);
+	EVAL6(COPY, 7, 8, 9, 10, 11, 12);
+	__bpf_trace_run(prog, args);
+}
+EXPORT_SYMBOL_GPL(bpf_trace_run12);
+
+static int __bpf_probe_register(struct tracepoint *tp, struct bpf_prog *prog)
+{
+	unsigned long addr;
+	char buf[128];
+
+	/*
+	 * check that program doesn't access arguments beyond what's
+	 * available in this tracepoint
+	 */
+	if (prog->aux->max_ctx_offset > tp->num_args * sizeof(u64))
+		return -EINVAL;
+
+	snprintf(buf, sizeof(buf), "__bpf_trace_%s", tp->name);
+	addr = kallsyms_lookup_name(buf);
+	if (!addr)
+		return -ENOENT;
+
+	return tracepoint_probe_register(tp, (void *)addr, prog);
+}
+
+int bpf_probe_register(struct tracepoint *tp, struct bpf_prog *prog)
+{
+	int err;
+
+	mutex_lock(&bpf_event_mutex);
+	err = __bpf_probe_register(tp, prog);
+	mutex_unlock(&bpf_event_mutex);
+	return err;
+}
+
+static int __bpf_probe_unregister(struct tracepoint *tp, struct bpf_prog *prog)
+{
+	unsigned long addr;
+	char buf[128];
+
+	snprintf(buf, sizeof(buf), "__bpf_trace_%s", tp->name);
+	addr = kallsyms_lookup_name(buf);
+	if (!addr)
+		return -ENOENT;
+
+	return tracepoint_probe_unregister(tp, (void *)addr, prog);
+}
+
+int bpf_probe_unregister(struct tracepoint *tp, struct bpf_prog *prog)
+{
+	int err;
+
+	mutex_lock(&bpf_event_mutex);
+	err = __bpf_probe_unregister(tp, prog);
+	mutex_unlock(&bpf_event_mutex);
+	return err;
 }
