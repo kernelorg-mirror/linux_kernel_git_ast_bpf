@@ -325,7 +325,13 @@ static struct ctl_table net_core_table[] = {
 		.data		= &bpf_jit_enable,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
+#ifndef CONFIG_BPF_JIT_ALWAYS_ON
 		.proc_handler	= proc_dointvec
+#else
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
+		.extra2		= &one,
+#endif
 	},
 # ifdef CONFIG_HAVE_EBPF_JIT
 	{
@@ -524,6 +530,9 @@ static __net_initdata struct pernet_operations sysctl_core_ops = {
 
 static __init int sysctl_core_init(void)
 {
+#if defined(CONFIG_BPF_JIT) && defined(CONFIG_BPF_JIT_ALWAYS_ON)
+	bpf_jit_enable = 1;
+#endif
 	register_net_sysctl(&init_net, "net/core", net_core_table);
 	return register_pernet_subsys(&sysctl_core_ops);
 }

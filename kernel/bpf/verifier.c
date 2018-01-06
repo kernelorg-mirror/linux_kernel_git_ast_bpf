@@ -5267,7 +5267,11 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 		depth = get_callee_stack_depth(env, insn, i);
 		if (depth < 0)
 			return depth;
+#ifdef CONFIG_BPF_JIT_ALWAYS_ON
+		return -ENOTSUPP;
+#else
 		bpf_patch_call_args(insn, depth);
+#endif
 	}
 	return 0;
 }
