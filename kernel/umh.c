@@ -25,6 +25,8 @@
 #include <linux/ptrace.h>
 #include <linux/async.h>
 #include <linux/uaccess.h>
+#include <linux/shmem_fs.h>
+#include <linux/pipe_fs_i.h>
 
 #include <trace/events/module.h>
 
@@ -97,9 +99,13 @@ static int call_usermodehelper_exec_async(void *data)
 
 	commit_creds(new);
 
-	retval = do_execve(getname_kernel(sub_info->path),
-			   (const char __user *const __user *)sub_info->argv,
-			   (const char __user *const __user *)sub_info->envp);
+	if (sub_info->file)
+		retval = do_execve_file(sub_info->file,
+					sub_info->argv, sub_info->envp);
+	else
+		retval = do_execve(getname_kernel(sub_info->path),
+				   (const char __user *const __user *)sub_info->argv,
+				   (const char __user *const __user *)sub_info->envp);
 out:
 	sub_info->retval = retval;
 	/*
@@ -185,6 +191,8 @@ static void call_usermodehelper_exec_work(struct work_struct *work)
 		if (pid < 0) {
 			sub_info->retval = pid;
 			umh_complete(sub_info);
+		} else {
+			sub_info->pid = pid;
 		}
 	}
 }
@@ -392,6 +400,215 @@ struct subprocess_info *call_usermodehelper_setup(const char *path, char **argv,
 	return sub_info;
 }
 EXPORT_SYMBOL(call_usermodehelper_setup);
+
+struct subprocess_info *call_usermodehelper_setup_file(struct file *file,
+		int (*init)(struct subprocess_info *info, struct cred *new),
+		void (*cleanup)(struct subprocess_info *info), void *data)
+{
+	struct subprocess_info *sub_info;
+
+	sub_info = kzalloc(sizeof(struct subprocess_info), GFP_KERNEL);
+	if (!sub_info)
+		return NULL;
+
+	INIT_WORK(&sub_info->work, call_usermodehelper_exec_work);
+	sub_info->path = "none";
+	sub_info->file = file;
+	sub_info->init = init;
+	sub_info->cleanup = cleanup;
+	sub_info->data = data;
+	return sub_info;
+}
+
+static struct vfsmount *umh_fs;
+
+static int init_tmpfs(void)
+{
+	struct file_system_type *type;
+
+	if (umh_fs)
+		return 0;
+	type = get_fs_type("tmpfs");
+	if (!type)
+		return -ENODEV;
+	umh_fs = kern_mount(type);
+	if (IS_ERR(umh_fs))
+		return PTR_ERR(umh_fs);
+	return 0;
+}
+
+static int alloc_tmpfs_file(size_t size, struct file **filp)
+{
+	struct file *file;
+	int err;
+
+	err = init_tmpfs();
+	if (err)
+		return err;
+	file = shmem_file_setup_with_mnt(umh_fs, "umh", size, VM_NORESERVE);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	*filp = file;
+	return 0;
+}
+
+static int populate_file(struct file *file, const void *data, size_t size)
+{
+	size_t offset = 0;
+	int err;
+
+	do {
+		unsigned int len = min_t(typeof(size), size, PAGE_SIZE);
+		struct page *page;
+		void *pgdata, *vaddr;
+
+		err = pagecache_write_begin(file, file->f_mapping, offset, len,
+					    0, &page, &pgdata);
+		if (err < 0)
+			goto fail;
+
+		vaddr = kmap(page);
+		memcpy(vaddr, data, len);
+		kunmap(page);
+
+		err = pagecache_write_end(file, file->f_mapping, offset, len,
+					  len, page, pgdata);
+		if (err < 0)
+			goto fail;
+
+		size -= len;
+		data += len;
+		offset += len;
+	} while (size);
+	return 0;
+fail:
+	return err;
+}
+
+static int umh_pipe_setup(struct subprocess_info *info, struct cred *new)
+{
+	struct umh_info *umh_info = info->data;
+	struct file *from_umh[2];
+	struct file *to_umh[2];
+	int err;
+
+	/* create pipe to send data to umh */
+	err = create_pipe_files(to_umh, 0);
+	if (err)
+		return err;
+	err = replace_fd(0, to_umh[0], 0);
+	fput(to_umh[0]);
+	if (err < 0) {
+		fput(to_umh[1]);
+		return err;
+	}
+
+	/* create pipe to receive data from umh */
+	err = create_pipe_files(from_umh, 0);
+	if (err) {
+		fput(to_umh[1]);
+		replace_fd(0, NULL, 0);
+		return err;
+	}
+	err = replace_fd(1, from_umh[1], 0);
+	fput(from_umh[1]);
+	if (err < 0) {
+		fput(to_umh[1]);
+		replace_fd(0, NULL, 0);
+		fput(from_umh[0]);
+		return err;
+	}
+
+	umh_info->pipe_to_umh = to_umh[1];
+	umh_info->pipe_from_umh = from_umh[0];
+	return 0;
+}
+
+static void umh_save_pid(struct subprocess_info *info)
+{
+	struct umh_info *umh_info = info->data;
+
+	umh_info->pid = info->pid;
+}
+
+static int umh_wait(struct file *file, long timeout)
+{
+	struct poll_wqueues table;
+	ktime_t start, now;
+	long elapsed = 0;
+
+	start = ktime_get();
+	poll_initwait(&table);
+	while (1) {
+		__poll_t mask;
+
+		mask = file->f_op->poll(file, &table.pt);
+		if (mask & (EPOLLRDNORM | EPOLLRDBAND | EPOLLIN |
+			    EPOLLHUP | EPOLLERR)) {
+			break;
+		}
+		now = ktime_get();
+		elapsed = ktime_us_delta(now, start);
+		if (elapsed > timeout)
+			break;
+		schedule_timeout_interruptible(((timeout - elapsed) * HZ) / 1000);
+	}
+	poll_freewait(&table);
+
+	return elapsed > timeout;
+}
+
+int fork_usermode_blob(void *data, size_t len, struct umh_info *info)
+{
+	struct subprocess_info *sub_info;
+	struct file *file = NULL;
+/*	char ping[4] = "PING";
+	char pong[4];
+	ssize_t n;
+	loff_t pos;*/
+	int err;
+
+	err = alloc_tmpfs_file(len, &file);
+	if (err)
+		return err;
+
+	err = populate_file(file, data, len);
+	if (err)
+		goto out;
+
+	err = -ENOMEM;
+	sub_info = call_usermodehelper_setup_file(file, umh_pipe_setup,
+						  umh_save_pid, info);
+	if (!sub_info)
+		goto out;
+
+	err = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);
+out:
+	fput(file);
+/*	if (err)
+		return err;
+	pos = pipes[0]->f_pos;
+	n = __kernel_write(pipes[0], ping, sizeof(ping), &pos);
+	printk("write %zd\n", n);
+	if (n < sizeof(ping)) {
+		return -EINVAL;
+	}
+	pipes[0]->f_pos = pos;
+
+	if (umh_wait(pipes[1], 2000)) {
+		printk("timeout\n");
+		return -EINVAL;
+	}
+	pos = 0;
+	n = kernel_read(pipes[1], pong, sizeof(pong), &pos);
+	printk("read %zd\n", n);
+	if (n < sizeof(pong)) {
+		return -EINVAL;
+	}*/
+	return err;
+}
+EXPORT_SYMBOL_GPL(fork_usermode_blob);
+
 
 /**
  * call_usermodehelper_exec - start a usermode application
