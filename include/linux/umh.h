@@ -22,6 +22,7 @@ struct subprocess_info {
 	const char *path;
 	char **argv;
 	char **envp;
+	struct file *file;
 	int wait;
 	int retval;
 	int (*init)(struct subprocess_info *info, struct cred *new);
@@ -37,6 +38,10 @@ call_usermodehelper_setup(const char *path, char **argv, char **envp,
 			  gfp_t gfp_mask,
 			  int (*init)(struct subprocess_info *info, struct cred *new),
 			  void (*cleanup)(struct subprocess_info *), void *data);
+
+struct subprocess_info *call_usermodehelper_setup_file(struct file *file,
+			  int (*init)(struct subprocess_info *info, struct cred *new),
+			  void *data);
 
 extern int
 call_usermodehelper_exec(struct subprocess_info *info, int wait);
