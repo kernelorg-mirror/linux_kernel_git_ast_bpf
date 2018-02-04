@@ -97,9 +97,13 @@ static int call_usermodehelper_exec_async(void *data)
 
 	commit_creds(new);
 
-	retval = do_execve(getname_kernel(sub_info->path),
-			   (const char __user *const __user *)sub_info->argv,
-			   (const char __user *const __user *)sub_info->envp);
+	if (sub_info->file)
+		retval = do_execve_file(sub_info->file,
+					sub_info->argv, sub_info->envp);
+	else
+		retval = do_execve(getname_kernel(sub_info->path),
+				   (const char __user *const __user *)sub_info->argv,
+				   (const char __user *const __user *)sub_info->envp);
 out:
 	sub_info->retval = retval;
 	/*
@@ -392,6 +396,20 @@ struct subprocess_info *call_usermodehelper_setup(const char *path, char **argv,
 	return sub_info;
 }
 EXPORT_SYMBOL(call_usermodehelper_setup);
+
+struct subprocess_info *call_usermodehelper_setup_file(struct file *file)
+{
+	struct subprocess_info *sub_info;
+
+	sub_info = kzalloc(sizeof(struct subprocess_info), GFP_KERNEL);
+	if (!sub_info)
+		return NULL;
+
+	INIT_WORK(&sub_info->work, call_usermodehelper_exec_work);
+	sub_info->path = "/dev/null";
+	sub_info->file = file;
+	return sub_info;
+}
 
 /**
  * call_usermodehelper_exec - start a usermode application

@@ -325,6 +325,7 @@ struct load_info {
 	struct {
 		unsigned int sym, str, mod, vers, info, pcpu;
 	} index;
+	struct file *file;
 };
 
 /*
@@ -2801,6 +2802,15 @@ static int module_sig_check(struct load_info *info, int flags)
 }
 #endif /* !CONFIG_MODULE_SIG */
 
+static int run_umh(struct file *file)
+{
+	struct subprocess_info *sub_info = call_usermodehelper_setup_file(file);
+
+	if (!sub_info)
+		return -ENOMEM;
+	return call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);
+}
+
 /* Sanity checks against invalid binaries, wrong arch, weird elf version. */
 static int elf_header_check(struct load_info *info)
 {
@@ -2808,7 +2818,6 @@ static int elf_header_check(struct load_info *info)
 		return -ENOEXEC;
 
 	if (memcmp(info->hdr->e_ident, ELFMAG, SELFMAG) != 0
-	    || info->hdr->e_type != ET_REL
 	    || !elf_check_arch(info->hdr)
 	    || info->hdr->e_shentsize != sizeof(Elf_Shdr))
 		return -ENOEXEC;
@@ -2818,6 +2827,11 @@ static int elf_header_check(struct load_info *info)
 		info->len - info->hdr->e_shoff))
 		return -ENOEXEC;
 
+	if (info->hdr->e_type == ET_EXEC)
+		return run_umh(info->file);
+
+	if (info->hdr->e_type != ET_REL)
+		return -ENOEXEC;
 	return 0;
 }
 
@@ -3669,6 +3683,17 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	if (err)
 		goto free_copy;
 
+	if (info->hdr->e_type == ET_EXEC) {
+#ifdef CONFIG_MODULE_SIG
+		if (!info->sig_ok) {
+			pr_notice_once("umh %s verification failed: signature and/or required key missing - tainting kernel\n",
+				       info->file->f_path.dentry->d_name.name);
+			add_taint(TAINT_UNSIGNED_MODULE, LOCKDEP_STILL_OK);
+		}
+#endif
+		return 0;
+	}
+
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
 	if (IS_ERR(mod)) {
@@ -3856,6 +3881,7 @@ SYSCALL_DEFINE3(init_module, void __user *, umod,
 SYSCALL_DEFINE3(finit_module, int, fd, const char __user *, uargs, int, flags)
 {
 	struct load_info info = { };
+	struct fd f;
 	loff_t size;
 	void *hdr;
 	int err;
@@ -3870,14 +3896,21 @@ SYSCALL_DEFINE3(finit_module, int, fd, const char __user *, uargs, int, flags)
 		      |MODULE_INIT_IGNORE_VERMAGIC))
 		return -EINVAL;
 
-	err = kernel_read_file_from_fd(fd, &hdr, &size, INT_MAX,
-				       READING_MODULE);
+	f = fdget(fd);
+	if (!f.file)
+		return -EBADF;
+
+	err = kernel_read_file(f.file, &hdr, &size, INT_MAX, READING_MODULE);
 	if (err)
-		return err;
+		goto out;
 	info.hdr = hdr;
 	info.len = size;
+	info.file = f.file;
 
-	return load_module(&info, uargs, flags);
+	err = load_module(&info, uargs, flags);
+out:
+	fdput(f);
+	return err;
 }
 
 static inline int within(unsigned long addr, void *start, unsigned long size)
