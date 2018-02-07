@@ -1840,6 +1840,41 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 	return err;
 }
 
+DECLARE_WAIT_QUEUE_HEAD(bpfilter_get_cmd_wq);
+DECLARE_WAIT_QUEUE_HEAD(bpfilter_reply_wq);
+bool bpfilter_get_cmd_ready = false;
+bool bpfilter_reply_ready = false;
+struct bpfilter_get_cmd bpfilter_get_cmd_mbox;
+struct bpfilter_reply bpfilter_reply_mbox;
+
+#define BPFILTER_GET_CMD_LAST_FIELD bpfilter_get_cmd.len
+
+static int bpfilter_get_cmd(const union bpf_attr *attr,
+			    union bpf_attr __user *uattr)
+{
+	if (CHECK_ATTR(BPFILTER_GET_CMD))
+		return -EINVAL;
+	wait_event_killable(bpfilter_get_cmd_wq, bpfilter_get_cmd_ready);
+	bpfilter_get_cmd_ready = false;
+	if (copy_to_user(&uattr->bpfilter_get_cmd, &bpfilter_get_cmd_mbox,
+			 sizeof(bpfilter_get_cmd_mbox)))
+		return -EFAULT;
+	return 0;
+}
+
+#define BPFILTER_REPLY_LAST_FIELD bpfilter_reply.status
+
+static int bpfilter_reply(const union bpf_attr *attr,
+			  union bpf_attr __user *uattr)
+{
+	if (CHECK_ATTR(BPFILTER_REPLY))
+		return -EINVAL;
+	bpfilter_reply_mbox.status = attr->bpfilter_reply.status;
+	bpfilter_reply_ready = true;
+	wake_up(&bpfilter_reply_wq);
+	return 0;
+}
+
 SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
 {
 	union bpf_attr attr = {};
@@ -1916,6 +1951,12 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 		break;
 	case BPF_OBJ_GET_INFO_BY_FD:
 		err = bpf_obj_get_info_by_fd(&attr, uattr);
+		break;
+	case BPFILTER_GET_CMD:
+		err = bpfilter_get_cmd(&attr, uattr);
+		break;
+	case BPFILTER_REPLY:
+		err = bpfilter_reply(&attr, uattr);
 		break;
 	default:
 		err = -EINVAL;
