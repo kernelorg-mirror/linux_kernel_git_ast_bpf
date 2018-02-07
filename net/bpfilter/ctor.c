@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <sys/socket.h>
-#include <linux/bitops.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+
+#include <sys/socket.h>
+
+#include <linux/bitops.h>
+
 #include "bpfilter_mod.h"
 
 unsigned int __sw_hweight32(unsigned int w)
@@ -13,35 +17,47 @@ unsigned int __sw_hweight32(unsigned int w)
 	return (w * 0x01010101) >> 24;
 }
 
-struct bpfilter_table_info *bpfilter_ipv4_table_ctor(struct bpfilter_table *tbl)
+struct bpfilter_table_info *bpfilter_ipv4_table_alloc(struct bpfilter_table *tbl,
+						      __u32 size_ents)
 {
 	unsigned int num_hooks = hweight32(tbl->valid_hooks);
-	struct bpfilter_ipt_standard *tgts;
 	struct bpfilter_table_info *info;
-	struct bpfilter_ipt_error *term;
-	unsigned int mask, offset, h, i;
 	unsigned int size, alloc_size;
 
 	size  = sizeof(struct bpfilter_ipt_standard) * num_hooks;
 	size += sizeof(struct bpfilter_ipt_error);
+	size += size_ents;
 
 	alloc_size = size + sizeof(struct bpfilter_table_info);
 
 	info = malloc(alloc_size);
-	if (!info)
-		return NULL;
+	if (info) {
+		memset(info, 0, alloc_size);
+		info->size = size;
+	}
+	return info;
+}
 
-	info->num_entries = num_hooks + 1;
-	info->size = size;
+struct bpfilter_table_info *bpfilter_ipv4_table_finalize(struct bpfilter_table *tbl,
+							 struct bpfilter_table_info *info,
+							 __u32 size_ents, __u32 num_ents)
+{
+	unsigned int num_hooks = hweight32(tbl->valid_hooks);
+	struct bpfilter_ipt_standard *tgts;
+	struct bpfilter_ipt_error *term;
+	struct bpfilter_ipt_entry *ent;
+	unsigned int mask, offset, h, i;
 
-	tgts = (struct bpfilter_ipt_standard *) (info + 1);
-	term = (struct bpfilter_ipt_error *) (tgts + num_hooks);
+	info->num_entries = num_ents + num_hooks + 1;
+
+	ent  = (struct bpfilter_ipt_entry *)(info + 1);
+	tgts = (struct bpfilter_ipt_standard *)((u8 *)ent + size_ents);
+	term = (struct bpfilter_ipt_error *)(tgts + num_hooks);
 
 	mask = tbl->valid_hooks;
 	offset = 0;
 	h = 0;
 	i = 0;
-	dprintf(debug_fd, "mask %x num_hooks %d\n", mask, num_hooks);
 	while (mask) {
 		struct bpfilter_ipt_standard *t;
 
@@ -55,7 +71,6 @@ struct bpfilter_table_info *bpfilter_ipv4_table_ctor(struct bpfilter_table *tbl)
 			BPFILTER_IPT_STANDARD_INIT(BPFILTER_NF_ACCEPT);
 		t->target.target.u.kernel.target =
 			bpfilter_target_get_by_name(t->target.target.u.user.name);
-		dprintf(debug_fd, "user.name %s\n", t->target.target.u.user.name);
 		if (!t->target.target.u.kernel.target)
 			goto out_fail;
 
@@ -67,14 +82,10 @@ struct bpfilter_table_info *bpfilter_ipv4_table_ctor(struct bpfilter_table *tbl)
 	*term = (struct bpfilter_ipt_error) BPFILTER_IPT_ERROR_INIT;
 	term->target.target.u.kernel.target =
 		bpfilter_target_get_by_name(term->target.target.u.user.name);
-	dprintf(debug_fd, "user.name %s\n", term->target.target.u.user.name);
-	if (!term->target.target.u.kernel.target)
-		goto out_fail;
-
-	dprintf(debug_fd, "info %p\n", info);
-	return info;
-
+	if (!term->target.target.u.kernel.target) {
 out_fail:
-	free(info);
-	return NULL;
+		free(info);
+		return NULL;
+	}
+	return info;
 }

@@ -94,8 +94,8 @@ enum bpf_cmd {
 	BPF_MAP_GET_FD_BY_ID,
 	BPF_OBJ_GET_INFO_BY_FD,
 	BPF_PROG_QUERY,
-	BPFILTER_GET_CMD,
-	BPFILTER_REPLY,
+	BPF_MBOX_REQUEST,
+	BPF_MBOX_REPLY,
 };
 
 enum bpf_map_type {
@@ -233,14 +233,29 @@ enum bpf_attach_type {
 #define BPF_F_RDONLY		(1U << 3)
 #define BPF_F_WRONLY		(1U << 4)
 
-struct bpfilter_get_cmd {
-	__u32 pid;
-	__u32 cmd;
-	__u64 addr;
-	__u32 len;
+enum bpf_mbox_subsys {
+	BPF_MBOX_SUBSYS_BPFILTER,
+#define BPF_MBOX_SUBSYS_BPFILTER	BPF_MBOX_SUBSYS_BPFILTER
 };
 
-struct bpfilter_reply {
+enum bpf_mbox_kind {
+	BPF_MBOX_KIND_SET,
+#define BPF_MBOX_KIND_SET		BPF_MBOX_KIND_SET
+	BPF_MBOX_KIND_GET,
+#define BPF_MBOX_KIND_GET		BPF_MBOX_KIND_GET
+};
+
+struct bpf_mbox_request {
+	__u64 addr;
+	__u32 len;
+	__u32 subsys;
+	__u32 kind;
+	__u32 cmd;
+	__u32 pid;
+};
+
+struct bpf_mbox_reply {
+	__u32 subsys;
 	__u32 status;
 };
 
@@ -334,8 +349,8 @@ union bpf_attr {
 		__u32		prog_cnt;
 	} query;
 
-	struct bpfilter_get_cmd bpfilter_get_cmd;
-	struct bpfilter_reply bpfilter_reply;
+	struct bpf_mbox_request	mbox_request;
+	struct bpf_mbox_reply 	mbox_reply;
 } __attribute__((aligned(8)));
 
 /* BPF helper function descriptions:
