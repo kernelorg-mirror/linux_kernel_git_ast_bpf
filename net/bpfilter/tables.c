@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <sys/socket.h>
 #include <errno.h>
 #include <string.h>
+
+#include <sys/socket.h>
+
 #include <linux/hashtable.h>
+
 #include "bpfilter_mod.h"
 
 static unsigned int full_name_hash(const void *salt, const char *name, unsigned int len)

@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
-#include <sys/uio.h>
 #include <errno.h>
 #include <stdio.h>
-#include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "include/uapi/linux/bpf.h"
+
+#include <sys/uio.h>
+#include <sys/socket.h>
+
 #include <asm/unistd.h>
+
+#include "include/uapi/linux/bpf.h"
+
 #include "bpfilter_mod.h"
 #include "msgfmt.h"
 
 extern long int syscall (long int __sysno, ...);
 
-static inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,
-			  unsigned int size)
+int sys_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 {
 	return syscall(321, cmd, attr, size);
 }
@@ -39,7 +42,7 @@ int copy_to_user(void *addr, const void *src, int len)
 	struct iovec local;
 	struct iovec remote;
 
-	local.iov_base = (void *) src;
+	local.iov_base = (void *)src;
 	local.iov_len = len;
 	remote.iov_base = addr;
 	remote.iov_len = len;

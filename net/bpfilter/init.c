@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <sys/socket.h>
 #include <errno.h>
+
+#include <sys/socket.h>
+
 #include "bpfilter_mod.h"
 
 static struct bpfilter_table filter_table_ipv4 = {
@@ -22,12 +24,13 @@ int bpfilter_ipv4_init(void)
 	if (err)
 		return err;
 
-	info = bpfilter_ipv4_table_ctor(t);
+	info = bpfilter_ipv4_table_alloc(t, 0);
 	if (!info)
 		return -ENOMEM;
-
+	info = bpfilter_ipv4_table_finalize(t, info, 0, 0);
+	if (!info)
+		return -ENOMEM;
 	t->info = info;
-
 	return bpfilter_table_add(&filter_table_ipv4);
 }
 
