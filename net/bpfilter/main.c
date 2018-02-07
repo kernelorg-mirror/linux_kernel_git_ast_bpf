@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
-#include <sys/uio.h>
 #include <errno.h>
 #include <stdio.h>
-#include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "include/uapi/linux/bpf.h"
+
+#include <sys/uio.h>
+#include <sys/socket.h>
+
 #include <asm/unistd.h>
+
+#include "include/uapi/linux/bpf.h"
+
 #include "bpfilter_mod.h"
 
 extern long int syscall (long int __sysno, ...);
 
-static inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,
-			  unsigned int size)
+int sys_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 {
 	return syscall(321, cmd, attr, size);
 }
@@ -38,21 +41,35 @@ int copy_to_user(void *addr, const void *src, int len)
 	struct iovec local;
 	struct iovec remote;
 
-	local.iov_base = (void *) src;
+	local.iov_base = (void *)src;
 	local.iov_len = len;
 	remote.iov_base = addr;
 	remote.iov_len = len;
 	return process_vm_writev(pid, &local, 1, &remote, 1, 0) != len;
 }
 
-static int handle_cmd(struct bpfilter_get_cmd *cmd)
+static int handle_get_cmd(struct bpf_mbox_request *cmd)
 {
 	pid = cmd->pid;
 	switch (cmd->cmd) {
 	case BPFILTER_IPT_SO_GET_INFO:
-		return bpfilter_get_info((void *) (long) cmd->addr, cmd->len);
+		return bpfilter_get_info((void *)(long)cmd->addr, cmd->len);
 	case BPFILTER_IPT_SO_GET_ENTRIES:
-		return bpfilter_get_entries((void *) (long) cmd->addr, cmd->len);
+		return bpfilter_get_entries((void *)(long)cmd->addr, cmd->len);
+	default:
+		break;
+	}
+	return -ENOPROTOOPT;
+}
+
+static int handle_set_cmd(struct bpf_mbox_request *cmd)
+{
+	pid = cmd->pid;
+	switch (cmd->cmd) {
+	case BPFILTER_IPT_SO_SET_REPLACE:
+		return bpfilter_set_replace((void *)(long)cmd->addr, cmd->len);
+	case BPFILTER_IPT_SO_SET_ADD_COUNTERS:
+		return bpfilter_set_add_counters((void *)(long)cmd->addr, cmd->len);
 	default:
 		break;
 	}
@@ -65,18 +82,18 @@ static void loop(void)
 	bpfilter_ipv4_init();
 
 	while (1) {
-		union bpf_attr get_cmd = {};
-		union bpf_attr reply = {};
-		struct bpfilter_get_cmd *cmd;
+		union bpf_attr req = {};
+		union bpf_attr rep = {};
+		struct bpf_mbox_request *cmd;
 
-		sys_bpf(BPFILTER_GET_CMD, &get_cmd, sizeof(get_cmd));
-		cmd = &get_cmd.bpfilter_get_cmd;
-
-		dprintf(debug_fd, "pid %d cmd %d addr %llx len %d\n",
-			cmd->pid, cmd->cmd, cmd->addr, cmd->len);
-
-		reply.bpfilter_reply.status = handle_cmd(cmd);
-		sys_bpf(BPFILTER_REPLY, &reply, sizeof(reply));
+		req.mbox_request.subsys = BPF_MBOX_SUBSYS_BPFILTER;
+		sys_bpf(BPF_MBOX_REQUEST, &req, sizeof(req));
+		cmd = &req.mbox_request;
+		rep.mbox_reply.subsys = BPF_MBOX_SUBSYS_BPFILTER;
+		rep.mbox_reply.status = cmd->kind == BPF_MBOX_KIND_SET ?
+					handle_set_cmd(cmd) :
+					handle_get_cmd(cmd);
+		sys_bpf(BPF_MBOX_REPLY, &rep, sizeof(rep));
 	}
 }
 

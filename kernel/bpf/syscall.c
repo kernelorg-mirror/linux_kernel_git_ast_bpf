@@ -1842,36 +1842,47 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 
 DECLARE_WAIT_QUEUE_HEAD(bpfilter_get_cmd_wq);
 DECLARE_WAIT_QUEUE_HEAD(bpfilter_reply_wq);
+
 bool bpfilter_get_cmd_ready = false;
 bool bpfilter_reply_ready = false;
-struct bpfilter_get_cmd bpfilter_get_cmd_mbox;
-struct bpfilter_reply bpfilter_reply_mbox;
 
-#define BPFILTER_GET_CMD_LAST_FIELD bpfilter_get_cmd.len
+struct bpf_mbox_request bpfilter_get_cmd_mbox;
+struct bpf_mbox_reply   bpfilter_reply_mbox;
 
-static int bpfilter_get_cmd(const union bpf_attr *attr,
+#define BPF_MBOX_REQUEST_LAST_FIELD	mbox_request.pid
+
+static int bpf_mbox_request(const union bpf_attr *attr,
 			    union bpf_attr __user *uattr)
 {
-	if (CHECK_ATTR(BPFILTER_GET_CMD))
+	if (CHECK_ATTR(BPF_MBOX_REQUEST))
 		return -EINVAL;
+	if (attr->mbox_request.subsys != BPF_MBOX_SUBSYS_BPFILTER)
+		return -ENOTSUPP;
+
 	wait_event_killable(bpfilter_get_cmd_wq, bpfilter_get_cmd_ready);
 	bpfilter_get_cmd_ready = false;
-	if (copy_to_user(&uattr->bpfilter_get_cmd, &bpfilter_get_cmd_mbox,
+
+	if (copy_to_user(&uattr->mbox_request, &bpfilter_get_cmd_mbox,
 			 sizeof(bpfilter_get_cmd_mbox)))
 		return -EFAULT;
 	return 0;
 }
 
-#define BPFILTER_REPLY_LAST_FIELD bpfilter_reply.status
+#define BPF_MBOX_REPLY_LAST_FIELD	mbox_reply.status
 
-static int bpfilter_reply(const union bpf_attr *attr,
+static int bpf_mbox_reply(const union bpf_attr *attr,
 			  union bpf_attr __user *uattr)
 {
-	if (CHECK_ATTR(BPFILTER_REPLY))
+	if (CHECK_ATTR(BPF_MBOX_REPLY))
 		return -EINVAL;
-	bpfilter_reply_mbox.status = attr->bpfilter_reply.status;
+	if (attr->mbox_reply.subsys != BPF_MBOX_SUBSYS_BPFILTER)
+		return -ENOTSUPP;
+
+	bpfilter_reply_mbox.subsys = attr->mbox_reply.subsys;
+	bpfilter_reply_mbox.status = attr->mbox_reply.status;
 	bpfilter_reply_ready = true;
 	wake_up(&bpfilter_reply_wq);
+
 	return 0;
 }
 
@@ -1952,11 +1963,11 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 	case BPF_OBJ_GET_INFO_BY_FD:
 		err = bpf_obj_get_info_by_fd(&attr, uattr);
 		break;
-	case BPFILTER_GET_CMD:
-		err = bpfilter_get_cmd(&attr, uattr);
+	case BPF_MBOX_REQUEST:
+		err = bpf_mbox_request(&attr, uattr);
 		break;
-	case BPFILTER_REPLY:
-		err = bpfilter_reply(&attr, uattr);
+	case BPF_MBOX_REPLY:
+		err = bpf_mbox_reply(&attr, uattr);
 		break;
 	default:
 		err = -EINVAL;
