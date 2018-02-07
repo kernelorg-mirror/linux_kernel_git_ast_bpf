@@ -1,0 +1,16 @@
+menuconfig BPFILTER
+	bool "BPF Filter configuration"
+	default n
+	depends on NET && BPF
+	help
+	  This builds bpfilter
+
+if BPFILTER
+config BPFILTER_UMH
+	tristate "BPF Filter module"
+	default m
+	depends on m
+	help
+	  This builds bpfilter user mode module
+endif
+
