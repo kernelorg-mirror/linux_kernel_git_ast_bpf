@@ -1,0 +1,11 @@
+config BPFILTER_SOCKOPT
+	bool
+
+config BPFILTER
+	tristate "BPF Filter module"
+	default n
+	depends on m && NET && BPF
+	select BPFILTER_SOCKOPT
+	help
+	  This builds bpfilter user mode module
+
