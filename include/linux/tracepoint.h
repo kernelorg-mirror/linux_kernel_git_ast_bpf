@@ -40,9 +40,19 @@ tracepoint_probe_register_prio(struct tracepoint *tp, void *probe, void *data,
 			       int prio);
 extern int
 tracepoint_probe_unregister(struct tracepoint *tp, void *probe, void *data);
-extern void
-for_each_kernel_tracepoint(void (*fct)(struct tracepoint *tp, void *priv),
-		void *priv);
+
+#ifdef CONFIG_TRACEPOINTS
+void *
+for_each_kernel_tracepoint(void *(*fct)(struct tracepoint *tp, void *priv),
+			   void *priv);
+#else
+static inline void *
+for_each_kernel_tracepoint(void *(*fct)(struct tracepoint *tp, void *priv),
+			   void *priv)
+{
+	return NULL;
+}
+#endif
 
 #ifdef CONFIG_MODULES
 struct tp_module {
@@ -225,23 +235,27 @@ extern void syscall_unregfunc(void);
 		return static_key_false(&__tracepoint_##name.key);	\
 	}
 
+#define ___FN_COUNT(fn,n0,n1,n2,n3,n4,n5,n6,n7,n8,n9,n10,n11,n12,n13,n14,n15,n16,n,...) fn##n
+#define __FN_COUNT(fn,...) ___FN_COUNT(fn,##__VA_ARGS__,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)
+#define __COUNT(...) __FN_COUNT(/**/,##__VA_ARGS__)
+
 /*
  * We have no guarantee that gcc and the linker won't up-align the tracepoint
  * structures, so we create an array of pointers that will be used for iteration
  * on the tracepoints.
  */
-#define DEFINE_TRACE_FN(name, reg, unreg)				 \
+#define DEFINE_TRACE_FN(name, reg, unreg, num_args)			 \
 	static const char __tpstrtab_##name[]				 \
 	__attribute__((section("__tracepoints_strings"))) = #name;	 \
 	struct tracepoint __tracepoint_##name				 \
 	__attribute__((section("__tracepoints"))) =			 \
-		{ __tpstrtab_##name, STATIC_KEY_INIT_FALSE, reg, unreg, NULL };\
+		{ __tpstrtab_##name, STATIC_KEY_INIT_FALSE, reg, unreg, NULL, num_args };\
 	static struct tracepoint * const __tracepoint_ptr_##name __used	 \
 	__attribute__((section("__tracepoints_ptrs"))) =		 \
 		&__tracepoint_##name;
 
-#define DEFINE_TRACE(name)						\
-	DEFINE_TRACE_FN(name, NULL, NULL);
+#define DEFINE_TRACE(name, num_args)					\
+	DEFINE_TRACE_FN(name, NULL, NULL, num_args);
 
 #define EXPORT_TRACEPOINT_SYMBOL_GPL(name)				\
 	EXPORT_SYMBOL_GPL(__tracepoint_##name)
@@ -275,8 +289,8 @@ extern void syscall_unregfunc(void);
 		return false;						\
 	}
 
-#define DEFINE_TRACE_FN(name, reg, unreg)
-#define DEFINE_TRACE(name)
+#define DEFINE_TRACE_FN(name, reg, unreg, num_args)
+#define DEFINE_TRACE(name, num_args)
 #define EXPORT_TRACEPOINT_SYMBOL_GPL(name)
 #define EXPORT_TRACEPOINT_SYMBOL(name)
 
