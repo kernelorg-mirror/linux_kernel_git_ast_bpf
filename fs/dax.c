@@ -1429,7 +1429,7 @@ static int dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
 			goto finish_iomap;
 		}
 
-		trace_dax_pmd_insert_mapping(inode, vmf, PMD_SIZE, pfn, entry);
+		trace_dax_pmd_insert_mapping(inode, vmf, PMD_SIZE, &pfn, entry);
 		result = vmf_insert_pfn_pmd(vma, vmf->address, vmf->pmd, pfn,
 					    write);
 		break;

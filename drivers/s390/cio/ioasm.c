@@ -35,7 +35,7 @@ int stsch(struct subchannel_id schid, struct schib *addr)
 	int ccode;
 
 	ccode = __stsch(schid, addr);
-	trace_s390_cio_stsch(schid, addr, ccode);
+	trace_s390_cio_stsch(&schid, addr, ccode);
 
 	return ccode;
 }
@@ -63,7 +63,7 @@ int msch(struct subchannel_id schid, struct schib *addr)
 	int ccode;
 
 	ccode = __msch(schid, addr);
-	trace_s390_cio_msch(schid, addr, ccode);
+	trace_s390_cio_msch(&schid, addr, ccode);
 
 	return ccode;
 }
@@ -88,7 +88,7 @@ int tsch(struct subchannel_id schid, struct irb *addr)
 	int ccode;
 
 	ccode = __tsch(schid, addr);
-	trace_s390_cio_tsch(schid, addr, ccode);
+	trace_s390_cio_tsch(&schid, addr, ccode);
 
 	return ccode;
 }
@@ -115,7 +115,7 @@ int ssch(struct subchannel_id schid, union orb *addr)
 	int ccode;
 
 	ccode = __ssch(schid, addr);
-	trace_s390_cio_ssch(schid, addr, ccode);
+	trace_s390_cio_ssch(&schid, addr, ccode);
 
 	return ccode;
 }
@@ -141,7 +141,7 @@ int csch(struct subchannel_id schid)
 	int ccode;
 
 	ccode = __csch(schid);
-	trace_s390_cio_csch(schid, ccode);
+	trace_s390_cio_csch(&schid, ccode);
 
 	return ccode;
 }
@@ -202,7 +202,7 @@ int rchp(struct chp_id chpid)
 	int ccode;
 
 	ccode = __rchp(chpid);
-	trace_s390_cio_rchp(chpid, ccode);
+	trace_s390_cio_rchp(&chpid, ccode);
 
 	return ccode;
 }
@@ -228,7 +228,7 @@ int rsch(struct subchannel_id schid)
 	int ccode;
 
 	ccode = __rsch(schid);
-	trace_s390_cio_rsch(schid, ccode);
+	trace_s390_cio_rsch(&schid, ccode);
 
 	return ccode;
 }
@@ -253,7 +253,7 @@ int hsch(struct subchannel_id schid)
 	int ccode;
 
 	ccode = __hsch(schid);
-	trace_s390_cio_hsch(schid, ccode);
+	trace_s390_cio_hsch(&schid, ccode);
 
 	return ccode;
 }
@@ -278,7 +278,7 @@ int xsch(struct subchannel_id schid)
 	int ccode;
 
 	ccode = __xsch(schid);
-	trace_s390_cio_xsch(schid, ccode);
+	trace_s390_cio_xsch(&schid, ccode);
 
 	return ccode;
 }

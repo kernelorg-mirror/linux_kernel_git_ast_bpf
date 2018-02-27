@@ -772,7 +772,7 @@ static void rcu_eqs_enter(bool user)
 	}
 
 	lockdep_assert_irqs_disabled();
-	trace_rcu_dyntick(TPS("Start"), rdtp->dynticks_nesting, 0, rdtp->dynticks);
+	trace_rcu_dyntick(TPS("Start"), rdtp->dynticks_nesting, 0, &rdtp->dynticks);
 	WARN_ON_ONCE(IS_ENABLED(CONFIG_RCU_EQS_DEBUG) && !user && !is_idle_task(current));
 	for_each_rcu_flavor(rsp) {
 		rdp = this_cpu_ptr(rsp->rda);
@@ -848,14 +848,14 @@ void rcu_nmi_exit(void)
 	 * leave it in non-RCU-idle state.
 	 */
 	if (rdtp->dynticks_nmi_nesting != 1) {
-		trace_rcu_dyntick(TPS("--="), rdtp->dynticks_nmi_nesting, rdtp->dynticks_nmi_nesting - 2, rdtp->dynticks);
+		trace_rcu_dyntick(TPS("--="), rdtp->dynticks_nmi_nesting, rdtp->dynticks_nmi_nesting - 2, &rdtp->dynticks);
 		WRITE_ONCE(rdtp->dynticks_nmi_nesting, /* No store tearing. */
 			   rdtp->dynticks_nmi_nesting - 2);
 		return;
 	}
 
 	/* This NMI interrupted an RCU-idle CPU, restore RCU-idleness. */
-	trace_rcu_dyntick(TPS("Startirq"), rdtp->dynticks_nmi_nesting, 0, rdtp->dynticks);
+	trace_rcu_dyntick(TPS("Startirq"), rdtp->dynticks_nmi_nesting, 0, &rdtp->dynticks);
 	WRITE_ONCE(rdtp->dynticks_nmi_nesting, 0); /* Avoid store tearing. */
 	rcu_dynticks_eqs_enter();
 }
@@ -930,7 +930,7 @@ static void rcu_eqs_exit(bool user)
 	rcu_dynticks_task_exit();
 	rcu_dynticks_eqs_exit();
 	rcu_cleanup_after_idle();
-	trace_rcu_dyntick(TPS("End"), rdtp->dynticks_nesting, 1, rdtp->dynticks);
+	trace_rcu_dyntick(TPS("End"), rdtp->dynticks_nesting, 1, &rdtp->dynticks);
 	WARN_ON_ONCE(IS_ENABLED(CONFIG_RCU_EQS_DEBUG) && !user && !is_idle_task(current));
 	WRITE_ONCE(rdtp->dynticks_nesting, 1);
 	WRITE_ONCE(rdtp->dynticks_nmi_nesting, DYNTICK_IRQ_NONIDLE);
@@ -1004,7 +1004,7 @@ void rcu_nmi_enter(void)
 	}
 	trace_rcu_dyntick(incby == 1 ? TPS("Endirq") : TPS("++="),
 			  rdtp->dynticks_nmi_nesting,
-			  rdtp->dynticks_nmi_nesting + incby, rdtp->dynticks);
+			  rdtp->dynticks_nmi_nesting + incby, &rdtp->dynticks);
 	WRITE_ONCE(rdtp->dynticks_nmi_nesting, /* Prevent store tearing. */
 		   rdtp->dynticks_nmi_nesting + incby);
 	barrier();

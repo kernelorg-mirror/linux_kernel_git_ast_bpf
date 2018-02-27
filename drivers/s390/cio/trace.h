@@ -22,7 +22,7 @@
 #include <linux/tracepoint.h>
 
 DECLARE_EVENT_CLASS(s390_class_schib,
-	TP_PROTO(struct subchannel_id schid, struct schib *schib, int cc),
+	TP_PROTO(struct subchannel_id *schid, struct schib *schib, int cc),
 	TP_ARGS(schid, schib, cc),
 	TP_STRUCT__entry(
 		__field(u8, cssid)
@@ -33,9 +33,9 @@ DECLARE_EVENT_CLASS(s390_class_schib,
 		__field(int, cc)
 	),
 	TP_fast_assign(
-		__entry->cssid = schid.cssid;
-		__entry->ssid = schid.ssid;
-		__entry->schno = schid.sch_no;
+		__entry->cssid = schid->cssid;
+		__entry->ssid = schid->ssid;
+		__entry->schno = schid->sch_no;
 		__entry->devno = schib->pmcw.dev;
 		__entry->schib = *schib;
 		__entry->cc = cc;
@@ -60,7 +60,7 @@ DECLARE_EVENT_CLASS(s390_class_schib,
  * @cc: Condition code
  */
 DEFINE_EVENT(s390_class_schib, s390_cio_stsch,
-	TP_PROTO(struct subchannel_id schid, struct schib *schib, int cc),
+	TP_PROTO(struct subchannel_id *schid, struct schib *schib, int cc),
 	TP_ARGS(schid, schib, cc)
 );
 
@@ -71,7 +71,7 @@ DEFINE_EVENT(s390_class_schib, s390_cio_stsch,
  * @cc: Condition code
  */
 DEFINE_EVENT(s390_class_schib, s390_cio_msch,
-	TP_PROTO(struct subchannel_id schid, struct schib *schib, int cc),
+	TP_PROTO(struct subchannel_id *schid, struct schib *schib, int cc),
 	TP_ARGS(schid, schib, cc)
 );
 
@@ -82,7 +82,7 @@ DEFINE_EVENT(s390_class_schib, s390_cio_msch,
  * @cc: Condition code
  */
 TRACE_EVENT(s390_cio_tsch,
-	TP_PROTO(struct subchannel_id schid, struct irb *irb, int cc),
+	TP_PROTO(struct subchannel_id *schid, struct irb *irb, int cc),
 	TP_ARGS(schid, irb, cc),
 	TP_STRUCT__entry(
 		__field(u8, cssid)
@@ -92,9 +92,9 @@ TRACE_EVENT(s390_cio_tsch,
 		__field(int, cc)
 	),
 	TP_fast_assign(
-		__entry->cssid = schid.cssid;
-		__entry->ssid = schid.ssid;
-		__entry->schno = schid.sch_no;
+		__entry->cssid = schid->cssid;
+		__entry->ssid = schid->ssid;
+		__entry->schno = schid->sch_no;
 		__entry->irb = *irb;
 		__entry->cc = cc;
 	),
@@ -151,7 +151,7 @@ TRACE_EVENT(s390_cio_tpi,
  * @cc: Condition code
  */
 TRACE_EVENT(s390_cio_ssch,
-	TP_PROTO(struct subchannel_id schid, union orb *orb, int cc),
+	TP_PROTO(struct subchannel_id *schid, union orb *orb, int cc),
 	TP_ARGS(schid, orb, cc),
 	TP_STRUCT__entry(
 		__field(u8, cssid)
@@ -161,9 +161,9 @@ TRACE_EVENT(s390_cio_ssch,
 		__field(int, cc)
 	),
 	TP_fast_assign(
-		__entry->cssid = schid.cssid;
-		__entry->ssid = schid.ssid;
-		__entry->schno = schid.sch_no;
+		__entry->cssid = schid->cssid;
+		__entry->ssid = schid->ssid;
+		__entry->schno = schid->sch_no;
 		__entry->orb = *orb;
 		__entry->cc = cc;
 	),
@@ -173,7 +173,7 @@ TRACE_EVENT(s390_cio_ssch,
 );
 
 DECLARE_EVENT_CLASS(s390_class_schid,
-	TP_PROTO(struct subchannel_id schid, int cc),
+	TP_PROTO(struct subchannel_id *schid, int cc),
 	TP_ARGS(schid, cc),
 	TP_STRUCT__entry(
 		__field(u8, cssid)
@@ -182,9 +182,9 @@ DECLARE_EVENT_CLASS(s390_class_schid,
 		__field(int, cc)
 	),
 	TP_fast_assign(
-		__entry->cssid = schid.cssid;
-		__entry->ssid = schid.ssid;
-		__entry->schno = schid.sch_no;
+		__entry->cssid = schid->cssid;
+		__entry->ssid = schid->ssid;
+		__entry->schno = schid->sch_no;
 		__entry->cc = cc;
 	),
 	TP_printk("schid=%x.%x.%04x cc=%d", __entry->cssid, __entry->ssid,
@@ -198,7 +198,7 @@ DECLARE_EVENT_CLASS(s390_class_schid,
  * @cc: Condition code
  */
 DEFINE_EVENT(s390_class_schid, s390_cio_csch,
-	TP_PROTO(struct subchannel_id schid, int cc),
+	TP_PROTO(struct subchannel_id *schid, int cc),
 	TP_ARGS(schid, cc)
 );
 
@@ -208,7 +208,7 @@ DEFINE_EVENT(s390_class_schid, s390_cio_csch,
  * @cc: Condition code
  */
 DEFINE_EVENT(s390_class_schid, s390_cio_hsch,
-	TP_PROTO(struct subchannel_id schid, int cc),
+	TP_PROTO(struct subchannel_id *schid, int cc),
 	TP_ARGS(schid, cc)
 );
 
@@ -218,7 +218,7 @@ DEFINE_EVENT(s390_class_schid, s390_cio_hsch,
  * @cc: Condition code
  */
 DEFINE_EVENT(s390_class_schid, s390_cio_xsch,
-	TP_PROTO(struct subchannel_id schid, int cc),
+	TP_PROTO(struct subchannel_id *schid, int cc),
 	TP_ARGS(schid, cc)
 );
 
@@ -228,7 +228,7 @@ DEFINE_EVENT(s390_class_schid, s390_cio_xsch,
  * @cc: Condition code
  */
 DEFINE_EVENT(s390_class_schid, s390_cio_rsch,
-	TP_PROTO(struct subchannel_id schid, int cc),
+	TP_PROTO(struct subchannel_id *schid, int cc),
 	TP_ARGS(schid, cc)
 );
 
@@ -238,7 +238,7 @@ DEFINE_EVENT(s390_class_schid, s390_cio_rsch,
  * @cc: Condition code
  */
 TRACE_EVENT(s390_cio_rchp,
-	TP_PROTO(struct chp_id chpid, int cc),
+	TP_PROTO(struct chp_id *chpid, int cc),
 	TP_ARGS(chpid, cc),
 	TP_STRUCT__entry(
 		__field(u8, cssid)
@@ -246,8 +246,8 @@ TRACE_EVENT(s390_cio_rchp,
 		__field(int, cc)
 	),
 	TP_fast_assign(
-		__entry->cssid = chpid.cssid;
-		__entry->id = chpid.id;
+		__entry->cssid = chpid->cssid;
+		__entry->id = chpid->id;
 		__entry->cc = cc;
 	),
 	TP_printk("chpid=%x.%02x cc=%d", __entry->cssid, __entry->id,
