@@ -3625,6 +3625,7 @@ static const struct bpf_func_proto bpf_sock_ops_cb_flags_set_proto = {
 BPF_CALL_3(bpf_bind, struct bpf_sock_addr_kern *, ctx, struct sockaddr *, addr,
 	   int, addr_len)
 {
+#ifdef CONFIG_INET
 	struct sock *sk = ctx->sk;
 	int err;
 
@@ -3639,15 +3640,16 @@ BPF_CALL_3(bpf_bind, struct bpf_sock_addr_kern *, ctx, struct sockaddr *, addr,
 		if (((struct sockaddr_in *)addr)->sin_port != htons(0))
 			return err;
 		return __inet_bind(sk, addr, addr_len, true, false);
-#if IS_ENABLED(CONFIG_IPV6)
+#if IS_BUILTIN(CONFIG_IPV6)
 	} else if (addr->sa_family == AF_INET6) {
 		if (addr_len < SIN6_LEN_RFC2133)
 			return err;
 		if (((struct sockaddr_in6 *)addr)->sin6_port != htons(0))
 			return err;
 		return __inet6_bind(sk, addr, addr_len, true, false);
-#endif
+#endif /* CONFIG_IPV6 */
 	}
+#endif /* CONFIG_INET */
 
 	return -EAFNOSUPPORT;
 }
