@@ -4,7 +4,7 @@
 #
 
 hostprogs-y := bpfilter_umh
-bpfilter_umh-objs := main.o
+bpfilter_umh-objs := main.o tgts.o targets.o tables.o init.o ctor.o sockopt.o
 HOSTCFLAGS += -I. -Itools/include/
 
 # a bit of elf magic to convert bpfilter_umh binary into a binary blob
