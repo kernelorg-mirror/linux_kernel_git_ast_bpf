@@ -384,7 +384,7 @@ bpf_get_prog_addr_region(const struct bpf_prog *prog,
 	*symbol_end   = addr + hdr->pages * PAGE_SIZE;
 }
 
-static void bpf_get_prog_name(const struct bpf_prog *prog, char *sym)
+static char *bpf_get_prog_name(const struct bpf_prog *prog, char *sym)
 {
 	const char *end = sym + KSYM_NAME_LEN;
 
@@ -402,9 +402,10 @@ static void bpf_get_prog_name(const struct bpf_prog *prog, char *sym)
 	sym += snprintf(sym, KSYM_NAME_LEN, "bpf_prog_");
 	sym  = bin2hex(sym, prog->tag, sizeof(prog->tag));
 	if (prog->aux->name[0])
-		snprintf(sym, (size_t)(end - sym), "_%s", prog->aux->name);
+		sym += snprintf(sym, (size_t)(end - sym), "_%s", prog->aux->name);
 	else
 		*sym = 0;
+	return sym;
 }
 
 static __always_inline unsigned long
@@ -480,23 +481,40 @@ static bool bpf_prog_kallsyms_verify_off(const struct bpf_prog *fp)
 
 void bpf_prog_kallsyms_add(struct bpf_prog *fp)
 {
+	unsigned long symbol_start, symbol_end;
+	char buf[KSYM_NAME_LEN], *sym;
+
 	if (!bpf_prog_kallsyms_candidate(fp) ||
 	    !capable(CAP_SYS_ADMIN))
 		return;
 
+	bpf_get_prog_addr_region(fp, &symbol_start, &symbol_end);
+	sym = bpf_get_prog_name(fp, buf);
+	sym++; /* sym - buf is the length of the name including trailing 0 */
+	while (!IS_ALIGNED(sym - buf, sizeof(u64)))
+		*sym++ = 0;
 	spin_lock_bh(&bpf_lock);
 	bpf_prog_ksym_node_add(fp->aux);
 	spin_unlock_bh(&bpf_lock);
+	perf_event_mmap_bpf_prog(symbol_start, symbol_end - symbol_start,
+				 buf, sym - buf);
 }
 
 void bpf_prog_kallsyms_del(struct bpf_prog *fp)
 {
+	unsigned long symbol_start, symbol_end;
+	/* mmap_record.filename cannot be NULL and has to be u64 aligned */
+	char buf[sizeof(u64)] = {};
+
 	if (!bpf_prog_kallsyms_candidate(fp))
 		return;
 
 	spin_lock_bh(&bpf_lock);
 	bpf_prog_ksym_node_del(fp->aux);
 	spin_unlock_bh(&bpf_lock);
+	bpf_get_prog_addr_region(fp, &symbol_start, &symbol_end);
+	perf_event_mmap_bpf_prog(symbol_start, symbol_end - symbol_start,
+				 buf, sizeof(buf));
 }
 
 static struct bpf_prog *bpf_prog_kallsyms_find(unsigned long addr)
