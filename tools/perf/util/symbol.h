@@ -310,6 +310,7 @@ char *dso__demangle_sym(struct dso *dso, int kmodule, const char *elf_name);
 
 void __symbols__insert(struct rb_root *symbols, struct symbol *sym, bool kernel);
 void symbols__insert(struct rb_root *symbols, struct symbol *sym);
+int symbols__erase(struct rb_root *symbols, u64 ip);
 void symbols__fixup_duplicate(struct rb_root *symbols);
 void symbols__fixup_end(struct rb_root *symbols);
 void map_groups__fixup_end(struct map_groups *mg);

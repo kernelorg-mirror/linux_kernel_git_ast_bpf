@@ -25,6 +25,7 @@
 #include "sane_ctype.h"
 #include <symbol/kallsyms.h>
 #include <linux/mman.h>
+#include <linux/magic.h>
 
 static void __machine__remove_thread(struct machine *machine, struct thread *th, bool lock);
 
@@ -728,6 +729,7 @@ struct map *machine__findnew_module_map(struct machine *machine, u64 start,
 	if (map == NULL)
 		goto out;
 
+/*	map_groups__fixup_overlappings(&machine->kmaps, map, stderr);*/
 	map_groups__insert(&machine->kmaps, map);
 
 	/* Put the map here because map_groups__insert alread got it */
@@ -1459,6 +1461,27 @@ static int machine__process_kernel_mmap_event(struct machine *machine,
 	struct map *map;
 	enum dso_kernel_type kernel_type;
 	bool is_kernel_mmap;
+
+	/* process JITed bpf programs load/unload events */
+	if (event->mmap.pid == ~0u && event->mmap.tid == BPF_FS_MAGIC) {
+		struct symbol *sym;
+
+		map = map_groups__find(&machine->kmaps, event->mmap.start);
+		if (event->mmap.filename[0]) {
+			fprintf(stderr, "adding bpf map->start %lx pgoff %lx %s\n",
+				map->start, map->pgoff,
+				event->mmap.filename);
+			sym = symbol__new(event->mmap.start - map->start + map->pgoff,
+					  event->mmap.len, 0, 0,
+					  event->mmap.filename);
+			dso__insert_symbol(map->dso, sym);
+		} else {
+			fprintf(stderr, "deleting bpf map->start %lx pgoff %lx\n",
+				map->start, map->pgoff);
+			symbols__erase(&map->dso->symbols, event->mmap.start);
+			dso__reset_find_symbol_cache(map->dso);
+		}
+	}
 
 	/* If we have maps from kcore then we do not need or want any others */
 	if (machine__uses_kcore(machine))

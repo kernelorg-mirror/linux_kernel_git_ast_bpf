@@ -353,6 +353,20 @@ static struct symbol *symbols__find(struct rb_root *symbols, u64 ip)
 	return NULL;
 }
 
+int symbols__erase(struct rb_root *symbols, u64 ip)
+{
+	struct symbol *s;
+
+	s = symbols__find(symbols, ip);
+	if (!s)
+		return -ENOENT;
+
+	rb_erase(&s->rb_node, symbols);
+	symbol__delete(s);
+	return 0;
+}
+
+
 static struct symbol *symbols__first(struct rb_root *symbols)
 {
 	struct rb_node *n = rb_first(symbols);
@@ -500,6 +514,9 @@ struct symbol *dso__find_symbol(struct dso *dso, u64 addr)
 		dso->last_find_result.symbol = symbols__find(&dso->symbols, addr);
 	}
 
+	fprintf(stderr, "dso__find_symbol dso %s addr %lx res %s\n",
+		dso->short_name, addr, dso->last_find_result.symbol ?
+		dso->last_find_result.symbol->name : "?");
 	return dso->last_find_result.symbol;
 }
 
