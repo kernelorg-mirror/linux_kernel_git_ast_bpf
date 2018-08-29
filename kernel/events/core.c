@@ -7152,7 +7152,7 @@ static int perf_event_mmap_match(struct perf_event *event,
 {
 	struct perf_mmap_event *mmap_event = data;
 	struct vm_area_struct *vma = mmap_event->vma;
-	int executable = vma->vm_flags & VM_EXEC;
+	int executable = !vma || vma->vm_flags & VM_EXEC;
 
 	return (!executable && event->attr.mmap_data) ||
 	       (executable && (event->attr.mmap || event->attr.mmap2));
@@ -7165,12 +7165,13 @@ static void perf_event_mmap_output(struct perf_event *event,
 	struct perf_output_handle handle;
 	struct perf_sample_data sample;
 	int size = mmap_event->event_id.header.size;
+	bool bpf_event = !mmap_event->vma;
 	int ret;
 
 	if (!perf_event_mmap_match(event, data))
 		return;
 
-	if (event->attr.mmap2) {
+	if (event->attr.mmap2 && !bpf_event) {
 		mmap_event->event_id.header.type = PERF_RECORD_MMAP2;
 		mmap_event->event_id.header.size += sizeof(mmap_event->maj);
 		mmap_event->event_id.header.size += sizeof(mmap_event->min);
@@ -7186,12 +7187,14 @@ static void perf_event_mmap_output(struct perf_event *event,
 	if (ret)
 		goto out;
 
-	mmap_event->event_id.pid = perf_event_pid(event, current);
-	mmap_event->event_id.tid = perf_event_tid(event, current);
+	if (!bpf_event) {
+		mmap_event->event_id.pid = perf_event_pid(event, current);
+		mmap_event->event_id.tid = perf_event_tid(event, current);
+	}
 
 	perf_output_put(&handle, mmap_event->event_id);
 
-	if (event->attr.mmap2) {
+	if (event->attr.mmap2 && !bpf_event) {
 		perf_output_put(&handle, mmap_event->maj);
 		perf_output_put(&handle, mmap_event->min);
 		perf_output_put(&handle, mmap_event->ino);
@@ -7446,6 +7449,37 @@ void perf_event_mmap(struct vm_area_struct *vma)
 
 	perf_addr_filters_adjust(vma);
 	perf_event_mmap_event(&mmap_event);
+}
+
+void perf_event_mmap_bpf_prog(u64 start, u64 len, char *name, int size)
+{
+	struct perf_mmap_event mmap_event;
+
+	if (!atomic_read(&nr_mmap_events))
+		return;
+
+	if (!IS_ALIGNED(size, sizeof(u64))) {
+		WARN_ONCE(1, "size is not aligned\n");
+		return;
+	}
+
+	mmap_event = (struct perf_mmap_event){
+		.file_name = name,
+		.file_size = size,
+		.event_id  = {
+			.header = {
+				.type = PERF_RECORD_MMAP,
+				.misc = PERF_RECORD_MISC_KERNEL,
+				.size = sizeof(mmap_event.event_id) + size,
+			},
+			.pid = -1, /* indicates kernel */
+			.tid = BPF_FS_MAGIC, /* bpf mmap event */
+			.start  = start,
+			.len    = len,
+			.pgoff  = start,
+		},
+	};
+	perf_iterate_sb(perf_event_mmap_output, &mmap_event, NULL);
 }
 
 void perf_event_aux_event(struct perf_event *event, unsigned long head,
