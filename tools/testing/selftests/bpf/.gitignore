@@ -25,3 +25,4 @@ test_cgroup_storage
 test_select_reuseport
 test_flow_dissector
 flow_dissector_load
+test_file_open
