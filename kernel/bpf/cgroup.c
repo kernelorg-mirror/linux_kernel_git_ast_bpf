@@ -15,6 +15,7 @@
 #include <linux/bpf.h>
 #include <linux/bpf-cgroup.h>
 #include <net/sock.h>
+#include <../fs/mount.h>
 
 DEFINE_STATIC_KEY_FALSE(cgroup_bpf_enabled_key);
 EXPORT_SYMBOL(cgroup_bpf_enabled_key);
@@ -753,4 +754,174 @@ const struct bpf_prog_ops cg_dev_prog_ops = {
 const struct bpf_verifier_ops cg_dev_verifier_ops = {
 	.get_func_proto		= cgroup_dev_func_proto,
 	.is_valid_access	= cgroup_dev_is_valid_access,
+};
+
+int __cgroup_bpf_file_filter(struct file *file, enum bpf_attach_type type)
+{
+	struct cgroup *cgrp;
+	int ret;
+
+	rcu_read_lock();
+	cgrp = task_dfl_cgroup(current);
+	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], file, BPF_PROG_RUN);
+	rcu_read_unlock();
+
+	return ret == 1 ? 0 : -EPERM;
+}
+EXPORT_SYMBOL(__cgroup_bpf_file_filter);
+
+BPF_CALL_3(bpf_get_file_path, struct file *, file, char *, buf, u64, size)
+{
+	char *p = file_path(file, buf, size);
+	int len;
+
+	if (IS_ERR(p)) {
+		strncpy(buf, "(error)", size);
+		return PTR_ERR(p);
+	}
+	len = buf + size - p;
+	memmove(buf, p, len);
+	memset(buf + len, 0, size - len);
+	return 0;
+}
+
+const struct bpf_func_proto bpf_get_file_path_proto = {
+	.func		= bpf_get_file_path,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
+	.arg3_type	= ARG_CONST_SIZE,
+};
+
+static const struct bpf_func_proto *
+cgroup_file_filter_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_get_file_path:
+		return &bpf_get_file_path_proto;
+	default:
+		return cgroup_dev_func_proto(func_id, prog);
+	}
+}
+
+static bool cgroup_file_filter_is_valid_access(int off, int size,
+					       enum bpf_access_type type,
+					       const struct bpf_prog *prog,
+					       struct bpf_insn_access_aux *info)
+{
+	const int size_default = sizeof(__u32);
+
+	if (off < 0 || off + size > sizeof(struct bpf_file_info) ||
+	    off % size || type != BPF_READ)
+		return false;
+
+	switch (off) {
+	case offsetof(struct bpf_file_info, fs_magic):
+	case offsetof(struct bpf_file_info, mnt_id):
+	case offsetof(struct bpf_file_info, dev_major):
+	case offsetof(struct bpf_file_info, dev_minor):
+	case offsetof(struct bpf_file_info, nlink):
+	case offsetof(struct bpf_file_info, mode):
+	case offsetof(struct bpf_file_info, flags):
+		return size == size_default;
+
+	case offsetof(struct bpf_file_info, inode):
+		return size == sizeof(__u64);
+
+	default:
+		if (size != size_default)
+			return false;
+	}
+	return true;
+}
+
+#define LD_1(F) ({					\
+	typeof(F) val = 0;				\
+	*insn++ = BPF_LDX_MEM(BPF_SIZEOF(val),		\
+			      si->dst_reg, si->src_reg,	\
+			      ((size_t)&F));		\
+	*target_size = sizeof(val);			\
+	val;						\
+	})
+
+#define LD_n(F) ({					\
+	typeof(F) val = 0;				\
+	*insn++ = BPF_LDX_MEM(BPF_SIZEOF(val),		\
+			      si->dst_reg, si->dst_reg,	\
+			      ((size_t)&F));		\
+	*target_size = sizeof(val);			\
+	val;						\
+	})
+
+static u32 cgroup_file_filter_ctx_access(enum bpf_access_type type,
+					 const struct bpf_insn *si,
+					 struct bpf_insn *insn_buf,
+					 struct bpf_prog *prog,
+					 u32 *target_size)
+{
+	struct bpf_insn *insn = insn_buf;
+	struct file *file = NULL;
+	struct inode *inode;
+	struct super_block *sb;
+	struct mount *mnt;
+
+	switch (si->off) {
+	case offsetof(struct bpf_file_info, fs_magic):
+		/* dst = file->f_inode->i_sb->s_magic */
+		inode = LD_1(file->f_inode);
+		sb = LD_n(inode->i_sb);
+		LD_n(sb->s_magic);
+		break;
+	case offsetof(struct bpf_file_info, dev_major):
+		/* dst = file->f_inode->i_sb->s_dev */
+		inode = LD_1(file->f_inode);
+		sb = LD_n(inode->i_sb);
+		LD_n(sb->s_dev);
+		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, MINORBITS);
+		break;
+	case offsetof(struct bpf_file_info, dev_minor):
+		/* dst = file->f_inode->i_sb->s_dev */
+		inode = LD_1(file->f_inode);
+		sb = LD_n(inode->i_sb);
+		LD_n(sb->s_dev);
+		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, MINORMASK);
+		break;
+	case offsetof(struct bpf_file_info, inode):
+		/* dst = file->f_inode->i_ino */
+		inode = LD_1(file->f_inode);
+		LD_n(inode->i_ino);
+		break;
+	case offsetof(struct bpf_file_info, mode):
+		/* dst = file->f_inode->i_mode */
+		inode = LD_1(file->f_inode);
+		LD_n(inode->i_mode);
+		break;
+	case offsetof(struct bpf_file_info, nlink):
+		/* dst = file->f_inode->i_nlink */
+		inode = LD_1(file->f_inode);
+		LD_n(inode->i_nlink);
+		break;
+	case offsetof(struct bpf_file_info, flags):
+		/* dst = file->f_flags */
+		LD_1(file->f_flags);
+		break;
+	case offsetof(struct bpf_file_info, mnt_id):
+		/* dst = real_mount(file->f_path.mnt)->mnt_id */
+		mnt = real_mount(LD_1(file->f_path.mnt));
+		LD_n(mnt->mnt_id);
+		break;
+	}
+	return insn - insn_buf;
+}
+#undef LD_1
+#undef LD_n
+
+const struct bpf_prog_ops file_filter_prog_ops = {
+};
+
+const struct bpf_verifier_ops file_filter_verifier_ops = {
+	.get_func_proto		= cgroup_file_filter_proto,
+	.is_valid_access	= cgroup_file_filter_is_valid_access,
+	.convert_ctx_access	= cgroup_file_filter_ctx_access
 };

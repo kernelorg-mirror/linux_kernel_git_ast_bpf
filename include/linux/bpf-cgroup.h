@@ -109,6 +109,8 @@ int __cgroup_bpf_run_filter_sock_ops(struct sock *sk,
 int __cgroup_bpf_check_dev_permission(short dev_type, u32 major, u32 minor,
 				      short access, enum bpf_attach_type type);
 
+int __cgroup_bpf_file_filter(struct file *file, enum bpf_attach_type type);
+
 static inline enum bpf_cgroup_storage_type cgroup_storage_type(
 	struct bpf_map *map)
 {
@@ -253,6 +255,13 @@ int bpf_percpu_cgroup_storage_update(struct bpf_map *map, void *key,
 									      \
 	__ret;								      \
 })
+#define BPF_CGROUP_RUN_PROG_FILE_FILTER(file)				     \
+({									      \
+	int __ret = 0;							      \
+	if (cgroup_bpf_enabled)						      \
+		__ret = __cgroup_bpf_file_filter(file, BPF_CGROUP_FILE_OPEN); \
+	__ret;								      \
+})
 int cgroup_bpf_prog_attach(const union bpf_attr *attr,
 			   enum bpf_prog_type ptype, struct bpf_prog *prog);
 int cgroup_bpf_prog_detach(const union bpf_attr *attr,
@@ -321,6 +330,7 @@ static inline int bpf_percpu_cgroup_storage_update(struct bpf_map *map,
 #define BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk, uaddr, t_ctx) ({ 0; })
 #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
 #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
+#define BPF_CGROUP_RUN_PROG_FILE_FILTER(file) ({ 0; })
 
 #define for_each_cgroup_storage_type(stype) for (; false; )
 
