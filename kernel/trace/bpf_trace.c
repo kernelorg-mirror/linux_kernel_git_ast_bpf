@@ -233,7 +233,7 @@ BPF_CALL_5(bpf_trace_printk, char *, fmt, u32, fmt_size, u64, arg1,
 			i++;
 		}
 
-		if (fmt[i] != 'i' && fmt[i] != 'd' &&
+		if (fmt[i] != 'i' && fmt[i] != 'd' && fmt[i] != 'o' &&
 		    fmt[i] != 'u' && fmt[i] != 'x')
 			return -EINVAL;
 		fmt_cnt++;
