@@ -155,6 +155,8 @@ static struct bpf_sock *(*bpf_sk_lookup_udp)(void *ctx,
 	(void *) BPF_FUNC_sk_lookup_udp;
 static int (*bpf_sk_release)(struct bpf_sock *sk) =
 	(void *) BPF_FUNC_sk_release;
+static int (*bpf_get_file_path)(struct bpf_file_info *file, void *buf, int size) =
+	(void *) BPF_FUNC_get_file_path;
 
 /* llvm builtin functions that eBPF C program may use to
  * emit BPF_LD_ABS and BPF_LD_IND instructions
