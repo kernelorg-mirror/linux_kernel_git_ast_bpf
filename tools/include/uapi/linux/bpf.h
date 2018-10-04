@@ -154,6 +154,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_LIRC_MODE2,
 	BPF_PROG_TYPE_SK_REUSEPORT,
 	BPF_PROG_TYPE_FLOW_DISSECTOR,
+	BPF_PROG_TYPE_FILE_FILTER,
 };
 
 enum bpf_attach_type {
@@ -175,6 +176,7 @@ enum bpf_attach_type {
 	BPF_CGROUP_UDP6_SENDMSG,
 	BPF_LIRC_MODE2,
 	BPF_FLOW_DISSECTOR,
+	BPF_CGROUP_FILE_OPEN,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -2215,6 +2217,18 @@ union bpf_attr {
  *		pointer that was returned from bpf_sk_lookup_xxx\ ().
  *	Return
  *		0 on success, or a negative error in case of failure.
+ *
+ * int bpf_get_file_path(struct bpf_file_info *file, char *buf, u32 size_of_buf)
+ * 	Description
+ * 		Reconstruct the full path of *file* and store it into *buf* of
+ * 		*size_of_buf*. The *size_of_buf* must be strictly positive.
+ * 		On success, the helper makes sure that the *buf* is NUL-terminated.
+ * 		On failure, it is filled with string "(error)".
+ * 		This helper should only be used for debugging.
+ * 		'char *path' should never be used for permission checks.
+ * 	Return
+ * 		0 on success, or a negative error in case of failure.
+ *
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -2303,7 +2317,8 @@ union bpf_attr {
 	FN(skb_ancestor_cgroup_id),	\
 	FN(sk_lookup_tcp),		\
 	FN(sk_lookup_udp),		\
-	FN(sk_release),
+	FN(sk_release),			\
+	FN(get_file_path),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call
@@ -2894,6 +2909,17 @@ struct bpf_flow_keys {
 			__u32	ipv6_dst[4];	/* in6_addr; network order */
 		};
 	};
+};
+
+struct bpf_file_info {
+	__u64 inode;
+	__u32 dev_major;
+	__u32 dev_minor;
+	__u32 fs_magic;
+	__u32 mnt_id;
+	__u32 nlink;
+	__u32 mode;	/* file mode S_ISDIR, S_ISLNK, 0755, etc */
+	__u32 flags;	/* open flags O_RDWR, O_CREAT, etc */
 };
 
 #endif /* _UAPI__LINUX_BPF_H__ */
