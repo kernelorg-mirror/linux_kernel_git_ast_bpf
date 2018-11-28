@@ -3751,6 +3751,73 @@ static void find_good_pkt_pointers(struct bpf_verifier_state *vstate,
 	}
 }
 
+static int is_branch_taken(struct bpf_reg_state *reg, u64 val, u8 opcode)
+{
+	if (__is_pointer_value(false, reg))
+		return -1;
+
+	switch (opcode) {
+	case BPF_JEQ:
+		if (tnum_is_const(reg->var_off))
+			return !!tnum_equals_const(reg->var_off, val);
+		break;
+	case BPF_JNE:
+		if (tnum_is_const(reg->var_off))
+			return !tnum_equals_const(reg->var_off, val);
+		break;
+	case BPF_JGT:
+		if (reg->umin_value > val)
+			return 1;
+		else if (reg->umax_value <= val)
+			return 0;
+		break;
+	case BPF_JSGT:
+		if (reg->smin_value > (s64)val)
+			return 1;
+		else if (reg->smax_value < (s64)val)
+			return 0;
+		break;
+	case BPF_JLT:
+		if (reg->umax_value < val)
+			return 1;
+		else if (reg->umin_value >= val)
+			return 0;
+		break;
+	case BPF_JSLT:
+		if (reg->smax_value < (s64)val)
+			return 1;
+		else if (reg->smin_value >= (s64)val)
+			return 0;
+		break;
+	case BPF_JGE:
+		if (reg->umin_value >= val)
+			return 1;
+		else if (reg->umax_value < val)
+			return 0;
+		break;
+	case BPF_JSGE:
+		if (reg->smin_value >= (s64)val)
+			return 1;
+		else if (reg->smax_value < (s64)val)
+			return 0;
+		break;
+	case BPF_JLE:
+		if (reg->umax_value <= val)
+			return 1;
+		else if (reg->umin_value > val)
+			return 0;
+		break;
+	case BPF_JSLE:
+		if (reg->smax_value <= (s64)val)
+			return 1;
+		else if (reg->smin_value > (s64)val)
+			return 0;
+		break;
+	}
+
+	return -1;
+}
+
 /* Adjusts the register min/max values in the case that the dst_reg is the
  * variable register that we are working on, and src_reg is a constant or we're
  * simply doing a BPF_K check.
@@ -4152,21 +4219,16 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 
 	dst_reg = &regs[insn->dst_reg];
 
-	/* detect if R == 0 where R was initialized to zero earlier */
 	if (BPF_SRC(insn->code) == BPF_K &&
-	    (opcode == BPF_JEQ || opcode == BPF_JNE) &&
-	    dst_reg->type == SCALAR_VALUE &&
-	    tnum_is_const(dst_reg->var_off)) {
-		if ((opcode == BPF_JEQ && dst_reg->var_off.value == insn->imm) ||
-		    (opcode == BPF_JNE && dst_reg->var_off.value != insn->imm)) {
-			/* if (imm == imm) goto pc+off;
-			 * only follow the goto, ignore fall-through
-			 */
+	    dst_reg->type == SCALAR_VALUE) {
+		int pred = is_branch_taken(dst_reg, insn->imm, opcode);
+
+		if (pred == 1) {
+			 /* only follow the goto, ignore fall-through */
 			*insn_idx += insn->off;
 			return 0;
-		} else {
-			/* if (imm != imm) goto pc+off;
-			 * only follow fall-through branch, since
+		} else if (pred == 0) {
+			/* only follow fall-through branch, since
 			 * that's where the program will go
 			 */
 			return 0;
