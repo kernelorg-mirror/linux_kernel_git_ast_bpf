@@ -533,8 +533,18 @@ struct sk_filter {
 	struct bpf_prog	*prog;
 };
 
-#define __bpf_prog_run(prog, ctx)		\
-	(*(prog)->bpf_func)(ctx, (prog)->insnsi)
+#define __bpf_prog_run(prog, ctx)	({			\
+	u32 ret;						\
+	if (static_branch_unlikely(&bpf_stats_enabled_key)) {	\
+		u64 start = sched_clock();			\
+		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
+		this_cpu_inc(prog->aux->stats->cnt);		\
+		this_cpu_add(prog->aux->stats->nsecs,		\
+			     sched_clock() - start);		\
+	} else {						\
+		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
+	}							\
+	ret; })
 #define __bpf_prog_run__may_preempt(prog, ctx)	\
 	({ __bpf_prog_run(prog, ctx); })
 #define __bpf_prog_run__non_preempt(prog, ctx)	\
