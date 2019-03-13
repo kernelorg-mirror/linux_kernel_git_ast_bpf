@@ -1489,6 +1489,7 @@ load_program(struct bpf_program *prog, struct bpf_insn *insns, int insns_cnt,
 {
 	struct bpf_load_program_attr load_attr;
 	char *cp, errmsg[STRERR_BUFSIZE];
+	int log_buf_size = BPF_LOG_BUF_SIZE;
 	char *log_buf;
 	int ret;
 
@@ -1512,11 +1513,12 @@ load_program(struct bpf_program *prog, struct bpf_insn *insns, int insns_cnt,
 	if (!load_attr.insns || !load_attr.insns_cnt)
 		return -EINVAL;
 
-	log_buf = malloc(BPF_LOG_BUF_SIZE);
+retry_load:
+	log_buf = malloc(log_buf_size);
 	if (!log_buf)
 		pr_warning("Alloc log buffer for bpf loader error, continue without log\n");
 
-	ret = bpf_load_program_xattr(&load_attr, log_buf, BPF_LOG_BUF_SIZE);
+	ret = bpf_load_program_xattr(&load_attr, log_buf, log_buf_size);
 
 	if (ret >= 0) {
 		*pfd = ret;
@@ -1524,6 +1526,11 @@ load_program(struct bpf_program *prog, struct bpf_insn *insns, int insns_cnt,
 		goto out;
 	}
 
+	if (errno == ENOSPC) {
+		log_buf_size <<= 1;
+		free(log_buf);
+		goto retry_load;
+	}
 	ret = -LIBBPF_ERRNO__LOAD;
 	cp = libbpf_strerror_r(errno, errmsg, sizeof(errmsg));
 	pr_warning("load bpf program failed: %s\n", cp);

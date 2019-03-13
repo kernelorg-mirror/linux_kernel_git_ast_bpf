@@ -420,6 +420,8 @@ struct bpf_array {
 	};
 };
 
+//#define BPF_COMPLEXITY_LIMIT_INSNS      131072
+#define BPF_COMPLEXITY_LIMIT_INSNS      1310720
 #define MAX_TAIL_CALL_CNT 32
 
 struct bpf_event_entry {

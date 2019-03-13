@@ -207,6 +207,7 @@ struct bpf_verifier_state {
 struct bpf_verifier_state_list {
 	struct bpf_verifier_state state;
 	struct bpf_verifier_state_list *next;
+	int miss_cnt, hit_cnt;
 };
 
 /* Possible states for alu_state member. */
@@ -284,6 +285,11 @@ struct bpf_verifier_env {
 	struct bpf_verifier_log log;
 	struct bpf_subprog_info subprog_info[BPF_MAX_SUBPROGS + 1];
 	u32 subprog_cnt;
+	u32 insn_processed;
+	u64 verification_time;
+	u32 max_states_per_insn;
+	u32 total_states;
+	u32 peak_states;
 };
 
 __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,

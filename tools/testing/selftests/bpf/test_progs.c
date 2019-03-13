@@ -168,9 +168,10 @@ int main(void)
 
 	jit_enabled = is_jit_enabled();
 
-#define CALL
+test_bpf_verif_scale();
+/*#define CALL
 #include <prog_tests/tests.h>
-#undef CALL
+#undef CALL*/
 
 	printf("Summary: %d PASSED, %d FAILED\n", pass_cnt, error_cnt);
 	return error_cnt ? EXIT_FAILURE : EXIT_SUCCESS;

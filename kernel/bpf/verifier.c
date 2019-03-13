@@ -176,7 +176,6 @@ struct bpf_verifier_stack_elem {
 	struct bpf_verifier_stack_elem *next;
 };
 
-#define BPF_COMPLEXITY_LIMIT_INSNS	131072
 #define BPF_COMPLEXITY_LIMIT_STACK	1024
 #define BPF_COMPLEXITY_LIMIT_STATES	64
 
@@ -280,6 +279,10 @@ __printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
 {
 	struct bpf_verifier_env *env = private_data;
 	va_list args;
+
+/*	va_start(args, fmt);
+	vprintk(fmt, args);
+	va_end(args);*/
 
 	if (!bpf_verifier_log_needed(&env->log))
 		return;
@@ -448,8 +451,8 @@ static void print_verifier_state(struct bpf_verifier_env *env,
 		    tnum_is_const(reg->var_off)) {
 			/* reg->off should be 0 for SCALAR_VALUE */
 			verbose(env, "%lld", reg->var_off.value + reg->off);
-			if (t == PTR_TO_STACK)
-				verbose(env, ",call_%d", func(env, reg)->callsite);
+/*			if (t == PTR_TO_STACK)
+				verbose(env, ",call_%d", func(env, reg)->callsite);*/
 		} else {
 			verbose(env, "(id=%d ref_obj_id=%d", reg->id,
 				reg->ref_obj_id);
@@ -6100,11 +6103,13 @@ static int propagate_liveness(struct bpf_verifier_env *env,
 static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 {
 	struct bpf_verifier_state_list *new_sl;
-	struct bpf_verifier_state_list *sl;
+	struct bpf_verifier_state_list *sl, **pprev;
 	struct bpf_verifier_state *cur = env->cur_state, *new;
 	int i, j, err, states_cnt = 0;
 
-	sl = env->explored_states[insn_idx];
+	pprev= &env->explored_states[insn_idx];
+	sl = *pprev;
+
 	if (!sl)
 		/* this 'insn_idx' instruction wasn't marked, so we will not
 		 * be doing state search here
@@ -6115,6 +6120,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 
 	while (sl != STATE_LIST_MARK) {
 		if (states_equal(env, &sl->state, cur)) {
+			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
 			 * Registers read by the continuation are read by us.
@@ -6130,9 +6136,43 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				return err;
 			return 1;
 		}
-		sl = sl->next;
 		states_cnt++;
+		sl->miss_cnt++;
+		if (sl->miss_cnt > sl->hit_cnt * 3 + 3) {
+			*pprev = sl->next;
+/*			print_verifier_state(env, sl->state.frame[sl->state.curframe]);*/
+			if (sl->state.frame[0]->regs[0].live & REG_LIVE_DONE) {
+				free_verifier_state(&sl->state, false);
+				kfree(sl);
+				env->peak_states--;
+			} else {
+				printk("Leaking\n");
+			}
+			sl = *pprev;
+			continue;
+		}
+		pprev = &sl->next;
+		sl = *pprev;
 	}
+
+	if (env->max_states_per_insn < states_cnt)
+		env->max_states_per_insn = states_cnt;
+
+/*	if (states_cnt >= 50) {
+		sl = env->explored_states[insn_idx];
+		printk("insn %5d states_cnt %d\n", insn_idx, states_cnt);
+		states_cnt = 0;
+		while (sl != STATE_LIST_MARK) {
+			verbose(env, "%3d: ", states_cnt++);
+			print_verifier_state(env, sl->state.frame[sl->state.curframe]);
+			if (sl->state.curframe == 1) {
+				verbose(env, "   : ");
+				print_verifier_state(env, sl->state.frame[0]);
+			}
+			sl = sl->next;
+		}
+		return 0;
+	}*/
 
 	if (!env->allow_ptr_leaks && states_cnt > BPF_COMPLEXITY_LIMIT_STATES)
 		return 0;
@@ -6147,6 +6187,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	new_sl = kzalloc(sizeof(struct bpf_verifier_state_list), GFP_KERNEL);
 	if (!new_sl)
 		return -ENOMEM;
+	env->total_states++;
+	env->peak_states++;
 
 	/* add new state to the head of linked list */
 	new = &new_sl->state;
@@ -6232,7 +6274,6 @@ static int do_check(struct bpf_verifier_env *env)
 	struct bpf_insn *insns = env->prog->insnsi;
 	struct bpf_reg_state *regs;
 	int insn_cnt = env->prog->len, i;
-	int insn_processed = 0;
 	bool do_print_state = false;
 
 	env->prev_linfo = NULL;
@@ -6267,10 +6308,10 @@ static int do_check(struct bpf_verifier_env *env)
 		insn = &insns[env->insn_idx];
 		class = BPF_CLASS(insn->code);
 
-		if (++insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
+		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
 			verbose(env,
 				"BPF program is too large. Processed %d insn\n",
-				insn_processed);
+				env->insn_processed);
 			return -E2BIG;
 		}
 
@@ -6575,7 +6616,7 @@ process_bpf_exit:
 	}
 
 	verbose(env, "processed %d insns (limit %d), stack depth ",
-		insn_processed, BPF_COMPLEXITY_LIMIT_INSNS);
+		env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS);
 	for (i = 0; i < env->subprog_cnt; i++) {
 		u32 depth = env->subprog_info[i].stack_depth;
 
@@ -7810,6 +7851,7 @@ static void free_states(struct bpf_verifier_env *env)
 int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
 	      union bpf_attr __user *uattr)
 {
+	u64 start_time = ktime_get_ns();
 	struct bpf_verifier_env *env;
 	struct bpf_verifier_log *log;
 	int i, len, ret = -EINVAL;
@@ -7851,7 +7893,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
 
 		ret = -EINVAL;
 		/* log attributes have to be sane */
-		if (log->len_total < 128 || log->len_total > UINT_MAX >> 8 ||
+		if (log->len_total < 128 || log->len_total > UINT_MAX >> 1 ||
 		    !log->level || !log->ubuf)
 			goto err_unlock;
 	}
@@ -7932,6 +7974,14 @@ skip_full_check:
 
 	if (ret == 0)
 		ret = fixup_call_args(env);
+
+	env->verification_time = ktime_get_ns() - start_time;
+	printk("processed %d insns (limit %d) time %lld usec max_states_per_insn %d total_states %d peak_states %d\n",
+	       env->insn_processed, BPF_COMPLEXITY_LIMIT_INSNS,
+	       env->verification_time / 1000,
+	       env->max_states_per_insn,
+	       env->total_states,
+	       env->peak_states);
 
 	if (log->level && bpf_verifier_log_full(log))
 		ret = -ENOSPC;
