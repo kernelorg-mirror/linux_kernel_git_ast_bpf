@@ -1151,6 +1151,15 @@ static int mark_reg_read(struct bpf_verifier_env *env,
 				parent->var_off.value, parent->off);
 			return -EFAULT;
 		}
+		if (parent->live & REG_LIVE_READ)
+			/* parentage chain never changes
+			 * and this parent was already marked as LIVE_READ.
+			 * There is no need to keep walking it again and
+			 * keep re-marking all parents as LIVE_READ with this
+			 * register is read multiple times later.
+			 * Once is enough.
+			 */
+			break;
 		/* ... then we depend on parent's value */
 		parent->live |= REG_LIVE_READ;
 		state = parent;
