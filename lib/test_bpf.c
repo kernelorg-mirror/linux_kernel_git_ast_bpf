@@ -6660,14 +6660,14 @@ static int __run_one(const struct bpf_prog *fp, const void *data,
 	u64 start, finish;
 	int ret = 0, i;
 
-	preempt_disable();
+	bpf_prog_lock();
 	start = ktime_get_ns();
 
 	for (i = 0; i < runs; i++)
-		ret = BPF_PROG_RUN(fp, data);
+		ret = __BPF_PROG_RUN(fp, data);
 
 	finish = ktime_get_ns();
-	preempt_enable();
+	bpf_prog_unlock();
 
 	*duration = finish - start;
 	do_div(*duration, runs);
