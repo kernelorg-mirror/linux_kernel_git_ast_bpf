@@ -21,6 +21,7 @@
 #include <linux/kallsyms.h>
 #include <linux/if_vlan.h>
 #include <linux/vmalloc.h>
+#include <linux/locallock.h>
 
 #include <net/sch_generic.h>
 
@@ -559,7 +560,20 @@ struct sk_filter {
 
 DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
 
-#define BPF_PROG_RUN(prog, ctx)	({				\
+#ifdef CONFIG_PREEMPT_RT_FULL
+DECLARE_LOCAL_IRQ_LOCK(bpf_invoke_lock);
+#define bpf_prog_lock() local_lock(bpf_invoke_lock)
+#define bpf_prog_unlock() local_unlock(bpf_invoke_lock)
+#else
+#define bpf_prog_lock() preempt_disable()
+#define bpf_prog_unlock() preempt_enable()
+#endif
+
+/* We cannot migrate off of the current cpu because BPF programs
+ * access per-cpu maps and other per-cpu data structures which are
+ * shared between BPF program execution and kernel execution.
+ */
+#define __BPF_PROG_RUN(prog, ctx)	({			\
 	u32 ret;						\
 	cant_sleep();						\
 	if (static_branch_unlikely(&bpf_stats_enabled_key)) {	\
@@ -574,6 +588,13 @@ DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
 	} else {						\
 		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
 	}							\
+	ret; })
+
+#define BPF_PROG_RUN(prog, ctx)	({				\
+	u32 ret;						\
+	bpf_prog_lock();					\
+	ret = __BPF_PROG_RUN(prog, ctx);			\
+	bpf_prog_unlock();					\
 	ret; })
 
 #define BPF_SKB_CB_LEN QDISC_CB_PRIV_LEN

@@ -2217,6 +2217,11 @@ int __weak bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
 DEFINE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
 EXPORT_SYMBOL(bpf_stats_enabled_key);
 
+#ifdef CONFIG_PREEMPT_RT_FULL
+DEFINE_LOCAL_IRQ_LOCK(bpf_invoke_lock);
+EXPORT_SYMBOL(bpf_invoke_lock);
+#endif
+
 /* All definitions of tracepoints related to BPF. */
 #define CREATE_TRACE_POINTS
 #include <linux/bpf_trace.h>
