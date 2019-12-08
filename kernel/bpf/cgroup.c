@@ -672,7 +672,7 @@ int __cgroup_bpf_run_filter_sk(struct sock *sk,
 	struct cgroup *cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
 	int ret;
 
-	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], sk, BPF_PROG_RUN);
+	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], sk, __BPF_PROG_RUN);
 	return ret == 1 ? 0 : -EPERM;
 }
 EXPORT_SYMBOL(__cgroup_bpf_run_filter_sk);
@@ -716,7 +716,7 @@ int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
 	}
 
 	cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
-	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
+	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, __BPF_PROG_RUN);
 
 	return ret == 1 ? 0 : -EPERM;
 }
@@ -746,7 +746,7 @@ int __cgroup_bpf_run_filter_sock_ops(struct sock *sk,
 	int ret;
 
 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], sock_ops,
-				 BPF_PROG_RUN);
+				 __BPF_PROG_RUN);
 	return ret == 1 ? 0 : -EPERM;
 }
 EXPORT_SYMBOL(__cgroup_bpf_run_filter_sock_ops);
@@ -765,7 +765,7 @@ int __cgroup_bpf_check_dev_permission(short dev_type, u32 major, u32 minor,
 	rcu_read_lock();
 	cgrp = task_dfl_cgroup(current);
 	allow = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx,
-				   BPF_PROG_RUN);
+				   __BPF_PROG_RUN);
 	rcu_read_unlock();
 
 	return !allow;
@@ -923,7 +923,7 @@ int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
 
 	rcu_read_lock();
 	cgrp = task_dfl_cgroup(current);
-	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
+	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, __BPF_PROG_RUN);
 	rcu_read_unlock();
 
 	kfree(ctx.cur_val);
@@ -1012,7 +1012,7 @@ int __cgroup_bpf_run_filter_setsockopt(struct sock *sk, int *level,
 
 	lock_sock(sk);
 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[BPF_CGROUP_SETSOCKOPT],
-				 &ctx, BPF_PROG_RUN);
+				 &ctx, __BPF_PROG_RUN);
 	release_sock(sk);
 
 	if (!ret) {
@@ -1096,7 +1096,7 @@ int __cgroup_bpf_run_filter_getsockopt(struct sock *sk, int level,
 
 	lock_sock(sk);
 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[BPF_CGROUP_GETSOCKOPT],
-				 &ctx, BPF_PROG_RUN);
+				 &ctx, __BPF_PROG_RUN);
 	release_sock(sk);
 
 	if (!ret) {
