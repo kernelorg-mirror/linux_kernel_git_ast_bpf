@@ -288,10 +288,17 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
 	struct stack_map_irq_work *work = NULL;
 
 	if (irqs_disabled()) {
+#ifdef CONFIG_PREEMPT_RT_FULL
+		/* We cannot use the up_read_non_owner() interface in RT
+		 * kernels, so just force reporting of IPs.
+		 */
+		irq_work_busy = true;
+#else
 		work = this_cpu_ptr(&up_read_work);
 		if (atomic_read(&work->irq_work.flags) & IRQ_WORK_BUSY)
 			/* cannot queue more up_read, fallback */
 			irq_work_busy = true;
+#endif
 	}
 
 	/*
