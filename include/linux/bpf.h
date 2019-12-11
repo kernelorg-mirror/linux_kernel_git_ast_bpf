@@ -558,6 +558,7 @@ static inline void bpf_dispatcher_change_prog(struct bpf_dispatcher *d,
 #endif
 
 struct bpf_func_info_aux {
+	u32 linkage;
 	bool unreliable;
 };
 
@@ -1006,7 +1007,9 @@ int btf_distill_func_proto(struct bpf_verifier_log *log,
 			   const char *func_name,
 			   struct btf_func_model *m);
 
-int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog);
+struct bpf_reg_state;
+int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
+			     struct bpf_reg_state *regs);
 
 struct bpf_prog *bpf_prog_by_id(u32 id);
 
