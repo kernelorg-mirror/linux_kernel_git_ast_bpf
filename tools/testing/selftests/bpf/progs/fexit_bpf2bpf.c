@@ -94,4 +94,28 @@ int BPF_PROG(test_subprog3, int val, struct sk_buff *skb, int ret)
 	test_result_subprog3 = 1;
 	return 0;
 }
+
+__u64 test_get_skb_len = 0;
+SEC("replace/get_skb_len")
+int new_get_skb_len(struct __sk_buff *skb)
+{
+	int len = skb->len;
+
+	if (len != 74)
+		return 0;
+	test_get_skb_len = 1;
+	return 74; /* original get_skb_len() returns skb->len */
+}
+
+__u64 test_get_skb_ifindex = 0;
+SEC("replace/get_skb_ifindex")
+int new_get_skb_ifindex(int val, struct __sk_buff *skb, int var)
+{
+	int ifindex = skb->ifindex;
+
+	if (ifindex != 1 || val != 3 || var != 1)
+		return 0;
+	test_get_skb_ifindex = 1;
+	return 3; /* original get_skb_ifindex() returns val * ifindex * var */
+}
 char _license[] SEC("license") = "GPL";
