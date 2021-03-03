@@ -54,6 +54,7 @@
 #include "str_error.h"
 #include "libbpf_internal.h"
 #include "hashmap.h"
+#include "bpf_gen_internal.h"
 
 #ifndef BPF_FS_MAGIC
 #define BPF_FS_MAGIC		0xcafe4a11
@@ -435,6 +436,8 @@ struct bpf_object {
 
 	bool loaded;
 	bool has_subcalls;
+
+	struct bpf_gen *gen_trace;
 
 	/*
 	 * Information when doing elf related work. Only valid if fd
@@ -2651,7 +2654,15 @@ static int bpf_object__sanitize_and_load_btf(struct bpf_object *obj)
 		bpf_object__sanitize_btf(obj, kern_btf);
 	}
 
-	err = btf__load(kern_btf);
+	if (obj->gen_trace) {
+		__u32 raw_size = 0;
+		const void *raw_data = btf__get_raw_data(kern_btf, &raw_size);
+
+		bpf_gen__load_btf(obj->gen_trace, raw_data, raw_size);
+		btf__set_fd(kern_btf, 0);
+	} else {
+		err = btf__load(kern_btf);
+	}
 	if (sanitize) {
 		if (!err) {
 			/* move fd to libbpf's BTF */
@@ -4271,6 +4282,17 @@ static bool kernel_supports(enum kern_feature_id feat_id)
 	return READ_ONCE(feat->res) == FEAT_SUPPORTED;
 }
 
+static void mark_feat_supported(enum kern_feature_id last_feat)
+{
+	struct kern_feature_desc *feat;
+	int i;
+
+	for (i = 0; i <= last_feat; i++) {
+		feat = &feature_probes[i];
+		WRITE_ONCE(feat->res, FEAT_SUPPORTED);
+	}
+}
+
 static bool map_is_reuse_compat(const struct bpf_map *map, int map_fd)
 {
 	struct bpf_map_info map_info = {};
@@ -4338,6 +4360,13 @@ bpf_object__populate_internal_map(struct bpf_object *obj, struct bpf_map *map)
 	char *cp, errmsg[STRERR_BUFSIZE];
 	int err, zero = 0;
 
+	if (obj->gen_trace) {
+		bpf_gen__map_update_elem(obj->gen_trace, map - obj->maps,
+					 map->mmaped, map->def.value_size);
+		if (map_type == LIBBPF_MAP_RODATA || map_type == LIBBPF_MAP_KCONFIG)
+			bpf_gen__map_freeze(obj->gen_trace, map - obj->maps);
+		return 0;
+	}
 	err = bpf_map_update_elem(map->fd, &zero, map->mmaped, 0);
 	if (err) {
 		err = -errno;
@@ -4363,7 +4392,7 @@ bpf_object__populate_internal_map(struct bpf_object *obj, struct bpf_map *map)
 
 static void bpf_map__destroy(struct bpf_map *map);
 
-static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map)
+static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, bool is_inner)
 {
 	struct bpf_create_map_attr create_attr;
 	struct bpf_map_def *def = &map->def;
@@ -4409,9 +4438,9 @@ static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map)
 
 	if (bpf_map_type__is_map_in_map(def->type)) {
 		if (map->inner_map) {
-			int err;
+			int err = 0;
 
-			err = bpf_object__create_map(obj, map->inner_map);
+			err = bpf_object__create_map(obj, map->inner_map, true);
 			if (err) {
 				pr_warn("map '%s': failed to create inner map: %d\n",
 					map->name, err);
@@ -4423,7 +4452,12 @@ static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map)
 			create_attr.inner_map_fd = map->inner_map_fd;
 	}
 
-	map->fd = bpf_create_map_xattr(&create_attr);
+	if (obj->gen_trace) {
+		bpf_gen__map_create(obj->gen_trace, &create_attr, is_inner ? -1 : map - obj->maps);
+		map->fd = 0;
+	} else {
+		map->fd = bpf_create_map_xattr(&create_attr);
+	}
 	if (map->fd < 0 && (create_attr.btf_key_type_id ||
 			    create_attr.btf_value_type_id)) {
 		char *cp, errmsg[STRERR_BUFSIZE];
@@ -4451,11 +4485,11 @@ static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map)
 	return 0;
 }
 
-static int init_map_slots(struct bpf_map *map)
+static int init_map_slots(struct bpf_object *obj, struct bpf_map *map)
 {
 	const struct bpf_map *targ_map;
 	unsigned int i;
-	int fd, err;
+	int fd, err = 0;
 
 	for (i = 0; i < map->init_slots_sz; i++) {
 		if (!map->init_slots[i])
@@ -4463,7 +4497,12 @@ static int init_map_slots(struct bpf_map *map)
 
 		targ_map = map->init_slots[i];
 		fd = bpf_map__fd(targ_map);
-		err = bpf_map_update_elem(map->fd, &i, &fd, 0);
+		if (obj->gen_trace) {
+			printf("// TODO map_update_elem: idx %ld key %d value==map_idx %ld\n",
+			       map - obj->maps, i, targ_map - obj->maps);
+		} else {
+			err = bpf_map_update_elem(map->fd, &i, &fd, 0);
+		}
 		if (err) {
 			err = -errno;
 			pr_warn("map '%s': failed to initialize slot [%d] to map '%s' fd=%d: %d\n",
@@ -4505,7 +4544,7 @@ bpf_object__create_maps(struct bpf_object *obj)
 			pr_debug("map '%s': skipping creation (preset fd=%d)\n",
 				 map->name, map->fd);
 		} else {
-			err = bpf_object__create_map(obj, map);
+			err = bpf_object__create_map(obj, map, false);
 			if (err)
 				goto err_out;
 
@@ -4521,7 +4560,7 @@ bpf_object__create_maps(struct bpf_object *obj)
 			}
 
 			if (map->init_slots_sz) {
-				err = init_map_slots(map);
+				err = init_map_slots(obj, map);
 				if (err < 0) {
 					zclose(map->fd);
 					goto err_out;
@@ -4929,6 +4968,9 @@ static int load_module_btfs(struct bpf_object *obj)
 	int err, fd;
 
 	if (obj->btf_modules_loaded)
+		return 0;
+
+	if (obj->gen_trace)
 		return 0;
 
 	/* don't do this again, even if we find no module BTFs */
@@ -6076,6 +6118,12 @@ static int bpf_core_apply_relo(struct bpf_program *prog,
 	if (str_is_empty(spec_str))
 		return -EINVAL;
 
+	if (prog->obj->gen_trace) {
+		printf("// TODO core_relo: prog %ld insn[%d] %s %s kind %d\n",
+		       prog - prog->obj->programs, relo->insn_off / 8,
+		       local_name, spec_str, relo->kind);
+//		return 0;
+	}
 	err = bpf_core_parse_spec(local_btf, local_id, spec_str, relo->kind, &local_spec);
 	if (err) {
 		pr_warn("prog '%s': relo #%d: parsing [%d] %s %s + %s failed: %d\n",
@@ -7021,6 +7069,9 @@ static int bpf_object__sanitize_prog(struct bpf_object* obj, struct bpf_program 
 	enum bpf_func_id func_id;
 	int i;
 
+	if (obj->gen_trace)
+		return 0;
+
 	for (i = 0; i < prog->insns_cnt; i++, insn++) {
 		if (!insn_is_helper_call(insn, &func_id))
 			continue;
@@ -7106,6 +7157,12 @@ load_program(struct bpf_program *prog, struct bpf_insn *insns, int insns_cnt,
 	load_attr.log_level = prog->log_level;
 	load_attr.prog_flags = prog->prog_flags;
 
+	if (prog->obj->gen_trace) {
+		bpf_gen__prog_load(prog->obj->gen_trace, &load_attr,
+				   prog - prog->obj->programs);
+		*pfd = 0;
+		return 0;
+	}
 retry_load:
 	if (log_buf_size) {
 		log_buf = malloc(log_buf_size);
@@ -7814,6 +7871,11 @@ int bpf_object__load_xattr(struct bpf_object_load_attr *attr)
 		return -EINVAL;
 	}
 
+	if (obj->gen_trace) {
+		mark_feat_supported(FEAT_FD_IDX);
+		bpf_gen__init(obj->gen_trace, attr->log_level);
+	}
+
 	err = bpf_object__probe_loading(obj);
 	err = err ? : bpf_object__load_vmlinux_btf(obj, false);
 	err = err ? : bpf_object__resolve_externs(obj, obj->kconfig);
@@ -7823,6 +7885,9 @@ int bpf_object__load_xattr(struct bpf_object_load_attr *attr)
 	err = err ? : bpf_object__create_maps(obj);
 	err = err ? : bpf_object__relocate(obj, attr->target_btf_path);
 	err = err ? : bpf_object__load_progs(obj, attr->log_level);
+
+	if (obj->gen_trace && !err)
+		err = bpf_gen__finish(obj->gen_trace);
 
 	/* clean up module BTFs */
 	for (i = 0; i < obj->btf_module_cnt; i++) {
@@ -8539,6 +8604,11 @@ void *bpf_object__priv(const struct bpf_object *obj)
 	return obj ? obj->priv : ERR_PTR(-EINVAL);
 }
 
+void bpf_object__set_gen_trace(struct bpf_object *obj, struct bpf_gen *gen)
+{
+	obj->gen_trace = gen;
+}
+
 static struct bpf_program *
 __bpf_program__iter(const struct bpf_program *p, const struct bpf_object *obj,
 		    bool forward)
@@ -9175,6 +9245,28 @@ invalid_prog:
 #define BTF_ITER_PREFIX "bpf_iter_"
 #define BTF_MAX_NAME_SIZE 128
 
+void btf_get_kernel_prefix_kind(enum bpf_attach_type attach_type,
+				const char **prefix, int *kind)
+{
+	switch (attach_type) {
+	case BPF_TRACE_RAW_TP:
+		*prefix = BTF_TRACE_PREFIX;
+		*kind = BTF_KIND_TYPEDEF;
+		break;
+	case BPF_LSM_MAC:
+		*prefix = BTF_LSM_PREFIX;
+		*kind = BTF_KIND_FUNC;
+		break;
+	case BPF_TRACE_ITER:
+		*prefix = BTF_ITER_PREFIX;
+		*kind = BTF_KIND_FUNC;
+		break;
+	default:
+		*prefix = "";
+		*kind = BTF_KIND_FUNC;
+	}
+}
+
 static int find_btf_by_prefix_kind(const struct btf *btf, const char *prefix,
 				   const char *name, __u32 kind)
 {
@@ -9195,21 +9287,11 @@ static int find_btf_by_prefix_kind(const struct btf *btf, const char *prefix,
 static inline int find_attach_btf_id(struct btf *btf, const char *name,
 				     enum bpf_attach_type attach_type)
 {
-	int err;
+	const char *prefix;
+	int kind;
 
-	if (attach_type == BPF_TRACE_RAW_TP)
-		err = find_btf_by_prefix_kind(btf, BTF_TRACE_PREFIX, name,
-					      BTF_KIND_TYPEDEF);
-	else if (attach_type == BPF_LSM_MAC)
-		err = find_btf_by_prefix_kind(btf, BTF_LSM_PREFIX, name,
-					      BTF_KIND_FUNC);
-	else if (attach_type == BPF_TRACE_ITER)
-		err = find_btf_by_prefix_kind(btf, BTF_ITER_PREFIX, name,
-					      BTF_KIND_FUNC);
-	else
-		err = btf__find_by_name_kind(btf, name, BTF_KIND_FUNC);
-
-	return err;
+	btf_get_kernel_prefix_kind(attach_type, &prefix, &kind);
+	return find_btf_by_prefix_kind(btf, prefix, name, kind);
 }
 
 int libbpf_find_vmlinux_btf_id(const char *name,
@@ -9308,7 +9390,7 @@ static int libbpf_find_attach_btf_id(struct bpf_program *prog, int *btf_obj_fd, 
 	__u32 attach_prog_fd = prog->attach_prog_fd;
 	const char *name = prog->sec_name, *attach_name;
 	const struct bpf_sec_def *sec = NULL;
-	int i, err;
+	int i, err = 0;
 
 	if (!name)
 		return -EINVAL;
@@ -9343,7 +9425,13 @@ static int libbpf_find_attach_btf_id(struct bpf_program *prog, int *btf_obj_fd, 
 	}
 
 	/* kernel/module BTF ID */
-	err = find_kernel_btf_id(prog->obj, attach_name, attach_type, btf_obj_fd, btf_type_id);
+	if (prog->obj->gen_trace) {
+		bpf_gen__record_find_name(prog->obj->gen_trace, attach_name, attach_type);
+		*btf_obj_fd = 0;
+		*btf_type_id = 1;
+	} else {
+		err = find_kernel_btf_id(prog->obj, attach_name, attach_type, btf_obj_fd, btf_type_id);
+	}
 	if (err) {
 		pr_warn("failed to find kernel BTF type ID of '%s': %d\n", attach_name, err);
 		return err;

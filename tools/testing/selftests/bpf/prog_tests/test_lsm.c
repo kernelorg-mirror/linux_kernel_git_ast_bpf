@@ -11,7 +11,7 @@
 #include <malloc.h>
 #include <stdlib.h>
 
-#include "lsm.skel.h"
+#include "lsm.lskel.h"
 
 char *CMD_ARGS[] = {"true", NULL};
 

@@ -11,7 +11,7 @@
 #include <test_progs.h>
 #include <linux/ring_buffer.h>
 
-#include "ima.skel.h"
+#include "ima.lskel.h"
 
 static int run_measured_process(const char *measured_dir, u32 *monitored_pid)
 {
@@ -54,7 +54,7 @@ void test_test_ima(void)
 	if (CHECK(!skel, "skel_load", "skeleton failed\n"))
 		goto close_prog;
 
-	ringbuf = ring_buffer__new(bpf_map__fd(skel->maps.ringbuf),
+	ringbuf = ring_buffer__new(skel->maps.ringbuf.map_fd,
 				   process_sample, NULL, NULL);
 	if (!ASSERT_OK_PTR(ringbuf, "ringbuf"))
 		goto close_prog;
