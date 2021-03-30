@@ -4684,6 +4684,12 @@ union bpf_attr {
  * 		If btf_fd is zero look for the name in vmlinux BTF and kernel module BTFs.
  * 	Return
  * 		Return btf_id and store module's BTF FD into attach_btf_obj_fd.
+ *
+ * long bpf_sys_close(u32 fd)
+ * 	Description
+ * 		Execute close syscall for given FD.
+ * 	Return
+ * 		A syscall result.
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -4853,6 +4859,7 @@ union bpf_attr {
 	FN(for_each_map_elem),		\
 	FN(sys_bpf),			\
 	FN(btf_find_by_name_kind),	\
+	FN(sys_close),			\
 	/* */
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
