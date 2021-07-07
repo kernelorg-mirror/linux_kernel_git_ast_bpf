@@ -1014,7 +1014,7 @@ struct bpf_hrtimer {
 	struct hrtimer timer;
 	struct bpf_map *map;
 	struct bpf_prog *prog;
-	void *callback_fn;
+	void __rcu *callback_fn;
 	void *value;
 };
 
@@ -1035,34 +1035,19 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 	struct bpf_hrtimer *t = container_of(hrtimer, struct bpf_hrtimer, timer);
 	struct bpf_map *map = t->map;
 	void *value = t->value;
-	struct bpf_timer_kern *timer = value + map->timer_off;
-	struct bpf_prog *prog;
 	void *callback_fn;
 	void *key;
 	u32 idx;
 
-	/* The triple underscore bpf_spin_lock is a direct call
-	 * to BPF_CALL_1(bpf_spin_lock) which does irqsave.
-	 */
-	____bpf_spin_lock(&timer->lock);
-	/* callback_fn and prog need to match. They're updated together
-	 * and have to be read under lock.
-	 */
-	prog = t->prog;
-	callback_fn = t->callback_fn;
-
-	/* wrap bpf subprog invocation with prog->refcnt++ and -- to make sure
-	 * that refcnt doesn't become zero when subprog is executing. Do it
-	 * under lock to make sure that bpf_timer_set_callback doesn't drop
-	 * prev prog refcnt to zero before timer_cb has a chance to bump it.
-	 */
-	bpf_prog_inc(prog);
-	____bpf_spin_unlock(&timer->lock);
+	callback_fn = rcu_dereference_check(t->callback_fn, rcu_read_lock_bh_held());
+	if (!callback_fn)
+		goto out;
 
 	/* bpf_timer_cb() runs in hrtimer_run_softirq. It doesn't migrate and
 	 * cannot be preempted by another bpf_timer_cb() on the same cpu.
 	 * Remember the timer this callback is servicing to prevent
-	 * deadlock if callback_fn() calls bpf_timer_cancel() on the same timer.
+	 * deadlock if callback_fn() calls bpf_timer_cancel() or
+	 * bpf_map_delete_elem() on the same timer.
 	 */
 	this_cpu_write(hrtimer_running, t);
 	if (map->map_type == BPF_MAP_TYPE_ARRAY) {
@@ -1078,9 +1063,9 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
 	BPF_CAST_CALL(callback_fn)((u64)(long)map, (u64)(long)key,
 				   (u64)(long)value, 0, 0);
 	/* The verifier checked that return value is zero. */
-	bpf_prog_put(prog);
 
 	this_cpu_write(hrtimer_running, NULL);
+out:
 	return HRTIMER_NORESTART;
 }
 
@@ -1104,6 +1089,9 @@ BPF_CALL_3(bpf_timer_init, struct bpf_timer_kern *, timer, struct bpf_map *, map
 	     clockid != CLOCK_REALTIME &&
 	     clockid != CLOCK_BOOTTIME))
 		return -EINVAL;
+	/* The triple underscore bpf_spin_lock is a direct call
+	 * to BPF_CALL_1(bpf_spin_lock) which does irqsave.
+	 */
 	____bpf_spin_lock(&timer->lock);
 	t = timer->timer;
 	if (t) {
@@ -1119,7 +1107,7 @@ BPF_CALL_3(bpf_timer_init, struct bpf_timer_kern *, timer, struct bpf_map *, map
 	t->value = (void *)timer - map->timer_off;
 	t->map = map;
 	t->prog = NULL;
-	t->callback_fn = NULL;
+	rcu_assign_pointer(t->callback_fn, NULL);
 	hrtimer_init(&t->timer, clockid, HRTIMER_MODE_REL_SOFT);
 	t->timer.function = bpf_timer_cb;
 	timer->timer = t;
@@ -1176,7 +1164,7 @@ BPF_CALL_3(bpf_timer_set_callback, struct bpf_timer_kern *, timer, void *, callb
 			bpf_prog_put(prev);
 		t->prog = prog;
 	}
-	t->callback_fn = callback_fn;
+	rcu_assign_pointer(t->callback_fn, callback_fn);
 out:
 	____bpf_spin_unlock(&timer->lock); /* including irqrestore */
 	return ret;
@@ -1225,12 +1213,9 @@ static void drop_prog_refcnt(struct bpf_hrtimer *t)
 	struct bpf_prog *prog = t->prog;
 
 	if (prog) {
-		/* If timer was armed with bpf_timer_start()
-		 * drop prog refcnt.
-		 */
 		bpf_prog_put(prog);
 		t->prog = NULL;
-		t->callback_fn = NULL;
+		rcu_assign_pointer(t->callback_fn, NULL);
 	}
 }
 
@@ -1255,13 +1240,13 @@ BPF_CALL_1(bpf_timer_cancel, struct bpf_timer_kern *, timer)
 		ret = -EDEADLK;
 		goto out;
 	}
-	/* Cancel the timer and wait for associated callback to finish
-	 * if it was running.
-	 */
-	ret = hrtimer_cancel(&t->timer);
 	drop_prog_refcnt(t);
 out:
 	____bpf_spin_unlock(&timer->lock);
+	/* Cancel the timer and wait for associated callback to finish
+	 * if it was running.
+	 */
+	ret = ret ?: hrtimer_cancel(&t->timer);
 	return ret;
 }
 
@@ -1290,27 +1275,32 @@ void bpf_timer_cancel_and_free(void *val)
 	t = timer->timer;
 	if (!t)
 		goto out;
-	/* Cancel the timer and wait for callback to complete if it was running.
-	 * Check that bpf_map_delete/update_elem() wasn't called from timer callback_fn.
-	 * In such case don't call hrtimer_cancel() (since it will deadlock)
-	 * and don't call hrtimer_try_to_cancel() (since it will just return -1).
-	 * Instead free the timer and set timer->timer = NULL.
-	 * The subsequent bpf_timer_start/cancel() helpers won't be able to use it,
-	 * since it won't be initialized.
-	 * In preallocated maps it's safe to do timer->timer = NULL.
-	 * The memory could be reused for another map element while current
-	 * callback_fn can do bpf_timer_init() on it.
-	 * In non-preallocated maps bpf_timer_cancel_and_free and
-	 * timer->timer = NULL will happen after callback_fn completes, since
-	 * program execution is an RCU critical section.
-	 */
-	if (this_cpu_read(hrtimer_running) != t)
-		hrtimer_cancel(&t->timer);
 	drop_prog_refcnt(t);
-	kfree(t);
+	/* The subsequent bpf_timer_start/cancel() helpers won't be able to use
+	 * this timer, since it won't be initialized.
+	 */
 	timer->timer = NULL;
 out:
 	____bpf_spin_unlock(&timer->lock);
+	if (!t)
+		return;
+	/* Cancel the timer and wait for callback to complete if it was running.
+	 * If hrtimer_cancel() can be safely called it's safe to call kfree(t)
+	 * right after for both preallocated and non-preallocated maps.
+	 * The timer->timer = NULL was already done and no code path can
+	 * see address 't' anymore.
+	 *
+	 * Check that bpf_map_delete/update_elem() wasn't called from timer
+	 * callback_fn. In such case don't call hrtimer_cancel() (since it will
+	 * deadlock) and don't call hrtimer_try_to_cancel() (since it will just
+	 * return -1). Though callback_fn is still running on this cpu it's
+	 * safe to do kfree(t) because bpf_timer_cb() read everything it needed
+	 * from 't'. The bpf subprog callback_fn won't be able to access 't',
+	 * since timer->timer = NULL was already done.
+	 */
+	if (this_cpu_read(hrtimer_running) != t)
+		hrtimer_cancel(&t->timer);
+	kfree(t);
 }
 
 const struct bpf_func_proto bpf_get_current_task_proto __weak;
