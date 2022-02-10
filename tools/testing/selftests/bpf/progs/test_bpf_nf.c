@@ -32,6 +32,17 @@ struct nf_conn *bpf_skb_ct_lookup(struct __sk_buff *, struct bpf_sock_tuple *, u
 				  struct bpf_ct_opts___local *, u32) __ksym;
 void bpf_ct_release(struct nf_conn *) __ksym;
 
+struct map_val {
+	struct nf_conn *ct;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct map_val);
+} hash SEC(".maps");
+
 static __always_inline void
 nf_ct_test(struct nf_conn *(*func)(void *, struct bpf_sock_tuple *, u32,
 				   struct bpf_ct_opts___local *, u32),
@@ -42,6 +53,23 @@ nf_ct_test(struct nf_conn *(*func)(void *, struct bpf_sock_tuple *, u32,
 	struct nf_conn *ct;
 
 	__builtin_memset(&bpf_tuple, 0, sizeof(bpf_tuple.ipv4));
+
+	ct = func(ctx, NULL, 0, &opts_def, sizeof(opts_def));
+	if (ct) {
+		struct map_val *val;
+		struct nf_conn *ct2, *ct3;
+		__u32 zero = 0;
+
+		val = bpf_map_lookup_elem(&hash, &zero);
+		bpf_kptr_try_set(&val->ct, ct);
+		bpf_ct_release(ct);
+
+		ct2 = bpf_kptr_get(&val->ct);
+		bpf_ct_release(ct2);
+
+		ct3 = bpf_kptr_xchg(&val->ct, NULL);
+		bpf_ct_release(ct3);
+	}
 
 	ct = func(ctx, NULL, 0, &opts_def, sizeof(opts_def));
 	if (ct)

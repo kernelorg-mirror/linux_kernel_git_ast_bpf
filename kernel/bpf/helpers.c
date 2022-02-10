@@ -1377,6 +1377,67 @@ out:
 	kfree(t);
 }
 
+BPF_CALL_2(bpf_kptr_get, void **, kptr, int, refcnt_off)
+{
+	void *ptr = READ_ONCE(kptr);
+
+	if (!ptr)
+		return 0;
+	/* ptr->refcnt could be == 0 if another cpu did
+	 * ptr2 = bpf_kptr_xchg();
+	 * bpf_*_release(ptr2);
+	 */
+	if (!refcount_inc_not_zero((refcount_t *)(ptr + refcnt_off)))
+		return 0;
+	return (long) ptr;
+}
+
+static const struct bpf_func_proto bpf_kptr_get_proto = {
+	.func		= bpf_kptr_get,
+	.gpl_only	= false,
+	.ret_type	= RET_PTR_TO_BTF_ID_OR_NULL,
+	.arg1_type	= ARG_PTR_TO_MAP_VALUE,
+};
+
+BPF_CALL_2(bpf_kptr_xchg, void **, kptr, void *, ptr)
+{
+	/* ptr is ptr_to_btf_id returned from bpf_*_lookup() with ptr->refcnt >= 1
+	 * or ptr == NULL.
+	 * returns ptr_to_btf_id with refcnt >= 1 or NULL
+	 */
+	return (long) xchg(kptr, ptr);
+}
+
+static const struct bpf_func_proto bpf_kptr_xchg_proto = {
+	.func		= bpf_kptr_xchg,
+	.gpl_only	= false,
+	.ret_type	= RET_PTR_TO_BTF_ID_OR_NULL,
+	.arg1_type	= ARG_PTR_TO_MAP_VALUE,
+};
+
+BPF_CALL_3(bpf_kptr_try_set, void **, kptr, void *, ptr, int, refcnt_off)
+{
+	/* ptr is ptr_to_btf_id returned from bpf_*_lookup() with ptr->refcnt >= 1
+	 * refcount_inc() has to be done before cmpxchg() because
+	 * another cpu might do bpf_kptr_xchg+release.
+	 */
+	refcount_inc((refcount_t *)(ptr + refcnt_off));
+	if (cmpxchg(kptr, NULL, ptr)) {
+		/* refcnt >= 2 here */
+		refcount_dec((refcount_t *)(ptr + refcnt_off));
+		return -EBUSY;
+	}
+	return 0;
+}
+
+static const struct bpf_func_proto bpf_kptr_try_set_proto = {
+	.func		= bpf_kptr_try_set,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_MAP_VALUE,
+	.arg2_type	= ARG_PTR_TO_BTF_ID,
+};
+
 const struct bpf_func_proto bpf_get_current_task_proto __weak;
 const struct bpf_func_proto bpf_get_current_task_btf_proto __weak;
 const struct bpf_func_proto bpf_probe_read_user_proto __weak;

@@ -5086,6 +5086,26 @@ union bpf_attr {
  *	Return
  *		0 on success, or a negative error in case of failure. On error
  *		*dst* buffer is zeroed out.
+ *
+ * long bpf_kptr_try_set(void *kptr, void *ptr)
+ *	Description
+ *		**ptr** is a refcnt-ed ptr_to_btf_id.
+ *		Atomically if (\*kptr == NULL) { \*kptr = ptr; refcount_inc((struct btf_id \*)ptr->refcnt); }
+ *	Return
+ *		Returns -EBUSY if \*kptr != NULL.
+ *
+ * void *bpf_kptr_get(void *kptr)
+ *	Description
+ *		if (\*kptr != NULL) { refcount_inc_not_zero((struct btf_id \*)\*kptr->refcnt); return \*kptr; }
+ *	Return
+ *		Returns NULL if \*kptr == NULL || refcount is already zero.
+ *
+ * void *bpf_kptr_xchg(void *kptr, void *ptr)
+ *	Description
+ *		Does xchg(kptr, ptr); where **ptr** is a refcnt-ed ptr_to_btf_id or NULL.
+ *	Return
+ *		Returns previous value of \*kptr which can be NULL.
+ *
  */
 #define __BPF_FUNC_MAPPER(FN)		\
 	FN(unspec),			\
@@ -5280,6 +5300,9 @@ union bpf_attr {
 	FN(xdp_load_bytes),		\
 	FN(xdp_store_bytes),		\
 	FN(copy_from_user_task),	\
+	FN(kptr_try_set),		\
+	FN(kptr_get),			\
+	FN(kptr_xchg),			\
 	/* */
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
