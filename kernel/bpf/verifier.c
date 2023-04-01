@@ -5391,10 +5391,23 @@ BTF_TYPE_SAFE_RCU(struct task_struct) {
 	struct css_set __rcu *cgroups;
 	struct task_struct __rcu *real_parent;
 	struct task_struct *group_leader;
+	struct mm_struct *mm;
+};
+
+BTF_TYPE_SAFE_RCU(struct cgroup) {
+	struct kernfs_node *kn;
 };
 
 BTF_TYPE_SAFE_RCU(struct css_set) {
 	struct cgroup *dfl_cgrp;
+};
+
+BTF_TYPE_SAFE_RCU(struct mm_struct) {
+	struct file __rcu *exe_file;
+};
+
+BTF_TYPE_SAFE_RCU(struct sk_buff) {
+	struct sock *sk;
 };
 
 /* full trusted: these fields are trusted even outside of RCU CS and never NULL */
@@ -5429,7 +5442,10 @@ static bool type_is_rcu(struct bpf_verifier_env *env,
 			const char *field_name, u32 btf_id)
 {
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct task_struct));
+	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct cgroup));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct css_set));
+	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct mm_struct));
+	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct sk_buff));
 
 	return btf_nested_type_is_trusted(&env->log, reg, field_name, btf_id, "__safe_rcu");
 }
