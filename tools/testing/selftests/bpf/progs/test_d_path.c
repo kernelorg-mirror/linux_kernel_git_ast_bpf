@@ -62,4 +62,23 @@ int BPF_PROG(prog_close, struct file *file, void *id)
 	return 0;
 }
 
+SEC("lsm/file_open")
+int BPF_PROG(lsm_file_open, struct file* f)
+{
+	struct task_struct* task = (struct task_struct*)bpf_get_current_task_btf();
+	struct path* fpath = NULL;
+	struct mm_struct *mm;
+	struct file *exe_file;
+	char buf[128] = {};
+
+	mm = task->mm;
+	if (mm) {
+		exe_file = mm->exe_file;
+		if (exe_file)
+			fpath = &exe_file->f_path;
+	}
+	if (fpath)
+		bpf_d_path(fpath, buf, sizeof(buf));
+	return 0;
+}
 char _license[] SEC("license") = "GPL";
