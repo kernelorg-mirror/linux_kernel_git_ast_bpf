@@ -194,7 +194,7 @@ static int bpf_dummy_ops_btf_struct_access(struct bpf_verifier_log *log,
 		return -EACCES;
 	}
 
-	err = btf_struct_access(log, reg, off, size, atype, next_btf_id, flag);
+	err = btf_struct_access(log, reg, off, size, atype, next_btf_id, flag, NULL);
 	if (err < 0)
 		return err;
 
