@@ -415,6 +415,8 @@ static void bpf_ma_reuse_cb(struct rcu_head *rcu)
 	c->reuse_cb_in_progress--;
 }
 
+void rcu_request_urgent_qs_task(struct task_struct *t);
+
 static void reuse_bulk(struct bpf_mem_cache *c)
 {
 	struct llist_node *head, *tail, *llnode, *tmp;
@@ -447,11 +449,11 @@ static void reuse_bulk(struct bpf_mem_cache *c)
 		c->free_by_rcu_tail = tail;
 	__llist_add_batch(head, tail, &c->free_by_rcu);
 
-	if (c->reuse_cb_in_progress >= 100 || 1) {
+//	if (c->reuse_cb_in_progress >= 100 || 1) {
 //		local_irq_save(flags);
-		rcu_momentary_dyntick_idle2();
+//		rcu_momentary_dyntick_idle2();
 //		local_irq_restore(flags);
-	}
+//	}
 
 /*	if (c->reuse_cb_in_progress >= 100)
 		return;*/
@@ -469,8 +471,14 @@ static void reuse_bulk(struct bpf_mem_cache *c)
 		return;
 	}
 
-	if (atomic_xchg(&c->call_rcu_in_progress, 1))
+	if (atomic_xchg(&c->call_rcu_in_progress, 1)) {
+//		rcu_request_urgent_qs_task(current);
+
+//		set_tsk_need_resched(current);
+//		set_preempt_need_resched();
+		rcu_momentary_dyntick_idle2();
 		return;
+	}
 
 //	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp));
 	head = __llist_del_all(&c->free_by_rcu);

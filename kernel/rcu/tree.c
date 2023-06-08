@@ -336,12 +336,7 @@ EXPORT_SYMBOL_GPL(rcu_momentary_dyntick_idle);
 
 notrace void rcu_momentary_dyntick_idle2(void)
 {
-	int seq;
-
-	raw_cpu_write(rcu_data.rcu_need_heavy_qs, false);
-	seq = ct_state_inc(2 * RCU_DYNTICKS_IDX);
-	/* It is illegal to call this from idle state. */
-	WARN_ON_ONCE(!(seq & RCU_DYNTICKS_IDX));
+	this_cpu_write(rcu_data.rcu_urgent_qs, true);
 }
 
 /**
