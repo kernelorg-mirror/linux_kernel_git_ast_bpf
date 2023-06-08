@@ -77,7 +77,7 @@ static int bpf_mem_cache_idx(size_t size)
 struct bpf_mem_shared_cache {
 	raw_spinlock_t reuse_lock;
 	bool percpu;
-	bool direct_free;
+//	bool direct_free;
 	struct llist_head wait_for_free;
 	atomic_t call_rcu_in_progress;
 	struct rcu_head rcu;
@@ -121,6 +121,7 @@ struct bpf_mem_cache {
 	struct llist_head waiting_for_gp;
 	struct llist_node *waiting_for_gp_tail;
 	atomic_t call_rcu_in_progress;
+	int reuse_cb_in_progress;
 };
 
 struct bpf_mem_caches {
@@ -285,12 +286,16 @@ static void free_one(void *obj, bool percpu)
 	kfree(obj);
 }
 
-static void free_all(struct llist_node *llnode, bool percpu)
+static int free_all(struct llist_node *llnode, bool percpu)
 {
 	struct llist_node *pos, *t;
+	int cnt = 0;
 
-	llist_for_each_safe(pos, t, llnode)
+	llist_for_each_safe(pos, t, llnode) {
 		free_one(pos, percpu);
+		cnt++;
+	}
+	return cnt;
 }
 
 static void free_rcu(struct rcu_head *rcu)
@@ -298,11 +303,13 @@ static void free_rcu(struct rcu_head *rcu)
 	struct bpf_mem_shared_cache *sc = container_of(rcu, struct bpf_mem_shared_cache, rcu);
 	struct llist_node *head;
 	unsigned long flags;
+	int cnt;
 
 	raw_spin_lock_irqsave(&sc->reuse_lock, flags);
 	head = __llist_del_all(&sc->wait_for_free);
 	raw_spin_unlock_irqrestore(&sc->reuse_lock, flags);
-	free_all(head, sc->percpu);
+	cnt = free_all(head, sc->percpu);
+	printk("after rcu_tasks_trace GP %d\n", cnt);
 	atomic_set(&sc->call_rcu_in_progress, 0);
 }
 
@@ -329,12 +336,16 @@ static void bpf_ma_add_to_reuse_ready_or_free(struct bpf_mem_cache *c)
 	/* Don't move these objects to reuse_ready list and free
 	 * these objects directly.
 	 */
-	if (sc->direct_free) {
+/*	if (sc->direct_free) {
 		free_all(head, sc->percpu);
 		return;
-	}
+	}*/
+/*		local_irq_save(flags);
+		rcu_momentary_dyntick_idle();
+		local_irq_restore(flags);*/
 
 	if (!atomic_xchg(&sc->call_rcu_in_progress, 1)) {
+		printk("cpu %d reuse_cb_in_progress %d\n", raw_smp_processor_id(), c->reuse_cb_in_progress);
 		head = __llist_del_all(&c->reuse_ready_head);
 		tail = c->reuse_ready_tail;
 		c->reuse_ready_tail = NULL;
@@ -346,6 +357,13 @@ static void bpf_ma_add_to_reuse_ready_or_free(struct bpf_mem_cache *c)
 	}
 }
 
+struct bpf_reuse_batch {
+	struct bpf_mem_cache *c;
+	struct llist_node *head, *tail;
+	struct rcu_head rcu;
+};
+
+
 static void reuse_rcu(struct rcu_head *rcu)
 {
 	struct bpf_mem_cache *c = container_of(rcu, struct bpf_mem_cache, rcu);
@@ -354,10 +372,25 @@ static void reuse_rcu(struct rcu_head *rcu)
 	atomic_set(&c->call_rcu_in_progress, 0);
 }
 
+static void bpf_ma_reuse_cb(struct rcu_head *rcu)
+{
+	struct bpf_reuse_batch *batch = container_of(rcu, struct bpf_reuse_batch, rcu);
+	struct bpf_mem_cache *c = batch->c;
+
+	if (llist_empty(&c->waiting_for_gp))
+		c->waiting_for_gp_tail = batch->tail;
+	__llist_add_batch(batch->head, batch->tail, &c->waiting_for_gp);
+	kfree(batch);
+	bpf_ma_add_to_reuse_ready_or_free(c);
+	c->reuse_cb_in_progress--;
+}
+
+
 static void reuse_bulk(struct bpf_mem_cache *c)
 {
 	struct llist_node *head, *tail, *llnode, *tmp;
 	unsigned long flags;
+	struct bpf_reuse_batch *batch;
 
 	if (IS_ENABLED(CONFIG_PREEMPT_RT))
 		local_irq_save(flags);
@@ -385,10 +418,26 @@ static void reuse_bulk(struct bpf_mem_cache *c)
 		c->free_by_rcu_tail = tail;
 	__llist_add_batch(head, tail, &c->free_by_rcu);
 
+//	if (c->reuse_cb_in_progress >= 1000)
+//		return;
+
+	batch = kmalloc(sizeof(*batch), GFP_ATOMIC);
+	if (batch) {
+		head = __llist_del_all(&c->free_by_rcu);
+		tail = c->free_by_rcu_tail;
+		c->free_by_rcu_tail = NULL;
+		batch->c = c;
+		batch->head = head;
+		batch->tail = tail;
+		c->reuse_cb_in_progress++;
+		call_rcu_hurry(&batch->rcu, bpf_ma_reuse_cb);
+		return;
+	}
+
 	if (atomic_xchg(&c->call_rcu_in_progress, 1))
 		return;
 
-	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp));
+//	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp));
 	head = __llist_del_all(&c->free_by_rcu);
 	tail = c->free_by_rcu_tail;
 	c->free_by_rcu_tail = NULL;
@@ -438,7 +487,7 @@ static void prefill_mem_cache(struct bpf_mem_cache *c, int cpu)
 	init_irq_work(&c->refill_work, bpf_mem_refill);
 	if (c->unit_size <= 256) {
 		c->low_watermark = 32;
-		c->high_watermark = 32;
+		c->high_watermark = 64;
 	} else {
 		/* When page_size == 4k, order-0 cache will have low_mark == 2
 		 * and high_mark == 6 with batch alloc of 3 individual pages at
@@ -448,7 +497,7 @@ static void prefill_mem_cache(struct bpf_mem_cache *c, int cpu)
 		c->low_watermark = max(32 * 256 / c->unit_size, 1);
 		c->high_watermark = max(96 * 256 / c->unit_size, 3);
 	}
-	c->batch = 32;//max((c->high_watermark - c->low_watermark) / 4 * 3, 1);
+	c->batch = 64;//max((c->high_watermark - c->low_watermark) / 4 * 3, 1);
 
 	/* To avoid consuming memory assume that 1st run of bpf
 	 * prog won't be doing more than 4 map_update_elem from
@@ -556,7 +605,7 @@ static void drain_shared_mem_cache(struct bpf_mem_shared_cache *sc)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&sc->reuse_lock, flags);
-	sc->direct_free = true;
+//	sc->direct_free = true;
 	head = __llist_del_all(&sc->wait_for_free);
 	raw_spin_unlock_irqrestore(&sc->reuse_lock, flags);
 
@@ -685,6 +734,7 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 			irq_work_sync(&c->refill_work);
 			drain_mem_cache(c);
 			rcu_in_progress += atomic_read(&c->call_rcu_in_progress);
+			rcu_in_progress += c->reuse_cb_in_progress;
 		}
 		sc = ma->s_cache;
 		drain_shared_mem_cache(sc);
@@ -703,6 +753,7 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 				irq_work_sync(&c->refill_work);
 				drain_mem_cache(c);
 				rcu_in_progress += atomic_read(&c->call_rcu_in_progress);
+				rcu_in_progress += c->reuse_cb_in_progress;
 			}
 		}
 		for (i = 0; i < NUM_CACHES; i++) {
