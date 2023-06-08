@@ -122,6 +122,7 @@ struct bpf_mem_cache {
 	struct llist_node *waiting_for_gp_tail;
 	atomic_t call_rcu_in_progress;
 	int reuse_cb_in_progress;
+	int reuse_tt_cb_in_progress;
 };
 
 struct bpf_mem_caches {
@@ -309,14 +310,34 @@ static void free_rcu(struct rcu_head *rcu)
 	head = __llist_del_all(&sc->wait_for_free);
 	raw_spin_unlock_irqrestore(&sc->reuse_lock, flags);
 	cnt = free_all(head, sc->percpu);
-	printk("after rcu_tasks_trace GP %d\n", cnt);
+//	printk("after rcu_tasks_trace GP %d\n", cnt);
 	atomic_set(&sc->call_rcu_in_progress, 0);
 }
+
+struct bpf_reuse_batch {
+	struct bpf_mem_cache *c;
+	struct llist_node *head, *tail;
+	struct rcu_head rcu;
+};
+
+static void bpf_ma_reuse_tt_cb(struct rcu_head *rcu)
+{
+	struct bpf_reuse_batch *batch = container_of(rcu, struct bpf_reuse_batch, rcu);
+	struct bpf_mem_cache *c = batch->c;
+	int cnt;
+
+	cnt = free_all(batch->head, false);
+//	printk("after rcu_tasks_trace GP cb %d\n", cnt);
+	kfree(batch);
+	c->reuse_tt_cb_in_progress--;
+}
+
 
 static void bpf_ma_add_to_reuse_ready_or_free(struct bpf_mem_cache *c)
 {
 	struct bpf_mem_shared_cache *sc = c->sc;
 	struct llist_node *head, *tail;
+	struct bpf_reuse_batch *batch;
 	unsigned long flags;
 
 	/* Draining could be running concurrently with reuse_rcu() */
@@ -344,8 +365,23 @@ static void bpf_ma_add_to_reuse_ready_or_free(struct bpf_mem_cache *c)
 		rcu_momentary_dyntick_idle();
 		local_irq_restore(flags);*/
 
+/*	if (c->reuse_tt_cb_in_progress >= 10)
+		return;
+	batch = kmalloc(sizeof(*batch), GFP_ATOMIC);
+	if (batch) {
+		head = __llist_del_all(&c->reuse_ready_head);
+		tail = c->reuse_ready_tail;
+		c->reuse_ready_tail = NULL;
+		batch->c = c;
+		batch->head = head;
+		batch->tail = tail;
+		c->reuse_tt_cb_in_progress++;
+		call_rcu_tasks_trace(&batch->rcu, bpf_ma_reuse_tt_cb);
+		return;
+	}*/
+
 	if (!atomic_xchg(&sc->call_rcu_in_progress, 1)) {
-		printk("cpu %d reuse_cb_in_progress %d\n", raw_smp_processor_id(), c->reuse_cb_in_progress);
+//		printk("cpu %d reuse_cb_in_progress %d\n", raw_smp_processor_id(), c->reuse_cb_in_progress);
 		head = __llist_del_all(&c->reuse_ready_head);
 		tail = c->reuse_ready_tail;
 		c->reuse_ready_tail = NULL;
@@ -356,12 +392,6 @@ static void bpf_ma_add_to_reuse_ready_or_free(struct bpf_mem_cache *c)
 		call_rcu_tasks_trace(&sc->rcu, free_rcu);
 	}
 }
-
-struct bpf_reuse_batch {
-	struct bpf_mem_cache *c;
-	struct llist_node *head, *tail;
-	struct rcu_head rcu;
-};
 
 
 static void reuse_rcu(struct rcu_head *rcu)
@@ -384,7 +414,6 @@ static void bpf_ma_reuse_cb(struct rcu_head *rcu)
 	bpf_ma_add_to_reuse_ready_or_free(c);
 	c->reuse_cb_in_progress--;
 }
-
 
 static void reuse_bulk(struct bpf_mem_cache *c)
 {
@@ -418,10 +447,16 @@ static void reuse_bulk(struct bpf_mem_cache *c)
 		c->free_by_rcu_tail = tail;
 	__llist_add_batch(head, tail, &c->free_by_rcu);
 
-//	if (c->reuse_cb_in_progress >= 1000)
-//		return;
+	if (c->reuse_cb_in_progress >= 100 || 1) {
+//		local_irq_save(flags);
+		rcu_momentary_dyntick_idle2();
+//		local_irq_restore(flags);
+	}
 
-	batch = kmalloc(sizeof(*batch), GFP_ATOMIC);
+/*	if (c->reuse_cb_in_progress >= 100)
+		return;*/
+
+	batch = NULL;//kmalloc(sizeof(*batch), GFP_ATOMIC);
 	if (batch) {
 		head = __llist_del_all(&c->free_by_rcu);
 		tail = c->free_by_rcu_tail;
@@ -487,7 +522,7 @@ static void prefill_mem_cache(struct bpf_mem_cache *c, int cpu)
 	init_irq_work(&c->refill_work, bpf_mem_refill);
 	if (c->unit_size <= 256) {
 		c->low_watermark = 32;
-		c->high_watermark = 64;
+		c->high_watermark = 1024;
 	} else {
 		/* When page_size == 4k, order-0 cache will have low_mark == 2
 		 * and high_mark == 6 with batch alloc of 3 individual pages at
@@ -735,6 +770,7 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 			drain_mem_cache(c);
 			rcu_in_progress += atomic_read(&c->call_rcu_in_progress);
 			rcu_in_progress += c->reuse_cb_in_progress;
+			rcu_in_progress += c->reuse_tt_cb_in_progress;
 		}
 		sc = ma->s_cache;
 		drain_shared_mem_cache(sc);
@@ -754,6 +790,7 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 				drain_mem_cache(c);
 				rcu_in_progress += atomic_read(&c->call_rcu_in_progress);
 				rcu_in_progress += c->reuse_cb_in_progress;
+				rcu_in_progress += c->reuse_tt_cb_in_progress;
 			}
 		}
 		for (i = 0; i < NUM_CACHES; i++) {

@@ -334,6 +334,16 @@ notrace void rcu_momentary_dyntick_idle(void)
 }
 EXPORT_SYMBOL_GPL(rcu_momentary_dyntick_idle);
 
+notrace void rcu_momentary_dyntick_idle2(void)
+{
+	int seq;
+
+	raw_cpu_write(rcu_data.rcu_need_heavy_qs, false);
+	seq = ct_state_inc(2 * RCU_DYNTICKS_IDX);
+	/* It is illegal to call this from idle state. */
+	WARN_ON_ONCE(!(seq & RCU_DYNTICKS_IDX));
+}
+
 /**
  * rcu_is_cpu_rrupt_from_idle - see if 'interrupted' from idle
  *
