@@ -99,16 +99,27 @@ struct bpf_mem_cache {
 	int low_watermark, high_watermark, batch;
 	int percpu_size;
 
-	struct rcu_head rcu;
 	/* list of objects to be freed after RCU tasks trace GP */
 	struct llist_head free_by_rcu_ttrace;
 	struct llist_node *free_by_rcu_ttrace_tail;
+	struct bpf_mem_common_data *common;
+};
+
+struct bpf_mem_common_data {
 	struct llist_head waiting_for_gp_ttrace;
+	struct llist_head common_free_by_rcu_ttrace;
 	atomic_t call_rcu_ttrace_in_progress;
+	atomic_t steal_in_progress;
+	struct rcu_head rcu;
+	int percpu_size;
 };
 
 struct bpf_mem_caches {
 	struct bpf_mem_cache cache[NUM_CACHES];
+};
+
+struct bpf_mem_common_datas {
+	struct bpf_mem_common_data data[NUM_CACHES];
 };
 
 static struct llist_node notrace *__llist_del_first(struct llist_head *head)
@@ -184,6 +195,7 @@ static void add_obj_to_free_list(struct bpf_mem_cache *c, void *obj)
 static void alloc_bulk(struct bpf_mem_cache *c, int cnt, int node)
 {
 	struct mem_cgroup *memcg = NULL, *old_memcg;
+	struct bpf_mem_common_data *cd = c->common;
 	void *obj;
 	int i;
 
@@ -207,7 +219,37 @@ static void alloc_bulk(struct bpf_mem_cache *c, int cnt, int node)
 	}
 	if (i >= cnt)
 		return;
+	/*
+	 * Try to steal from global/per-bpf_mem_alloc list of objects that are
+	 * waiting for tasks trace grace period.
+	 */
+	if (llist_empty(&cd->common_free_by_rcu_ttrace) && llist_empty(&cd->waiting_for_gp_ttrace))
+		goto do_kmalloc;
 
+	if (atomic_xchg(&cd->steal_in_progress, 1))
+		goto do_kmalloc;
+	/*
+	 * Above atomic_xchg locked out all but one cpu that will attempt to
+	 * atomically llist_del_first() that will race with llist_del_all() in
+	 * __free_rcu() and llist_add() in do_call_rcu().
+	 */
+	for (; i < cnt; i++) {
+		obj = llist_del_first(&cd->common_free_by_rcu_ttrace);
+		if (!obj)
+			break;
+		add_obj_to_free_list(c, obj);
+	}
+	for (; i < cnt; i++) {
+		obj = llist_del_first(&cd->waiting_for_gp_ttrace);
+		if (!obj)
+			break;
+		add_obj_to_free_list(c, obj);
+	}
+	atomic_set(&cd->steal_in_progress, 0);
+
+	if (i >= cnt)
+		return;
+do_kmalloc:
 	memcg = get_memcg(c);
 	old_memcg = set_active_memcg(memcg);
 	for (; i < cnt; i++) {
@@ -250,10 +292,10 @@ static int free_all(struct llist_node *llnode, bool percpu)
 
 static void __free_rcu(struct rcu_head *head)
 {
-	struct bpf_mem_cache *c = container_of(head, struct bpf_mem_cache, rcu);
+	struct bpf_mem_common_data *cd = container_of(head, struct bpf_mem_common_data, rcu);
 
-	free_all(llist_del_all(&c->waiting_for_gp_ttrace), !!c->percpu_size);
-	atomic_set(&c->call_rcu_ttrace_in_progress, 0);
+	free_all(llist_del_all(&cd->waiting_for_gp_ttrace), !!cd->percpu_size);
+	atomic_set(&cd->call_rcu_ttrace_in_progress, 0);
 }
 
 static void __free_rcu_tasks_trace(struct rcu_head *head)
@@ -280,27 +322,35 @@ static void enque_to_free(struct bpf_mem_cache *c, void *obj)
 
 static void do_call_rcu(struct bpf_mem_cache *c)
 {
+	struct bpf_mem_common_data *cd = c->common;
 	struct llist_node *llnode;
 
-	if (atomic_xchg(&c->call_rcu_ttrace_in_progress, 1))
+	if (atomic_xchg(&cd->call_rcu_ttrace_in_progress, 1)) {
+		/* Move all objects from per-cpu list to common */
+		llnode = __llist_del_all(&c->free_by_rcu_ttrace);
+		if (llnode)
+			llist_add_batch(llnode, c->free_by_rcu_ttrace_tail,
+					&cd->common_free_by_rcu_ttrace);
 		return;
+	}
 
-	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp_ttrace));
+	/* Should never happen */
+	WARN_ON_ONCE(!llist_empty(&cd->waiting_for_gp_ttrace));
+
+	/* Move all common objects first */
+	WRITE_ONCE(cd->waiting_for_gp_ttrace.first, llist_del_all(&cd->common_free_by_rcu_ttrace));
+
+	/* And add per-cpu objects */
 	llnode = __llist_del_all(&c->free_by_rcu_ttrace);
 	if (llnode)
-		/* There is no concurrent __llist_add(waiting_for_gp_ttrace) access.
-		 * It doesn't race with llist_del_all either.
-		 * But there could be two concurrent llist_del_all(waiting_for_gp_ttrace):
-		 * from __free_rcu() and from drain_mem_cache().
-		 */
-		__llist_add_batch(llnode, c->free_by_rcu_ttrace_tail,
-				  &c->waiting_for_gp_ttrace);
+		llist_add_batch(llnode, c->free_by_rcu_ttrace_tail,
+				&cd->waiting_for_gp_ttrace);
 	/* Use call_rcu_tasks_trace() to wait for sleepable progs to finish.
 	 * If RCU Tasks Trace grace period implies RCU grace period, free
 	 * these elements directly, else use call_rcu() to wait for normal
 	 * progs to finish and finally do free_one() on each element.
 	 */
-	call_rcu_tasks_trace(&c->rcu, __free_rcu_tasks_trace);
+	call_rcu_tasks_trace(&cd->rcu, __free_rcu_tasks_trace);
 }
 
 static void free_bulk(struct bpf_mem_cache *c)
@@ -403,13 +453,22 @@ int bpf_mem_alloc_init(struct bpf_mem_alloc *ma, int size, bool percpu)
 	static u16 sizes[NUM_CACHES] = {96, 192, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
 	struct bpf_mem_caches *cc, __percpu *pcc;
 	struct bpf_mem_cache *c, __percpu *pc;
+	struct bpf_mem_common_datas *cds;
+	struct bpf_mem_common_data *cd;
 	struct obj_cgroup *objcg = NULL;
 	int cpu, i, unit_size, percpu_size = 0;
 
 	if (size) {
-		pc = __alloc_percpu_gfp(sizeof(*pc), 8, GFP_KERNEL);
-		if (!pc)
+		cd = kzalloc(sizeof(*cd), GFP_KERNEL);
+		if (!cd)
 			return -ENOMEM;
+		cd->percpu_size = percpu_size;
+
+		pc = __alloc_percpu_gfp(sizeof(*pc), 8, GFP_KERNEL);
+		if (!pc) {
+			kfree(cd);
+			return -ENOMEM;
+		}
 
 		if (percpu)
 			/* room for llist_node and per-cpu pointer */
@@ -427,9 +486,11 @@ int bpf_mem_alloc_init(struct bpf_mem_alloc *ma, int size, bool percpu)
 			c->unit_size = unit_size;
 			c->objcg = objcg;
 			c->percpu_size = percpu_size;
+			c->common = cd;
 			prefill_mem_cache(c, cpu);
 		}
 		ma->cache = pc;
+		ma->com_data = cd;
 		return 0;
 	}
 
@@ -437,9 +498,17 @@ int bpf_mem_alloc_init(struct bpf_mem_alloc *ma, int size, bool percpu)
 	if (WARN_ON_ONCE(percpu))
 		return -EINVAL;
 
-	pcc = __alloc_percpu_gfp(sizeof(*cc), 8, GFP_KERNEL);
-	if (!pcc)
+	cds = kzalloc(sizeof(*cds), GFP_KERNEL);
+	if (!cds)
 		return -ENOMEM;
+	/* Every common_data->percpu_size stays zero */
+
+	pcc = __alloc_percpu_gfp(sizeof(*cc), 8, GFP_KERNEL);
+	if (!pcc) {
+		kfree(cds);
+		return -ENOMEM;
+	}
+
 #ifdef CONFIG_MEMCG_KMEM
 	objcg = get_obj_cgroup_from_current();
 #endif
@@ -449,10 +518,12 @@ int bpf_mem_alloc_init(struct bpf_mem_alloc *ma, int size, bool percpu)
 			c = &cc->cache[i];
 			c->unit_size = sizes[i];
 			c->objcg = objcg;
+			c->common = &cds->data[i];
 			prefill_mem_cache(c, cpu);
 		}
 	}
 	ma->caches = pcc;
+	ma->com_datas = cds;
 	return 0;
 }
 
@@ -468,17 +539,25 @@ static void drain_mem_cache(struct bpf_mem_cache *c)
 	 * on these lists, so it is safe to use __llist_del_all().
 	 */
 	free_all(__llist_del_all(&c->free_by_rcu_ttrace), percpu);
-	free_all(llist_del_all(&c->waiting_for_gp_ttrace), percpu);
 	free_all(__llist_del_all(&c->free_llist), percpu);
 	free_all(__llist_del_all(&c->free_llist_extra), percpu);
+}
+
+static void drain_common_data(struct bpf_mem_common_data *cd)
+{
+	bool percpu = !!cd->percpu_size;
+
+	free_all(llist_del_all(&cd->common_free_by_rcu_ttrace), percpu);
+	free_all(llist_del_all(&cd->waiting_for_gp_ttrace), percpu);
 }
 
 static void free_mem_alloc_no_barrier(struct bpf_mem_alloc *ma)
 {
 	free_percpu(ma->cache);
 	free_percpu(ma->caches);
-	ma->cache = NULL;
-	ma->caches = NULL;
+	kfree(ma->com_data);
+	kfree(ma->com_datas);
+	memset(ma, 0, sizeof(*ma));
 }
 
 static void free_mem_alloc(struct bpf_mem_alloc *ma)
@@ -527,16 +606,15 @@ static void destroy_mem_alloc(struct bpf_mem_alloc *ma, int rcu_in_progress)
 	}
 
 	/* Defer barriers into worker to let the rest of map memory to be freed */
-	copy->cache = ma->cache;
-	ma->cache = NULL;
-	copy->caches = ma->caches;
-	ma->caches = NULL;
+	memcpy(copy, ma, sizeof(*ma));
+	memset(ma, 0, sizeof(*ma));
 	INIT_WORK(&copy->work, free_mem_alloc_deferred);
 	queue_work(system_unbound_wq, &copy->work);
 }
 
 void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 {
+	struct bpf_mem_common_data *cd;
 	struct bpf_mem_caches *cc;
 	struct bpf_mem_cache *c;
 	int cpu, i, rcu_in_progress;
@@ -556,8 +634,10 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 			 */
 			irq_work_sync(&c->refill_work);
 			drain_mem_cache(c);
-			rcu_in_progress += atomic_read(&c->call_rcu_ttrace_in_progress);
 		}
+		cd = ma->com_data;
+		drain_common_data(cd);
+		rcu_in_progress += atomic_read(&cd->call_rcu_ttrace_in_progress);
 		/* objcg is the same across cpus */
 		if (c->objcg)
 			obj_cgroup_put(c->objcg);
@@ -571,8 +651,12 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 				c = &cc->cache[i];
 				irq_work_sync(&c->refill_work);
 				drain_mem_cache(c);
-				rcu_in_progress += atomic_read(&c->call_rcu_ttrace_in_progress);
 			}
+		}
+		for (i = 0; i < NUM_CACHES; i++) {
+			cd = &ma->com_datas->data[i];
+			drain_common_data(cd);
+			rcu_in_progress += atomic_read(&cd->call_rcu_ttrace_in_progress);
 		}
 		if (c->objcg)
 			obj_cgroup_put(c->objcg);
