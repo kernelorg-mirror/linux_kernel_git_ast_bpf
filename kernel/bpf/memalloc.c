@@ -102,6 +102,7 @@ struct bpf_mem_cache {
 	struct rcu_head rcu;
 	/* list of objects to be freed after RCU tasks trace GP */
 	struct llist_head free_by_rcu_ttrace;
+	struct llist_node *free_by_rcu_ttrace_tail;
 	struct llist_head waiting_for_gp_ttrace;
 	atomic_t call_rcu_ttrace_in_progress;
 };
@@ -273,24 +274,27 @@ static void enque_to_free(struct bpf_mem_cache *c, void *obj)
 	/* bpf_mem_cache is a per-cpu object. Freeing happens in irq_work.
 	 * Nothing races to add to free_by_rcu_ttrace list.
 	 */
-	__llist_add(llnode, &c->free_by_rcu_ttrace);
+	if (__llist_add(llnode, &c->free_by_rcu_ttrace))
+		c->free_by_rcu_ttrace_tail = llnode;
 }
 
 static void do_call_rcu(struct bpf_mem_cache *c)
 {
-	struct llist_node *llnode, *t;
+	struct llist_node *llnode;
 
 	if (atomic_xchg(&c->call_rcu_ttrace_in_progress, 1))
 		return;
 
 	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp_ttrace));
-	llist_for_each_safe(llnode, t, __llist_del_all(&c->free_by_rcu_ttrace))
+	llnode = __llist_del_all(&c->free_by_rcu_ttrace);
+	if (llnode)
 		/* There is no concurrent __llist_add(waiting_for_gp_ttrace) access.
 		 * It doesn't race with llist_del_all either.
 		 * But there could be two concurrent llist_del_all(waiting_for_gp_ttrace):
 		 * from __free_rcu() and from drain_mem_cache().
 		 */
-		__llist_add(llnode, &c->waiting_for_gp_ttrace);
+		__llist_add_batch(llnode, c->free_by_rcu_ttrace_tail,
+				  &c->waiting_for_gp_ttrace);
 	/* Use call_rcu_tasks_trace() to wait for sleepable progs to finish.
 	 * If RCU Tasks Trace grace period implies RCU grace period, free
 	 * these elements directly, else use call_rcu() to wait for normal
