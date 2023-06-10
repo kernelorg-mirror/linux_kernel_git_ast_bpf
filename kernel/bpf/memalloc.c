@@ -336,7 +336,7 @@ static void do_call_rcu(struct bpf_mem_cache *c)
 
 	if (atomic_xchg(&cd->call_rcu_ttrace_in_progress, 1)) {
 		/* Move all objects from per-cpu list to common */
-		llnode = __llist_del_all(&c->free_by_rcu_ttrace);
+		llnode = llist_del_all(&c->free_by_rcu_ttrace);
 		if (llnode)
 			llist_add_batch(llnode, c->free_by_rcu_ttrace_tail,
 					&cd->common_free_by_rcu_ttrace);
@@ -350,7 +350,7 @@ static void do_call_rcu(struct bpf_mem_cache *c)
 	WRITE_ONCE(cd->waiting_for_gp_ttrace.first, llist_del_all(&cd->common_free_by_rcu_ttrace));
 
 	/* And add per-cpu objects */
-	llnode = __llist_del_all(&c->free_by_rcu_ttrace);
+	llnode = llist_del_all(&c->free_by_rcu_ttrace);
 	if (llnode)
 		llist_add_batch(llnode, c->free_by_rcu_ttrace_tail,
 				&cd->waiting_for_gp_ttrace);
@@ -394,7 +394,7 @@ static void __free_by_rcu(struct rcu_head *head)
 {
 	struct bpf_mem_cache *c = container_of(head, struct bpf_mem_cache, rcu);
 
-	if (__llist_add_batch(llist_del_all(&c->waiting_for_gp),
+	if (llist_add_batch(llist_del_all(&c->waiting_for_gp),
 			      c->waiting_for_gp_tail,
 			      &c->free_by_rcu_ttrace))
 		c->free_by_rcu_ttrace_tail = c->waiting_for_gp_tail;
@@ -587,7 +587,7 @@ static void drain_mem_cache(struct bpf_mem_cache *c)
 	 * Except for waiting_for_gp_ttrace list, there are no concurrent operations
 	 * on these lists, so it is safe to use __llist_del_all().
 	 */
-	free_all(__llist_del_all(&c->free_by_rcu_ttrace), percpu);
+	free_all(llist_del_all(&c->free_by_rcu_ttrace), percpu);
 	free_all(__llist_del_all(&c->free_llist), percpu);
 	free_all(__llist_del_all(&c->free_llist_extra), percpu);
 	free_all(__llist_del_all(&c->free_by_rcu), percpu);
