@@ -99,6 +99,15 @@ struct bpf_mem_cache {
 	int low_watermark, high_watermark, batch;
 	int percpu_size;
 
+	/* list of objects to be freed after RCU GP */
+	struct llist_head free_by_rcu;
+	struct llist_node *free_by_rcu_tail;
+	struct llist_head waiting_for_gp;
+	struct llist_node *waiting_for_gp_tail;
+	struct rcu_head rcu;
+	atomic_t call_rcu_in_progress;
+	struct llist_head free_llist_extra_rcu;
+
 	/* list of objects to be freed after RCU tasks trace GP */
 	struct llist_head free_by_rcu_ttrace;
 	struct llist_node *free_by_rcu_ttrace_tail;
@@ -381,6 +390,44 @@ static void free_bulk(struct bpf_mem_cache *c)
 	do_call_rcu(c);
 }
 
+static void __free_by_rcu(struct rcu_head *head)
+{
+	struct bpf_mem_cache *c = container_of(head, struct bpf_mem_cache, rcu);
+
+	if (__llist_add_batch(llist_del_all(&c->waiting_for_gp),
+			      c->waiting_for_gp_tail,
+			      &c->free_by_rcu_ttrace))
+		c->free_by_rcu_ttrace_tail = c->waiting_for_gp_tail;
+	atomic_set(&c->call_rcu_in_progress, 0);
+
+	/* Objects went through regular RCU GP. Send them to RCU tasks trace */
+	do_call_rcu(c);
+}
+
+static void check_free_by_rcu(struct bpf_mem_cache *c)
+{
+	struct llist_node *llnode, *t;
+
+	if (llist_empty(&c->free_by_rcu) && llist_empty(&c->free_llist_extra_rcu))
+		return;
+
+	/* drain free_llist_extra_rcu */
+	llist_for_each_safe(llnode, t, llist_del_all(&c->free_llist_extra_rcu))
+		if (__llist_add(llnode, &c->free_by_rcu))
+			c->free_by_rcu_tail = llnode;
+
+	if (atomic_xchg(&c->call_rcu_in_progress, 1)) {
+		rcu_request_urgent_qs_task(current);
+		return;
+	}
+
+	WARN_ON_ONCE(!llist_empty(&c->waiting_for_gp));
+
+	WRITE_ONCE(c->waiting_for_gp.first, __llist_del_all(&c->free_by_rcu));
+	c->waiting_for_gp_tail = c->free_by_rcu_tail;
+	call_rcu_hurry(&c->rcu, __free_by_rcu);
+}
+
 static void bpf_mem_refill(struct irq_work *work)
 {
 	struct bpf_mem_cache *c = container_of(work, struct bpf_mem_cache, refill_work);
@@ -395,6 +442,8 @@ static void bpf_mem_refill(struct irq_work *work)
 		alloc_bulk(c, c->batch, NUMA_NO_NODE);
 	else if (cnt > c->high_watermark)
 		free_bulk(c);
+
+	check_free_by_rcu(c);
 }
 
 static void notrace irq_work_raise(struct bpf_mem_cache *c)
@@ -541,6 +590,9 @@ static void drain_mem_cache(struct bpf_mem_cache *c)
 	free_all(__llist_del_all(&c->free_by_rcu_ttrace), percpu);
 	free_all(__llist_del_all(&c->free_llist), percpu);
 	free_all(__llist_del_all(&c->free_llist_extra), percpu);
+	free_all(__llist_del_all(&c->free_by_rcu), percpu);
+	free_all(__llist_del_all(&c->free_llist_extra_rcu), percpu);
+	free_all(llist_del_all(&c->waiting_for_gp), percpu);
 }
 
 static void drain_common_data(struct bpf_mem_common_data *cd)
@@ -634,6 +686,7 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 			 */
 			irq_work_sync(&c->refill_work);
 			drain_mem_cache(c);
+			rcu_in_progress += atomic_read(&c->call_rcu_in_progress);
 		}
 		cd = ma->com_data;
 		drain_common_data(cd);
@@ -651,6 +704,7 @@ void bpf_mem_alloc_destroy(struct bpf_mem_alloc *ma)
 				c = &cc->cache[i];
 				irq_work_sync(&c->refill_work);
 				drain_mem_cache(c);
+				rcu_in_progress += atomic_read(&c->call_rcu_in_progress);
 			}
 		}
 		for (i = 0; i < NUM_CACHES; i++) {
@@ -732,6 +786,25 @@ static void notrace unit_free(struct bpf_mem_cache *c, void *ptr)
 		irq_work_raise(c);
 }
 
+static void notrace unit_free_rcu(struct bpf_mem_cache *c, void *ptr)
+{
+	struct llist_node *llnode = ptr - LLIST_NODE_SZ;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	if (local_inc_return(&c->active) == 1) {
+		if (__llist_add(llnode, &c->free_by_rcu))
+			c->free_by_rcu_tail = llnode;
+	} else {
+		llist_add(llnode, &c->free_llist_extra_rcu);
+	}
+	local_dec(&c->active);
+	local_irq_restore(flags);
+
+	if (!atomic_read(&c->call_rcu_in_progress))
+		irq_work_raise(c);
+}
+
 /* Called from BPF program or from sys_bpf syscall.
  * In both cases migration is disabled.
  */
@@ -773,11 +846,15 @@ void notrace *bpf_mem_cache_alloc(struct bpf_mem_alloc *ma)
 	return !ret ? NULL : ret + LLIST_NODE_SZ;
 }
 
+static volatile int test = 1;
 void notrace bpf_mem_cache_free(struct bpf_mem_alloc *ma, void *ptr)
 {
 	if (!ptr)
 		return;
 
+	if (test)
+	unit_free_rcu(this_cpu_ptr(ma->cache), ptr);
+	else
 	unit_free(this_cpu_ptr(ma->cache), ptr);
 }
 
