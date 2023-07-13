@@ -629,6 +629,9 @@ static void set_signal_archinfo(unsigned long address,
 	tsk->thread.cr2 = address;
 }
 
+extern void *bpf_area;
+void bpf_fix_area(void *addr);
+
 static noinline void
 page_fault_oops(struct pt_regs *regs, unsigned long error_code,
 		unsigned long address)
@@ -686,6 +689,11 @@ page_fault_oops(struct pt_regs *regs, unsigned long error_code,
 	if (!(error_code & X86_PF_PROT) &&
 	    kfence_handle_page_fault(address, error_code & X86_PF_WRITE, regs))
 		return;
+	if (is_vmalloc_addr((void *)address) && (void *)address >= bpf_area && (void *)address <= bpf_area + (1<<30)) {
+		printk("fault at %lx\n", address);
+		bpf_fix_area(address);
+		return;
+	}
 
 oops:
 	/*

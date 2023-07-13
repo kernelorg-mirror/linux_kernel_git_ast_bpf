@@ -1092,6 +1092,33 @@ free_map_tab:
 	return ret;
 }
 
+int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
+			     pgprot_t prot, struct page **pages, unsigned int page_shift);
+
+void *bpf_area, *bpf_scratch;
+static DEFINE_SPINLOCK(area_lock);
+pte_t *lookup_address(unsigned long address, unsigned int *level);
+int vmap_set_pte_at(pte_t *pte, unsigned long addr, pgprot_t prot, struct page *page);
+
+void bpf_fix_area(void *addr)
+{
+	unsigned long flags;
+	struct page *page;
+	unsigned int level;
+	pte_t *pte;
+	int err;
+
+	spin_lock_irqsave(&area_lock, flags);
+	pte = lookup_address((long)addr, &level);
+
+	page = alloc_pages(GFP_ATOMIC, 0);
+	err = vmap_set_pte_at(pte, (long)addr, PAGE_KERNEL, page);
+	printk("page %px err %d\n", page, err);
+	if (err)
+		__free_page(page);
+	spin_unlock_irqrestore(&area_lock, flags);
+}
+
 #define BPF_MAP_CREATE_LAST_FIELD map_extra
 /* called via syscall */
 static int map_create(union bpf_attr *attr)
@@ -1102,6 +1129,19 @@ static int map_create(union bpf_attr *attr)
 	struct bpf_map *map;
 	int f_flags;
 	int err;
+	struct vm_struct *area;
+
+#define MM_SZ (1ULL << 32)
+
+	if (!bpf_area) {
+		area = get_vm_area(MM_SZ, VM_ALLOC);
+		err = vmap_pages_range_noflush((long)area->addr, (long)area->addr + MM_SZ,
+					       PAGE_KERNEL, NULL, PAGE_SHIFT);
+		printk("bpf_area %px err %d\n", area->addr, err);
+		bpf_scratch = bpf_area = area->addr;
+	}
+/*	*(u32 *)bpf_scratch = 0;
+	bpf_scratch += PAGE_SIZE;*/
 
 	err = CHECK_ATTR(BPF_MAP_CREATE);
 	if (err)
