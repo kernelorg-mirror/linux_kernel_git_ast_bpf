@@ -455,6 +455,18 @@ void vunmap_range(unsigned long addr, unsigned long end)
 	flush_tlb_kernel_range(addr, end);
 }
 
+int vmap_set_pte_at(pte_t *pte, unsigned long addr, pgprot_t prot, struct page *page)
+{
+	if (!pte_none(ptep_get(pte)))
+		return -EBUSY;
+
+	if (WARN_ON(!pfn_valid(page_to_pfn(page))))
+		return -EINVAL;
+
+	set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
+	return 0;
+}
+
 static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 		unsigned long end, pgprot_t prot, struct page **pages, int *nr,
 		pgtbl_mod_mask *mask)
@@ -470,18 +482,23 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 	if (!pte)
 		return -ENOMEM;
 	do {
-		struct page *page = pages[*nr];
+		struct page *page;
 
 		if (WARN_ON(!pte_none(ptep_get(pte))))
 			return -EBUSY;
+
+		/* Lazily-paged range, we're done */
+		if (!pages)
+			continue;
+
+		page = pages[*nr];
 		if (WARN_ON(!page))
 			return -ENOMEM;
 		if (WARN_ON(!pfn_valid(page_to_pfn(page))))
 			return -EINVAL;
 
 		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
-		(*nr)++;
-	} while (pte++, addr += PAGE_SIZE, addr != end);
+	} while ((*nr)++, pte++, addr += PAGE_SIZE, addr != end);
 	*mask |= PGTBL_PTE_MODIFIED;
 	return 0;
 }
@@ -582,9 +599,10 @@ int __vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 	unsigned int i, nr = (end - addr) >> PAGE_SHIFT;
 
 	WARN_ON(page_shift < PAGE_SHIFT);
+	WARN_ON(page_shift != PAGE_SHIFT && !pages);
 
 	if (!IS_ENABLED(CONFIG_HAVE_ARCH_HUGE_VMALLOC) ||
-			page_shift == PAGE_SHIFT)
+	    page_shift == PAGE_SHIFT || !pages)
 		return vmap_small_pages_range_noflush(addr, end, prot, pages);
 
 	for (i = 0; i < nr; i += 1U << (page_shift - PAGE_SHIFT)) {
