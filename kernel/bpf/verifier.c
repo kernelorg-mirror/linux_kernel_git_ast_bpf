@@ -11246,6 +11246,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		mark_reg_unknown(env, regs, BPF_REG_0);
 		mark_btf_func_reg_size(env, BPF_REG_0, t->size);
 	} else if (btf_type_is_ptr(t)) {
+		ptr_type = btf_type_by_id(desc_btf, t->type);
+		if (btf_type_is_type_tag(ptr_type) &&
+		    strcmp(btf_name_by_offset(desc_btf, ptr_type->name_off), "ptr32") == 0) {
+			mark_reg_known_zero(env, regs, BPF_REG_0);
+			regs[BPF_REG_0].type = PTR_TO_MEM32;
+			goto check_args;
+		}
 		ptr_type = btf_type_skip_modifiers(desc_btf, t->type, &ptr_type_id);
 
 		if (meta.btf == btf_vmlinux && btf_id_set_contains(&special_kfunc_set, meta.func_id)) {
@@ -11428,6 +11435,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+check_args:
 	nargs = btf_type_vlen(meta.func_proto);
 	args = (const struct btf_param *)(meta.func_proto + 1);
 	for (i = 0; i < nargs; i++) {
@@ -17572,6 +17580,10 @@ static int convert_ctx_accesses(struct bpf_verifier_env *env)
 					BPF_SIZE((insn)->code);
 				env->prog->aux->num_exentries++;
 			}
+			continue;
+		case PTR_TO_MEM32:
+			insn->code = BPF_CLASS(insn->code) | BPF_PROBE_MEM32 | BPF_SIZE(insn->code);
+			env->prog->aux->num_exentries++;
 			continue;
 		default:
 			continue;

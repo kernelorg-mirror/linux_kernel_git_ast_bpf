@@ -7034,6 +7034,13 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
 				continue;
 			}
 
+			ref_t = btf_type_by_id(btf, t->type);
+			if (btf_type_is_type_tag(ref_t) &&
+			    strcmp(__btf_name_by_offset(btf, ref_t->name_off), "ptr32") == 0) {
+				reg->type = PTR_TO_MEM32;
+				continue;
+			}
+
 			t = btf_type_skip_modifiers(btf, t->type, NULL);
 
 			ref_t = btf_resolve_size(btf, t, &reg->mem_size);
