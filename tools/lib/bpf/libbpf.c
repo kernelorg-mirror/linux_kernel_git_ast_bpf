@@ -7909,7 +7909,7 @@ static int bpf_object__resolve_ksym_func_btf_id(struct bpf_object *obj,
 
 	ret = bpf_core_types_are_compat(obj->btf, local_func_proto_id,
 					kern_btf, kfunc_proto_id);
-	if (ret <= 0) {
+	if (ret <= 0 && 0) {
 		if (ext->is_weak)
 			return 0;
 

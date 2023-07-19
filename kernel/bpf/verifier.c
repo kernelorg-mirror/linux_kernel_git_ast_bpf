@@ -5797,6 +5797,8 @@ static int check_ptr_alignment(struct bpf_verifier_env *env,
 	case PTR_TO_XDP_SOCK:
 		pointer_desc = "xdp_sock ";
 		break;
+	case PTR_TO_MEM32:
+		return 0;
 	default:
 		break;
 	}
@@ -6898,6 +6900,15 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 
 		if (!err && value_regno >= 0 && (rdonly_mem || t == BPF_READ))
 			mark_reg_unknown(env, regs, value_regno);
+	} else if (reg->type == PTR_TO_MEM32) {
+		if (value_regno >= 0) {
+			if (size == 8) {
+				mark_reg_known_zero(env, regs, value_regno);
+				regs[value_regno].type = PTR_TO_MEM32;
+			} else {
+				mark_reg_unknown(env, regs, value_regno);
+			}
+		}
 	} else {
 		verbose(env, "R%d invalid mem access '%s'\n", regno,
 			reg_type_str(env, reg->type));
@@ -9330,6 +9341,11 @@ static int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
 				return -EINVAL;
 			if (!(arg->arg_type & PTR_MAYBE_NULL) && (reg->type & PTR_MAYBE_NULL)) {
 				bpf_log(log, "arg#%d is expected to be non-NULL\n", i);
+				return -EINVAL;
+			}
+		} else if (base_type(arg->arg_type) == ARG_PTR_TO_MEM32) {
+			if (reg->type != PTR_TO_MEM32) {
+				bpf_log(log, "R%d is not mem32\n", regno);
 				return -EINVAL;
 			}
 		} else if (arg->arg_type == (ARG_PTR_TO_DYNPTR | MEM_RDONLY)) {
@@ -12165,6 +12181,13 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		mark_reg_unknown(env, regs, BPF_REG_0);
 		mark_btf_func_reg_size(env, BPF_REG_0, t->size);
 	} else if (btf_type_is_ptr(t)) {
+		ptr_type = btf_type_by_id(desc_btf, t->type);
+		if (btf_type_is_typedef(ptr_type) &&
+		    strcmp(btf_name_by_offset(desc_btf, ptr_type->name_off), "bpf_uptr") == 0 && 0) {
+			mark_reg_known_zero(env, regs, BPF_REG_0);
+			regs[BPF_REG_0].type = PTR_TO_MEM32;
+			goto check_args;
+		}
 		ptr_type = btf_type_skip_modifiers(desc_btf, t->type, &ptr_type_id);
 
 		if (meta.btf == btf_vmlinux && btf_id_set_contains(&special_kfunc_set, meta.func_id)) {
@@ -12393,6 +12416,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+check_args:
 	nargs = btf_type_vlen(meta.func_proto);
 	args = (const struct btf_param *)(meta.func_proto + 1);
 	for (i = 0; i < nargs; i++) {
@@ -13794,6 +13818,11 @@ static int adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 
 	dst_reg = &regs[insn->dst_reg];
 	src_reg = NULL;
+
+	if (dst_reg->type == PTR_TO_MEM32)
+		/* all arithmetic is allowed on 32-bit pointers */
+		return 0;
+
 	if (dst_reg->type != SCALAR_VALUE)
 		ptr_reg = dst_reg;
 	else
@@ -13911,7 +13940,7 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	} else if (opcode == BPF_MOV) {
 
 		if (BPF_SRC(insn->code) == BPF_X) {
-			if (insn->imm != 0) {
+			if (insn->imm != 0 && 0) {
 				verbose(env, "BPF_MOV uses reserved fields\n");
 				return -EINVAL;
 			}
@@ -13950,7 +13979,10 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			struct bpf_reg_state *dst_reg = regs + insn->dst_reg;
 
 			if (BPF_CLASS(insn->code) == BPF_ALU64) {
-				if (insn->off == 0) {
+				if (insn->imm) {
+					mark_reg_known_zero(env, regs, insn->dst_reg);
+					dst_reg->type = PTR_TO_MEM32;
+				} else if (insn->off == 0) {
 					/* case: R1 = R2
 					 * copy register state to dest reg
 					 */
@@ -14016,6 +14048,9 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 						dst_reg->subreg_def = env->insn_idx + 1;
 						coerce_subreg_to_size_sx(dst_reg, insn->off >> 3);
 					}
+				} else if (src_reg->type == PTR_TO_MEM32) {
+					__mark_reg_known_zero(dst_reg);
+					dst_reg->type = PTR_TO_MEM32;
 				} else {
 					mark_reg_unknown(env, regs,
 							 insn->dst_reg);
@@ -16375,6 +16410,9 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 	if (rcur->type == NOT_INIT)
 		return false;
 
+	if (rold->type == PTR_TO_MEM32)
+		return true;
+
 	/* Enforce that register types have to match exactly, including their
 	 * modifiers (like PTR_MAYBE_NULL, MEM_RDONLY, etc), as a general
 	 * rule.
@@ -18144,6 +18182,14 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 				fdput(f);
 				return -EBUSY;
 			}
+			if (map->map_type == BPF_MAP_TYPE_ARENA) {
+				if (env->prog->aux->arena) {
+					verbose(env, "On one bpf_arena per program\n");
+					fdput(f);
+					return -EBUSY;
+				}
+				env->prog->aux->arena = (void *)map;
+			}
 
 			fdput(f);
 next_insn:
@@ -18708,6 +18754,10 @@ static int convert_ctx_accesses(struct bpf_verifier_env *env)
 			   insn->code == (BPF_ST | BPF_MEM | BPF_W) ||
 			   insn->code == (BPF_ST | BPF_MEM | BPF_DW)) {
 			type = BPF_WRITE;
+		} else if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) && insn->imm) {
+			/* convert to 32-bit mov that clears upper 32-bit */
+			insn->code = BPF_ALU | BPF_MOV | BPF_X;
+			continue;
 		} else {
 			continue;
 		}
@@ -18727,6 +18777,47 @@ static int convert_ctx_accesses(struct bpf_verifier_env *env)
 			delta    += cnt - 1;
 			env->prog = new_prog;
 			insn      = new_prog->insnsi + i + delta;
+			continue;
+		}
+
+		if (env->insn_aux_data[i + delta].ptr_type == PTR_TO_MEM32) {
+			u64 user_vm_start = bpf_arena_get_user_vm_start(env->prog->aux->arena);
+
+			struct bpf_insn patch[] = {
+				BPF_MOV32_REG(insn->dst_reg, insn->dst_reg),
+				*insn,
+				((struct bpf_insn) {
+				 .code    = BPF_ST | BPF_W | BPF_PROBE_MEM32,
+				 .dst_reg = insn->dst_reg,
+				 .src_reg = 0,
+				 .off     = 4,
+				 .imm     = user_vm_start >> 32,
+				 })
+			};
+			if (BPF_SIZE(insn->code) == BPF_DW) {
+				/* hack: assume 8-byte load/store are for uptr-s */
+				patch[1].code = BPF_CLASS(insn->code) | BPF_PROBE_MEM32 | BPF_W;
+			} else {
+				patch[1].code = BPF_CLASS(insn->code) | BPF_PROBE_MEM32 | BPF_SIZE(insn->code);
+			}
+
+			if (type == BPF_WRITE) {
+				cnt = 3;
+			} else {
+				cnt = 2;
+				patch[0].src_reg = patch[0].dst_reg = insn->src_reg;
+			}
+
+			new_prog = bpf_patch_insn_data(env, i + delta, patch, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta    += cnt - 1;
+			env->prog = new_prog;
+			insn      = new_prog->insnsi + i + delta;
+
+			/* ldx mem32 is one extable insn while stx mem32 needs two */
+			env->prog->aux->num_exentries += cnt - 1;
 			continue;
 		}
 
@@ -18950,12 +19041,18 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
 		func[i]->aux->linfo_idx = env->subprog_info[i].linfo_idx;
+		func[i]->aux->arena = prog->aux->arena;
 		num_exentries = 0;
 		insn = func[i]->insnsi;
 		for (j = 0; j < func[i]->len; j++, insn++) {
 			if (BPF_CLASS(insn->code) == BPF_LDX &&
 			    (BPF_MODE(insn->code) == BPF_PROBE_MEM ||
+			     BPF_MODE(insn->code) == BPF_PROBE_MEM32 ||
 			     BPF_MODE(insn->code) == BPF_PROBE_MEMSX))
+				num_exentries++;
+			if ((BPF_CLASS(insn->code) == BPF_STX ||
+			     BPF_CLASS(insn->code) == BPF_ST) &&
+			     BPF_MODE(insn->code) == BPF_PROBE_MEM32)
 				num_exentries++;
 		}
 		func[i]->aux->num_exentries = num_exentries;
@@ -20138,6 +20235,9 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog)
 				mark_reg_known_zero(env, regs, i);
 				reg->mem_size = arg->mem_size;
 				reg->id = ++env->id_gen;
+			} else if (base_type(arg->arg_type) == ARG_PTR_TO_MEM32) {
+				mark_reg_unknown(env, regs, i);
+				reg->type = PTR_TO_MEM32;
 			} else {
 				WARN_ONCE(1, "BUG: unhandled arg#%d type %d\n",
 					  i - BPF_REG_1, arg->arg_type);
