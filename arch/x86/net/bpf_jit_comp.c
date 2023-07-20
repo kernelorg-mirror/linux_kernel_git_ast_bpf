@@ -1080,6 +1080,9 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
 		      bpf_prog->aux->func_idx != 0);
 	push_callee_regs(&prog, callee_regs_used);
+	EMIT2(0x41, 0x54);   /* push r12 */
+	emit_mov_imm64(&prog, X86_REG_R12, (long) bpf_prog->aux->ptr32_area >> 32,
+		       (u32) (long) bpf_prog->aux->ptr32_area);
 
 	ilen = prog - temp;
 	if (rw_image)
@@ -1940,6 +1943,7 @@ emit_jmp:
 			seen_exit = true;
 			/* Update cleanup_addr */
 			ctx->cleanup_addr = proglen;
+			EMIT2(0x41, 0x5C);   /* pop r12 */
 			pop_callee_regs(&prog, callee_regs_used);
 			EMIT1(0xC9);         /* leave */
 			emit_return(&prog, image + addrs[i - 1] + (prog - temp));

@@ -2402,6 +2402,17 @@ __bpf_kfunc void bpf_rcu_read_unlock(void)
 	rcu_read_unlock();
 }
 
+typedef u32 bpf_ptr32;
+
+__bpf_kfunc bpf_ptr32 *bpf_alloc32(u32 size)
+{
+	return (void *)4096;
+}
+
+__bpf_kfunc void bpf_free32(bpf_ptr32 *ptr)
+{
+}
+
 __diag_pop();
 
 BTF_SET8_START(generic_btf_ids)
@@ -2460,6 +2471,8 @@ BTF_ID_FLAGS(func, bpf_dynptr_is_null)
 BTF_ID_FLAGS(func, bpf_dynptr_is_rdonly)
 BTF_ID_FLAGS(func, bpf_dynptr_size)
 BTF_ID_FLAGS(func, bpf_dynptr_clone)
+BTF_ID_FLAGS(func, bpf_alloc32)
+BTF_ID_FLAGS(func, bpf_free32)
 BTF_SET8_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {
