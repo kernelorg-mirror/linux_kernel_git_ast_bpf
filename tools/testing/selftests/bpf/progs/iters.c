@@ -716,4 +716,551 @@ int iter_pass_iter_ptr_to_subprog(const void *ctx)
 	return 0;
 }
 
+SEC("fentry/" SYS_PREFIX "sys_nanosleep")
+__failure
+__msg("21: (79) r8 = *(u64 *)(r0 +0)")
+__msg("invalid read from stack R0 off=-32 size=8")
+__naked int iter_precision_fixed_point1(void)
+{
+	/* This is equivalent to C program below.
+	 * The call to bpf_iter_num_next() is reachable with r7 values -16 and -32.
+	 * State with r7=-16 is visited first, at which point r7 has no read mark
+	 * and is not marked precise.
+	 * State with r7=-32 is visited second, iterator convergence logic must
+	 * figure out that r7=-16 and r7=-32 states are different, otherwise
+	 * the program would be considered safe.
+	 *
+	 * r8 = 0
+	 * fp[-16] = 0
+	 * r7 = -16
+	 * r6 = bpf_get_current_pid_tgid()
+	 * bpf_iter_num_new(&fp[-8], 0, 10)
+	 * while (bpf_iter_num_next(&fp[-8])) {
+	 *   if (r6 != 42) {
+	 *     r7 = -32
+	 *     r6 = bpf_get_current_pid_tgid()
+	 *     continue;
+	 *   }
+	 *   r0 = r10
+	 *   r0 += r7
+	 *   r8 = *(u64 *)(r0 + 0)
+	 *   r6 = bpf_get_current_pid_tgid()
+	 * }
+	 * bpf_iter_num_destroy(&fp[-8])
+	 * return r8
+	 */
+	asm volatile (
+		"r8 = 0;"
+		"*(u64 *)(r10 - 16) = r8;"
+		"r7 = -16;"
+		"call %[bpf_get_current_pid_tgid];"
+		"r6 = r0;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+	"1:"
+		"r1 = r10;"
+		"r1 += -8;\n"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto 2f;"
+		"if r6 != 42 goto 3f;"
+		"r7 = -32;"
+		"call %[bpf_get_current_pid_tgid];"
+		"r6 = r0;"
+		"goto 1b;\n"
+	"3:"
+		"r0 = r10;"
+		"r0 += r7;"
+		"r8 = *(u64 *)(r0 + 0);"
+		"call %[bpf_get_current_pid_tgid];"
+		"r6 = r0;"
+		"goto 1b;\n"
+	"2:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = r8;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_pid_tgid),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy),
+		  __imm(bpf_probe_read_user)
+		: __clobber_all
+	);
+}
+
+SEC("fentry/" SYS_PREFIX "sys_nanosleep")
+__failure
+__msg("R1 type=scalar expected=fp")
+int iter_precision_fixed_point2(const void *ctx) {
+    struct bpf_iter_num it;
+    __u64 val = 0;
+    __u64 *ptr = &val;
+    __u64 rnd = bpf_get_current_pid_tgid();
+
+    bpf_iter_num_new(&it, 0, 10);
+    while (bpf_iter_num_next(&it)) {
+         rnd++;
+         if (rnd == 42) {
+             ptr = (void*)(0xdead);
+             continue;
+         }
+         if (!bpf_iter_num_next(&it))
+             break;
+         bpf_probe_read_user(ptr, 8, (void*)(0xdeadbeef));
+     }
+     bpf_iter_num_destroy(&it);
+     return 0;
+}
+
+SEC("fentry/" SYS_PREFIX "sys_nanosleep")
+__success
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked int loop_after_conditional(void)
+{
+	asm volatile (
+		"call %[bpf_get_current_pid_tgid];"
+		"r1 = 0;"
+		"if r0 > 42 goto +1;"
+		"r1 = 7;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+	"1:"
+		"r1 = r10;"
+		"r1 += -8;\n"
+		"call %[bpf_iter_num_next];"
+		"if r0 != 0 goto 1b;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_current_pid_tgid),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy),
+		  __imm(bpf_probe_read_user)
+		: __clobber_all
+	);
+}
+
+SEC("?raw_tp")
+__failure
+__msg("misaligned stack access off (0x0; 0x0)+-25+0")
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked int loop_state_deps1(void)
+{
+	/*
+	 *   j = iter_new();             // fp[-16]
+	 *   a = 0;                      // r6
+	 *   b = 0;                      // r7
+	 *   c = -24;                    // r8
+	 *   while (iter_next(j)) {
+	 *     i = iter_new();           // fp[-8]
+	 *     a = 0;                    // r6
+	 *     b = 0;                    // r7
+	 *     while (iter_next(i)) {
+	 *       if (a == 1) {
+	 *         a = 0;
+	 *         b = 1;
+	 *       } else if (a == 0) {
+	 *         a = 1;
+	 *         if (random() == 42)
+	 *           continue;
+	 *         if (b == 1) {
+	 *           *(r10 + c) = 7;
+	 *           iter_destroy(i);
+	 *           iter_destroy(j);
+	 *           return;
+	 *         }
+	 *       }
+	 *     }
+	 *     iter_destroy(i);
+	 *     a = 0;
+	 *     b = 0;
+	 *     c = -25;
+	 *   }
+	 *   iter_destroy(j);
+	 *   return;
+	 */
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -16;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+		"r6 = 0;"
+		"r7 = 0;"
+		"r8 = -24;"
+	"j_loop_%=:"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto j_loop_end_%=;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+		"r6 = 0;"
+		"r7 = 0;"
+	"i_loop_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto i_loop_end_%=;"
+	"check_one_r6_%=:"
+		"if r6 != 1 goto check_zero_r6_%=;"
+		"r6 = 0;"
+		"r7 = 1;"
+		"goto i_loop_%=;"
+	"check_zero_r6_%=:"
+		"if r6 != 0 goto i_loop_%=;"
+		"r6 = 1;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 != 42 goto check_one_r7_%=;"
+		"goto i_loop_%=;"
+	"check_one_r7_%=:"
+		"if r7 != 1 goto i_loop_%=;"
+		"r0 = r10;"
+		"r0 += r8;"
+		"r1 = 7;"
+		"*(u64 *)(r0 + 0) = r1;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+	"i_loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r6 = 0;"
+		"r7 = 0;"
+		"r8 = -25;"
+		"goto j_loop_%=;"
+	"j_loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_prandom_u32),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy)
+		: __clobber_all
+	);
+}
+
+SEC("?raw_tp")
+__failure
+__msg("misaligned stack access off (0x0; 0x0)+-25+0")
+__flag(BPF_F_TEST_STATE_FREQ)
+__naked int loop_state_deps2(void)
+{
+	/*
+	 *   j = iter_new();             // fp[-16]
+	 *   a = 0;                      // r6
+	 *   b = 0;                      // r7
+	 *   c = -24;                    // r8
+	 *   while (iter_next(j)) {
+	 *     i = iter_new();           // fp[-8]
+	 *     a = 0;                    // r6
+	 *     b = 0;                    // r7
+	 *     while (iter_next(i)) {
+	 *       if (a == 1) {
+	 *         a = 0;
+	 *         b = 1;
+	 *       } else if (a == 0) {
+	 *         a = 1;
+	 *         if (random() == 42)
+	 *           continue;
+	 *         if (b == 1) {
+	 *           *(r10 + c) = 7;
+	 *           iter_destroy(i);
+	 *           iter_destroy(j);
+	 *           return;
+	 *         }
+	 *       }
+	 *     }
+	 *     iter_destroy(i);
+	 *     i = iter_new();           // fp[-8]
+	 *     a = 0;                    // r6
+	 *     b = 0;                    // r7
+	 *     while (iter_next(i)) {
+	 *       if (a == 1) {
+	 *         a = 0;
+	 *         b = 1;
+	 *       } else if (a == 0) {
+	 *         a = 1;
+	 *         if (random() == 42)
+	 *           continue;
+	 *         if (b == 1) {
+	 *           a = 0;
+	 *           c = -25;
+	 *         }
+	 *       }
+	 *     }
+	 *     iter_destroy(i);
+	 *   }
+	 *   iter_destroy(j);
+	 *   return;
+	 */
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -16;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+		"r6 = 0;"
+		"r7 = 0;"
+		"r8 = -24;"
+	"j_loop_%=:"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto j_loop_end_%=;"
+
+		/* first inner loop */
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+		"r6 = 0;"
+		"r7 = 0;"
+	"i_loop_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto i_loop_end_%=;"
+	"check_one_r6_%=:"
+		"if r6 != 1 goto check_zero_r6_%=;"
+		"r6 = 0;"
+		"r7 = 1;"
+		"goto i_loop_%=;"
+	"check_zero_r6_%=:"
+		"if r6 != 0 goto i_loop_%=;"
+		"r6 = 1;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 != 42 goto check_one_r7_%=;"
+		"goto i_loop_%=;"
+	"check_one_r7_%=:"
+		"if r7 != 1 goto i_loop_%=;"
+		"r0 = r10;"
+		"r0 += r8;"
+		"r1 = 7;"
+		"*(u64 *)(r0 + 0) = r1;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+	"i_loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+
+		/* second inner loop */
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+		"r6 = 0;"
+		"r7 = 0;"
+	"i2_loop_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto i2_loop_end_%=;"
+	"check2_one_r6_%=:"
+		"if r6 != 1 goto check2_zero_r6_%=;"
+		"r6 = 0;"
+		"r7 = 1;"
+		"goto i2_loop_%=;"
+	"check2_zero_r6_%=:"
+		"if r6 != 0 goto i2_loop_%=;"
+		"r6 = 1;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 != 42 goto check2_one_r7_%=;"
+		"goto i2_loop_%=;"
+	"check2_one_r7_%=:"
+		"if r7 != 1 goto i2_loop_%=;"
+		"r6 = 0;"
+		"r8 = -25;"
+		"goto i2_loop_%=;"
+	"i2_loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+
+		"r6 = 0;"
+		"r7 = 0;"
+		"goto j_loop_%=;"
+	"j_loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -16;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_prandom_u32),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy)
+		: __clobber_all
+	);
+}
+
+SEC("fentry/" SYS_PREFIX "sys_nanosleep")
+__failure __msg("type=scalar expected=fp")
+__naked int num_iter_bug(const void *ctx)
+{
+        asm volatile (
+                // r7 = &fp[-16]
+                // fp[-16] = 0
+                "r7 = r10;"
+                "r7 += -16;"
+                "r0 = 0;"
+                "*(u64 *)(r7 + 0) = r0;"
+                // r6 = bpf_get_current_pid_tgid()
+                "call %[bpf_get_current_pid_tgid];"
+                "r6 = r0;"
+                // bpf_iter_num_new(&fp[-8], 0, 10)
+                "r1 = r10;"
+                "r1 += -8;"
+                "r2 = 0;"
+                "r3 = 10;"
+                "call %[bpf_iter_num_new];"
+                // while (bpf_iter_num_next(&fp[-8])) {
+                //   r6++
+                //   if (r6 != 42) {
+                //     r7 = 0xdead
+                //     continue;
+                //   }
+                //   bpf_probe_read_user(r7, 8, 0xdeadbeef)
+                // }
+        "1:"
+                "r1 = r10;"
+                "r1 += -8;"
+                "call %[bpf_iter_num_next];"
+                "if r0 == 0 goto 2f;"
+                "r6 += 1;"
+                "if r6 != 42 goto 3f;"
+                "r7 = 0xdead;"
+                "goto 1b;"
+        "3:"
+                "r1 = r7;"
+                "r2 = 8;"
+                "r3 = 0xdeadbeef;"
+                "call %[bpf_probe_read_user];"
+                "goto 1b;"
+        "2:"
+                // bpf_iter_num_destroy(&fp[-8])
+                "r1 = r10;"
+                "r1 += -8;"
+                "call %[bpf_iter_num_destroy];"
+                // return 0
+                "r0 = 0;"
+                "exit;"
+                :
+                : __imm(bpf_get_current_pid_tgid),
+                  __imm(bpf_iter_num_new),
+                  __imm(bpf_iter_num_next),
+                  __imm(bpf_iter_num_destroy),
+                  __imm(bpf_probe_read_user)
+                : __clobber_all
+        );
+}
+
+SEC("?raw_tp")
+__success
+__naked int loop1(void)
+{
+        asm volatile (
+                "r1 = r10;"
+                "r1 += -8;"
+                "r2 = 0;"
+                "r3 = 10;"
+                "call %[bpf_iter_num_new];"
+        "loop_%=:"
+                "r1 = r10;"
+                "r1 += -8;"
+                "call %[bpf_iter_num_next];"
+                "if r0 == 0 goto loop_end_%=;"
+                "call %[bpf_get_prandom_u32];"
+                "if r0 != 42 goto loop_%=;"
+                "r0 += 0;"
+                "goto loop_%=;"
+        "loop_end_%=:"
+                "r1 = r10;"
+                "r1 += -8;"
+                "call %[bpf_iter_num_destroy];"
+                "r0 = 0;"
+                "exit;"
+                :
+                : __imm(bpf_get_prandom_u32),
+                  __imm(bpf_iter_num_new),
+                  __imm(bpf_iter_num_next),
+                  __imm(bpf_iter_num_destroy)
+                : __clobber_all
+        );
+}
+
+SEC("?raw_tp")
+__success
+__naked int hydra1(void)
+{
+	asm volatile (
+		"r1 = r10;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"r3 = 10;"
+		"call %[bpf_iter_num_new];"
+	"loop_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_next];"
+		"if r0 == 0 goto loop_end_%=;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 != 42 goto loop_%=;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 != 42 goto loop_%=;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 != 42 goto loop_%=;"
+		"r0 += 0;"
+		"goto loop_%=;"
+	"loop_end_%=:"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call %[bpf_iter_num_destroy];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_get_prandom_u32),
+		  __imm(bpf_iter_num_new),
+		  __imm(bpf_iter_num_next),
+		  __imm(bpf_iter_num_destroy)
+		: __clobber_all
+	);
+}
+
 char _license[] SEC("license") = "GPL";
