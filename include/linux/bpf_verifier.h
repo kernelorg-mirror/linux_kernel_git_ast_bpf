@@ -369,6 +369,7 @@ struct bpf_verifier_state {
 	u32 branches;
 	u32 insn_idx;
 	u32 curframe;
+	int delayed;
 
 	struct bpf_active_lock active_lock;
 	bool speculative;
@@ -571,6 +572,11 @@ struct bpf_idset {
 	u32 ids[BPF_ID_MAP_SIZE];
 };
 
+struct bpf_verifier_state_stack {
+	struct bpf_verifier_stack_elem *head; /* stack of verifier states to be processed */
+	int size;                             /* number of states to be processed */
+};
+
 /* single container for all structs
  * one verifier_env per bpf_check() call
  */
@@ -579,8 +585,7 @@ struct bpf_verifier_env {
 	u32 prev_insn_idx;
 	struct bpf_prog *prog;		/* eBPF program being verified */
 	const struct bpf_verifier_ops *ops;
-	struct bpf_verifier_stack_elem *head; /* stack of verifier states to be processed */
-	int stack_size;			/* number of states to be processed */
+	struct bpf_verifier_state_stack stack;
 	bool strict_alignment;		/* perform strict pointer alignment checks */
 	bool test_state_freq;		/* test verifier with different pruning frequency */
 	struct bpf_verifier_state *cur_state; /* current verifier state */

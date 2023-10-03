@@ -178,6 +178,7 @@ struct bpf_verifier_stack_elem {
 	struct bpf_verifier_stack_elem *next;
 	/* length of verifier log at the time this state was pushed on stack */
 	u32 log_pos;
+	u32 loop_start;
 };
 
 #define BPF_COMPLEXITY_LIMIT_JMP_SEQ	8192
@@ -1765,6 +1766,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->parent = src->parent;
 	dst_state->first_insn_idx = src->first_insn_idx;
 	dst_state->last_insn_idx = src->last_insn_idx;
+	dst_state->delayed = src->delayed;
 	for (i = 0; i <= src->curframe; i++) {
 		dst = dst_state->frame[i];
 		if (!dst) {
@@ -1785,6 +1787,9 @@ static void update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifi
 	while (st) {
 		u32 br = --st->branches;
 
+		verbose(env, "update_br %lx branches=%d\n",
+			((long)st) >> 3 & 0xFFFF, st->branches);
+
 		/* WARN_ON(br > 1) technically makes sense here,
 		 * but see comment in push_stack(), hence:
 		 */
@@ -1797,20 +1802,23 @@ static void update_branch_counts(struct bpf_verifier_env *env, struct bpf_verifi
 	}
 }
 
-static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
-		     int *insn_idx, bool pop_log)
+static int pop_stack(struct bpf_verifier_env *env,
+		     int *prev_insn_idx, int *insn_idx, bool pop_log)
 {
+	struct bpf_verifier_state_stack *stack = &env->stack;
 	struct bpf_verifier_state *cur = env->cur_state;
-	struct bpf_verifier_stack_elem *elem, *head = env->head;
+	struct bpf_verifier_stack_elem *elem, *head = stack->head;
 	int err;
 
-	if (env->head == NULL)
+	if (stack->head == NULL)
 		return -ENOENT;
 
 	if (cur) {
 		err = copy_verifier_state(cur, &head->st);
 		if (err)
 			return err;
+		verbose(env, "%d: pop_stack %lx branches=%d\n", head->insn_idx,
+			((long)&head->st) >> 3 & 0xFFFF, cur->branches);
 	}
 	if (pop_log)
 		bpf_vlog_reset(&env->log, head->log_pos);
@@ -1821,17 +1829,18 @@ static int pop_stack(struct bpf_verifier_env *env, int *prev_insn_idx,
 	elem = head->next;
 	free_verifier_state(&head->st, false);
 	kfree(head);
-	env->head = elem;
-	env->stack_size--;
+	stack->head = elem;
+	stack->size--;
 	return 0;
 }
 
-static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
-					     int insn_idx, int prev_insn_idx,
-					     bool speculative)
+static struct bpf_verifier_state *__push_stack(struct bpf_verifier_env *env,
+					       int insn_idx, int prev_insn_idx,
+					       bool speculative, u32 iter_ref_id)
 {
+	struct bpf_verifier_state_stack *stack = &env->stack;
 	struct bpf_verifier_state *cur = env->cur_state;
-	struct bpf_verifier_stack_elem *elem;
+	struct bpf_verifier_stack_elem *elem, *e, **pprev;
 	int err;
 
 	elem = kzalloc(sizeof(struct bpf_verifier_stack_elem), GFP_KERNEL);
@@ -1840,17 +1849,30 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 
 	elem->insn_idx = insn_idx;
 	elem->prev_insn_idx = prev_insn_idx;
-	elem->next = env->head;
+
+	pprev = &stack->head;
+	e = *pprev;
+	if (iter_ref_id) {
+		/* Find where iter_ref_id started the loop */
+		while (e && e->loop_start != iter_ref_id) {
+			pprev = &e->next;
+			e = e->next;
+		}
+	}
+	elem->next = e;
 	elem->log_pos = env->log.end_pos;
-	env->head = elem;
-	env->stack_size++;
+	*pprev = elem;
+	stack->size++;
 	err = copy_verifier_state(&elem->st, cur);
 	if (err)
 		goto err;
+	verbose(env, "%d: push_stack %lx branches=%d parent %lx\n", insn_idx,
+		((long)&elem->st) >> 3 & 0xFFFF, cur->branches,
+		((long)elem->st.parent) >> 3 & 0xFFFF);
 	elem->st.speculative |= speculative;
-	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
+	if (stack->size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
 		verbose(env, "The sequence of %d jumps is too complex.\n",
-			env->stack_size);
+			stack->size);
 		goto err;
 	}
 	if (elem->st.parent) {
@@ -1872,6 +1894,20 @@ err:
 	/* pop all elements and return */
 	while (!pop_stack(env, NULL, NULL, false));
 	return NULL;
+}
+
+static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
+					     int insn_idx, int prev_insn_idx,
+					     bool speculative)
+{
+	return __push_stack(env, insn_idx, prev_insn_idx, speculative, 0);
+}
+
+static struct bpf_verifier_state *push_stack_at(struct bpf_verifier_env *env,
+						int insn_idx, int prev_insn_idx,
+						u32 iter_ref_id)
+{
+	return __push_stack(env, insn_idx, prev_insn_idx, false, iter_ref_id);
 }
 
 #define CALLER_SAVED_REGS 6
@@ -2376,14 +2412,14 @@ static struct bpf_verifier_state *push_async_cb(struct bpf_verifier_env *env,
 
 	elem->insn_idx = insn_idx;
 	elem->prev_insn_idx = prev_insn_idx;
-	elem->next = env->head;
+	elem->next = env->stack.head;
 	elem->log_pos = env->log.end_pos;
-	env->head = elem;
-	env->stack_size++;
-	if (env->stack_size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
+	env->stack.head = elem;
+	env->stack.size++;
+	if (env->stack.size > BPF_COMPLEXITY_LIMIT_JMP_SEQ) {
 		verbose(env,
 			"The sequence of %d jumps is too complex for async cb.\n",
-			env->stack_size);
+			env->stack.size);
 		goto err;
 	}
 	/* Unlike push_stack() do not copy_verifier_state().
@@ -7737,6 +7773,15 @@ static int process_iter_next_call(struct bpf_verifier_env *env, int insn_idx,
 		queued_iter = &queued_st->frame[iter_frameno]->stack[iter_spi].spilled_ptr;
 		queued_iter->iter.state = BPF_ITER_STATE_ACTIVE;
 		queued_iter->iter.depth++;
+		if (env->stack.head->next && queued_iter->iter.depth == 1)
+			/* The first time iter_next() is called for this iterator
+			 * mark stack position with iter's ref_obj_id which is unique.
+			 *
+			 * If ->next is NULL the stack was empty before the verifier
+			 * started exploring iter_next(), so don't leave any mark.
+			 * Later push_stack_at() will place the state at the top of the stack.
+			 */
+			env->stack.head->next->loop_start = queued_iter->ref_obj_id;
 
 		queued_fr = queued_st->frame[queued_st->curframe];
 		mark_ptr_not_null_reg(&queued_fr->regs[BPF_REG_0]);
@@ -16315,8 +16360,8 @@ static int propagate_precision(struct bpf_verifier_env *env,
 	return 0;
 }
 
-static bool states_maybe_looping(struct bpf_verifier_state *old,
-				 struct bpf_verifier_state *cur)
+static bool all_regs_equal(struct bpf_verifier_state *old,
+			   struct bpf_verifier_state *cur)
 {
 	struct bpf_func_state *fold, *fcur;
 	int i, fr = cur->curframe;
@@ -16396,14 +16441,14 @@ static bool is_iter_next_insn(struct bpf_verifier_env *env, int insn_idx)
  *   }
  *
  */
-static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf_verifier_state *cur)
+static bool has_active_iters(struct bpf_verifier_state *cur)
 {
-	struct bpf_reg_state *slot, *cur_slot;
 	struct bpf_func_state *state;
+	struct bpf_reg_state *slot;
 	int i, fr;
 
-	for (fr = old->curframe; fr >= 0; fr--) {
-		state = old->frame[fr];
+	for (fr = cur->curframe; fr >= 0; fr--) {
+		state = cur->frame[fr];
 		for (i = 0; i < state->allocated_stack / BPF_REG_SIZE; i++) {
 			if (state->stack[i].slot_type[0] != STACK_ITER)
 				continue;
@@ -16412,9 +16457,7 @@ static bool iter_active_depths_differ(struct bpf_verifier_state *old, struct bpf
 			if (slot->iter.state != BPF_ITER_STATE_ACTIVE)
 				continue;
 
-			cur_slot = &cur->frame[fr]->stack[i].spilled_ptr;
-			if (cur_slot->iter.depth != slot->iter.depth)
-				return true;
+			return true;
 		}
 	}
 	return false;
@@ -16428,6 +16471,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	int i, j, err, states_cnt = 0;
 	bool force_new_state = env->test_state_freq || is_force_checkpoint(env, insn_idx);
 	bool add_new_state = force_new_state;
+	bool delay_incremented = false;
 
 	/* bpf progs typically have pruning point every 4 instructions
 	 * http://vger.kernel.org/bpfconf2019.html#session-1
@@ -16451,6 +16495,8 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		if (sl->state.insn_idx != insn_idx)
 			goto next;
 
+		verbose(env, "search %lx branches=%d ", ((long)&sl->state) >> 3 & 0xFFFF,
+			sl->state.branches);
 		if (sl->state.branches) {
 			struct bpf_func_state *frame = sl->state.frame[sl->state.curframe];
 
@@ -16470,7 +16516,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 				goto skip_inf_loop_check;
 			}
 			/* BPF open-coded iterators loop detection is special.
-			 * states_maybe_looping() logic is too simplistic in detecting
+			 * all_regs_equal() logic is too simplistic in detecting
 			 * states that *might* be equivalent, because it doesn't know
 			 * about ID remapping, so don't even perform it.
 			 * See process_iter_next_call() and iter_active_depths_differ()
@@ -16486,6 +16532,7 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					struct bpf_func_state *cur_frame;
 					struct bpf_reg_state *iter_state, *iter_reg;
 					int spi;
+					bool exact;
 
 					cur_frame = cur->frame[cur->curframe];
 					/* btf_check_iter_kfuncs() enforces that
@@ -16498,17 +16545,73 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 					 */
 					spi = __get_spi(iter_reg->off + iter_reg->var_off.value);
 					iter_state = &func(env, iter_reg)->stack[spi].spilled_ptr;
-					if (iter_state->iter.state == BPF_ITER_STATE_ACTIVE)
+					if (iter_state->iter.state != BPF_ITER_STATE_ACTIVE)
+						goto skip_inf_loop_check;
+
+					exact = all_regs_equal(&sl->state, cur);
+
+					if (env->log.level & BPF_LOG_LEVEL2) {
+						verbose(env, "%d: exact %d delay %d ", insn_idx, exact, cur->delayed);
+						print_verifier_state(env, cur->frame[cur->curframe], true);
+					}
+					if (exact)
+						/* Nothing to explore further. */
 						goto hit;
+
+					/* The current state looks equal to the visited state,
+					 * but the visited state might not have all liveness and
+					 * precision marks, so look further.
+					 */
+					if (sl->state.branches > 1 && cur->delayed < 2) {
+						/* branches > 1 means that one is looping and
+						 * at least one normal branch wasn't explored.
+						 * Keep exploring and make sure not to add
+						 * the state to the list otherwise at the next
+						 * iteration of the loop it may match exactly.
+						 */
+						if (!delay_incremented) {
+							/* Several states in the link list can match.
+							 * Increment once.
+							 */
+							delay_incremented = true;
+							cur->delayed++;
+						}
+						add_new_state = false;
+						goto miss;
+					}
+					/* The state has likely only one branch which is our looping backedge.
+					 * Reschedule it to be explored again at the start of the loop
+					 * identified by iter_state->ref_obj_id.
+					 */
+					if (cur->delayed >= 20)
+						/* It was explored */
+						goto hit;
+					new = push_stack_at(env, insn_idx, env->prev_insn_idx,
+							    iter_state->ref_obj_id);
+					new->delayed += 10;
+					env->insn_processed += 1;
+					if (env->log.level & BPF_LOG_LEVEL2) {
+						verbose(env, "delaying %d: d%d\n", insn_idx, cur->delayed);
+					}
+					/* Though liveness and precision may be incomplete
+					 * propagate it and update branch counts.
+					 */
+					goto hit;
 				}
 				goto skip_inf_loop_check;
 			}
 			/* attempt to detect infinite loop to avoid unnecessary doomed work */
-			if (states_maybe_looping(&sl->state, cur) &&
+			if (all_regs_equal(&sl->state, cur) &&
 			    states_equal(env, &sl->state, cur) &&
-			    !iter_active_depths_differ(&sl->state, cur)) {
+			    !has_active_iters(cur)) {
 				verbose_linfo(env, insn_idx, "; ");
 				verbose(env, "infinite loop detected at insn %d\n", insn_idx);
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "old: ");
+					print_verifier_state(env, sl->state.frame[sl->state.curframe], true);
+					verbose(env, "cur: ");
+					print_verifier_state(env, cur->frame[cur->curframe], true);
+				}
 				return -EINVAL;
 			}
 			/* if the verifier is processing a loop, avoid adding new state
@@ -16532,6 +16635,12 @@ skip_inf_loop_check:
 		}
 		if (states_equal(env, &sl->state, cur)) {
 hit:
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				verbose(env, "hit: ");
+				print_verifier_state(env, sl->state.frame[sl->state.curframe], true);
+				verbose(env, "cur: ");
+				print_verifier_state(env, cur->frame[cur->curframe], true);
+			}
 			sl->hit_cnt++;
 			/* reached equivalent register/stack state,
 			 * prune the search.
@@ -16570,7 +16679,8 @@ miss:
 		 * Higher numbers increase max_states_per_insn and verification time,
 		 * but do not meaningfully decrease insn_processed.
 		 */
-		if (sl->miss_cnt > sl->hit_cnt * 3 + 3) {
+		if (sl->miss_cnt > sl->hit_cnt * 3 + 3 &&
+		    !(is_force_checkpoint(env, insn_idx) && sl->state.branches > 0)) {
 			/* the state is unlikely to be useful. Remove it to
 			 * speed up verification
 			 */
@@ -16638,6 +16748,8 @@ next:
 		kfree(new_sl);
 		return err;
 	}
+	verbose(env, "%d: add_state %lx branches=%d\n", insn_idx, ((long)new) >> 3 & 0xFFFF, new->branches);
+
 	new->insn_idx = insn_idx;
 	WARN_ONCE(new->branches != 1,
 		  "BUG is_state_visited:branches_to_explore=%d insn %d\n", new->branches, insn_idx);
@@ -16779,7 +16891,7 @@ static int do_check(struct bpf_verifier_env *env)
 		insn = &insns[env->insn_idx];
 		class = BPF_CLASS(insn->code);
 
-		if (++env->insn_processed > BPF_COMPLEXITY_LIMIT_INSNS) {
+		if (++env->insn_processed > 3000) {//BPF_COMPLEXITY_LIMIT_INSNS) {
 			verbose(env,
 				"BPF program is too large. Processed %d insn\n",
 				env->insn_processed);
