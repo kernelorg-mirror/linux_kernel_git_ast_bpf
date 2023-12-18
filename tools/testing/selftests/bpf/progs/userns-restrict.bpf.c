@@ -36,15 +36,24 @@
 /* kernel currently enforces a maximum usernamespace nesting depth of 32, see create_user_ns() in the kernel sources */
 #define USER_NAMESPACE_DEPTH_MAX 32U
 
+struct inner_map {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, int);
+};
+
 struct {
         __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+        __uint(max_entries, 1);
         __type(key, unsigned);         /* userns inode */
-        __type(value, __u32);          /* mnt_id set */
+        __array(values, struct inner_map);
 } userns_mnt_id_hash SEC(".maps");
 
 struct {
         __uint(type, BPF_MAP_TYPE_RINGBUF);
-} userns_ringbuf SEC(".maps") ;
+	__uint(max_entries, 4096);
+} userns_ringbuf SEC(".maps");
 
 static inline struct mount *real_mount(struct vfsmount *mnt) {
         return container_of(mnt, struct mount, mnt);
