@@ -20,6 +20,8 @@
 #include <bpf/bpf_core_read.h>
 #include <errno.h>
 
+void *bpf_rdonly_cast(void *, __u32) __ksym;
+
 /* BPF module that implements an allowlist of mounts (identified by mount ID) for user namespaces (identified
  * by their inode number in nsfs) that restricts creation of inodes (which would inherit the callers UID/GID)
  * or changing of ownership (similar).
@@ -68,12 +70,12 @@ static int validate_inode_on_mount(struct inode *inode, struct vfsmount *v) {
         int mnt_id;
 
         /* Get user namespace from vfsmount */
-        m = real_mount(v);
-        mount_userns = BPF_CORE_READ(m, mnt_ns, user_ns);
+        m = bpf_rdonly_cast(real_mount(v), bpf_core_type_id_kernel(struct mount));
+        mount_userns = m->mnt_ns->user_ns;
 
         /* Get user namespace from task */
-        task = (struct task_struct*) bpf_get_current_task();
-        task_userns = BPF_CORE_READ(task, cred, user_ns);
+        task = (struct task_struct*) bpf_get_current_task_btf();
+        task_userns = task->cred->user_ns;
 
         /* Is the file on a mount that belongs to our own user namespace or a child of it? If so, say
          * yes immediately. */
@@ -82,7 +84,7 @@ static int validate_inode_on_mount(struct inode *inode, struct vfsmount *v) {
                 if (p == task_userns)
                         return 0; /* our task's user namespace (or a child thereof) owns this superblock: allow! */
 
-                p = BPF_CORE_READ(p, parent);
+                p = p->parent;
                 if (!p)
                         break;
         }
@@ -93,13 +95,13 @@ static int validate_inode_on_mount(struct inode *inode, struct vfsmount *v) {
                 return -EPERM;
 
         /* This is a mount foreign to our task's user namespace, let's consult our allow list */
-        task_userns_inode = BPF_CORE_READ(task_userns, ns.inum);
+        task_userns_inode = task_userns->ns.inum;
 
         mnt_id_map = bpf_map_lookup_elem(&userns_mnt_id_hash, &task_userns_inode);
         if (!mnt_id_map) /* No rules installed for this userns? Then say yes, too! */
                 return 0;
 
-        mnt_id = BPF_CORE_READ(m, mnt_id);
+        mnt_id = m->mnt_id;
 
         /* Otherwise, say yes if the mount ID is allowlisted */
         if (bpf_map_lookup_elem(mnt_id_map, &mnt_id))
@@ -115,8 +117,8 @@ static int validate_path(const struct path *path, int ret) {
         if (ret != 0) /* propagate earlier error */
                 return ret;
 
-        inode = BPF_CORE_READ(path, dentry, d_inode);
-        v = BPF_CORE_READ(path, mnt);
+        inode = path->dentry->d_inode;
+        v = path->mnt;
 
         return validate_inode_on_mount(inode, v);
 }
@@ -155,9 +157,10 @@ void BPF_KPROBE(userns_restrict_free_user_ns, struct work_struct *work) {
         /* Inform userspace that a user namespace just went away. I wish there was a nicer way to hook into
          * user namespaces being deleted than using kprobes, but couldn't find any. */
 
-        userns = container_of(work, struct user_namespace, work);
+        userns = bpf_rdonly_cast(container_of(work, struct user_namespace, work),
+				 bpf_core_type_id_kernel(struct user_namespace));
 
-        inode = BPF_CORE_READ(userns, ns.inum);
+        inode = userns->ns.inum;
 
         mnt_id_map = bpf_map_lookup_elem(&userns_mnt_id_hash, &inode);
         if (!mnt_id_map) /* No rules installed for this userns? Then send no notification. */
