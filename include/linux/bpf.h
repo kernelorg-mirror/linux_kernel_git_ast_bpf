@@ -37,6 +37,7 @@ struct perf_event;
 struct bpf_prog;
 struct bpf_prog_aux;
 struct bpf_map;
+struct bpf_arena;
 struct sock;
 struct seq_file;
 struct btf;
@@ -2183,6 +2184,8 @@ void *bpf_map_area_mmapable_alloc(u64 size, int numa_node);
 void bpf_map_area_free(void *base);
 bool bpf_map_write_active(const struct bpf_map *map);
 void bpf_map_init_from_attr(struct bpf_map *map, union bpf_attr *attr);
+u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena);
+u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena);
 int  generic_map_lookup_batch(struct bpf_map *map,
 			      const union bpf_attr *attr,
 			      union bpf_attr __user *uattr);
