@@ -4786,6 +4786,9 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 				return -EFAULT;
 		}
 	}
+	info.fault_insn = prog->aux->fault_insn;
+	info.fault_ip = prog->aux->fault_ip;
+	info.fault_count = atomic_read(&prog->aux->fault_count);
 
 done:
 	if (copy_to_user(uinfo, &info, info_len) ||

@@ -321,7 +321,7 @@ int disasm_print_insn(unsigned char *image, ssize_t len, int opcodes,
 		      const struct btf *btf,
 		      const struct bpf_prog_linfo *prog_linfo,
 		      __u64 func_ksym, unsigned int func_idx,
-		      bool linum)
+		      bool linum, int fault_ip)
 {
 	const struct bpf_line_info *linfo = NULL;
 	unsigned int nr_skip = 0;
@@ -357,6 +357,8 @@ int disasm_print_insn(unsigned char *image, ssize_t len, int opcodes,
 			if (linfo)
 				btf_dump_linfo_plain(btf, linfo, "; ",
 						     linum);
+			if (fault_ip && pc == fault_ip)
+				printf("\t\t\t\tSEGFAULT !\n");
 			printf("%4x:" DISASM_SPACER, pc);
 		}
 

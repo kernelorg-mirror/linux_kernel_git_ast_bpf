@@ -1518,6 +1518,9 @@ struct bpf_prog_aux {
 	 */
 	u32 linfo_idx;
 	struct module *mod;
+	atomic_t fault_count;
+	u32 fault_ip;
+	u32 fault_insn;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
 	union {

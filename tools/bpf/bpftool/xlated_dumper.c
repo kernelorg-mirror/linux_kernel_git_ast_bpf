@@ -346,6 +346,8 @@ void dump_xlated_plain(struct dump_data *dd, void *buf, unsigned int len,
 				nr_skip++;
 			}
 		}
+		if (dd->fault_insn && dd->fault_insn == i)
+			printf("\t\t\t\tSEGFAULT !\n");
 
 		double_insn = insn[i].code == (BPF_LD | BPF_IMM | BPF_DW);
 

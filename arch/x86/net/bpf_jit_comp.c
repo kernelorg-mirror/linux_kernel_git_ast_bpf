@@ -1170,10 +1170,28 @@ static int emit_atomic(u8 **pprog, u8 atomic_op,
 }
 
 #define DONT_CLEAR 1
+#define EX_ARENA 1
 
 bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 {
-	u32 reg = x->fixup >> 8;
+	BUILD_BUG_ON(sizeof(*regs) >= 256);
+	u32 reg = (x->fixup >> 8) & 0xff;
+
+	if (x->fixup >> 16 == EX_ARENA) {
+		struct bpf_prog *prog;
+
+		prog = bpf_prog_ksym_find(regs->ip);
+		/* prog should always be found */
+		if (prog) {
+			/* clamp the count of faults in this bpf prog */
+			atomic_add_unless(&prog->aux->fault_count, 1, S32_MAX);
+			/* IP is relative to the start of JITed program.
+			 * It cannot be zero, since the first insn cannot be PROBE_MEM32
+			 */
+			cmpxchg(&prog->aux->fault_ip, 0, regs->ip - (long)prog->bpf_func);
+			cmpxchg(&prog->aux->fault_insn, 0, x->data >> 8);
+		}
+	}
 
 	/* jump over faulting load and clear dest register */
 	if (reg != DONT_CLEAR)
@@ -1779,9 +1797,9 @@ populate_extable:
 
 				ex->insn = delta;
 
-				ex->data = EX_TYPE_BPF;
+				ex->data = EX_TYPE_BPF | ((i - 1) << EX_DATA_REG_SHIFT);
 
-				ex->fixup = (prog - start_of_ldx) |
+				ex->fixup = (prog - start_of_ldx) | (EX_ARENA << 16) |
 					((BPF_CLASS(insn->code) == BPF_LDX ? reg2pt_regs[dst_reg] : DONT_CLEAR) << 8);
 			}
 			break;

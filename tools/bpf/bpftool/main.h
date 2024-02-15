@@ -178,7 +178,7 @@ int disasm_print_insn(unsigned char *image, ssize_t len, int opcodes,
 		      const struct btf *btf,
 		      const struct bpf_prog_linfo *prog_linfo,
 		      __u64 func_ksym, unsigned int func_idx,
-		      bool linum);
+		      bool linum, int fault_ip);
 int disasm_init(void);
 #else
 static inline
@@ -187,7 +187,7 @@ int disasm_print_insn(unsigned char *image, ssize_t len, int opcodes,
 		      const struct btf *btf,
 		      const struct bpf_prog_linfo *prog_linfo,
 		      __u64 func_ksym, unsigned int func_idx,
-		      bool linum)
+		      bool linum, int fault_ip)
 {
 	return 0;
 }

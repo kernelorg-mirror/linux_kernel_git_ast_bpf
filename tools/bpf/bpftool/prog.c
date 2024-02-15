@@ -534,6 +534,10 @@ static void print_prog_plain(struct bpf_prog_info *info, int fd, bool orphaned)
 
 	print_prog_header_plain(info, fd);
 
+	if (info->fault_count)
+		printf("\tSEGFAULTed %d times, 1st at insn %d JIT ip %x\n",
+		       info->fault_count, info->fault_insn, info->fault_ip);
+
 	if (info->load_time) {
 		char buf[32];
 
@@ -825,7 +829,7 @@ prog_dump(struct bpf_prog_info *info, enum dump_mode mode,
 				if (disasm_print_insn(img, lens[i], opcodes,
 						      name, disasm_opt, btf,
 						      prog_linfo, ksyms[i], i,
-						      linum))
+						      linum, info->fault_ip))
 					goto exit_free;
 
 				img += lens[i];
@@ -841,7 +845,7 @@ prog_dump(struct bpf_prog_info *info, enum dump_mode mode,
 		} else {
 			if (disasm_print_insn(buf, member_len, opcodes, name,
 					      disasm_opt, btf, NULL, 0, 0,
-					      false))
+					      false, info->fault_ip))
 				goto exit_free;
 		}
 	} else {
@@ -852,6 +856,7 @@ prog_dump(struct bpf_prog_info *info, enum dump_mode mode,
 		dd.func_info = func_info;
 		dd.finfo_rec_size = info->func_info_rec_size;
 		dd.prog_linfo = prog_linfo;
+		dd.fault_insn = info->fault_insn;
 
 		if (json_output)
 			dump_xlated_json(&dd, buf, member_len, opcodes, linum);

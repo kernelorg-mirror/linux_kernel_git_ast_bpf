@@ -24,6 +24,7 @@ struct dump_data {
 	struct btf *btf;
 	void *func_info;
 	__u32 finfo_rec_size;
+	__u32 fault_insn;
 	const struct bpf_prog_linfo *prog_linfo;
 	char scratch_buff[SYM_MAX_NAME + 8];
 };
