@@ -1436,6 +1436,23 @@ struct btf_mod_pair {
 
 struct bpf_kfunc_desc_tab;
 
+struct bpf_qlock {
+	atomic_t lock_id;
+};
+#define BPF_LOCKS_SHIFT 4
+#define BPF_LOCKS_MASK ((1 << BPF_LOCKS_SHIFT) - 1)
+struct bpf_lock_kern *bpf_lock_acquire(struct bpf_qlock *qlock);
+void bpf_lock_release(struct bpf_qlock *qlock, struct bpf_lock_kern *lock_kern);
+
+struct bpf_lock_kern {
+	u32 next;
+	int locked;
+	void *lock_addr;
+	struct lockdep_map dep_map;
+};
+extern struct bpf_lock_kern bpf_locks[(NR_CPUS << BPF_LOCKS_SHIFT) + 1];
+DECLARE_PER_CPU(u64, bpf_lock_inflight);
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1494,6 +1511,7 @@ struct bpf_prog_aux {
 	u32 verified_insns;
 	int cgroup_atype; /* enum cgroup_bpf_attach_type */
 	struct bpf_map *cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE];
+	u64 bad_lock;
 	char name[BPF_OBJ_NAME_LEN];
 	u64 (*bpf_exception_cb)(u64 cookie, u64 sp, u64 bp, u64, u64);
 #ifdef CONFIG_SECURITY

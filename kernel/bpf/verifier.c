@@ -11049,6 +11049,8 @@ enum special_kfunc_type {
 	KF_bpf_wq_set_callback_impl,
 	KF_bpf_preempt_disable,
 	KF_bpf_preempt_enable,
+	KF_bpf_lock_acquire_impl,
+	KF_bpf_lock_release_impl,
 	KF_bpf_iter_css_task_new,
 };
 
@@ -11105,6 +11107,8 @@ BTF_ID(func, bpf_throw)
 BTF_ID(func, bpf_wq_set_callback_impl)
 BTF_ID(func, bpf_preempt_disable)
 BTF_ID(func, bpf_preempt_enable)
+BTF_ID(func, bpf_lock_acquire_impl)
+BTF_ID(func, bpf_lock_release_impl)
 #ifdef CONFIG_CGROUPS
 BTF_ID(func, bpf_iter_css_task_new)
 #else
@@ -19798,6 +19802,150 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 	return 0;
 }
 
+static int do_lock_fixups(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog, *new_prog;
+	struct bpf_insn *insn = prog->insnsi;
+	const struct bpf_kfunc_desc *desc;
+	const int insn_cnt = prog->len;
+	struct bpf_insn insn_buf[32];
+	int i, cnt, delta = 0;
+
+	for (i = 0; i < insn_cnt;) {
+		if (insn->code != (BPF_JMP | BPF_CALL))
+			goto next_insn;
+		if (insn->src_reg == BPF_PSEUDO_CALL)
+			goto next_insn;
+		if (insn->src_reg != BPF_PSEUDO_KFUNC_CALL)
+			goto next_insn;
+
+		if (!insn->imm) {
+			verbose(env, "invalid kernel function call not eliminated in verifier pass\n");
+			return -EINVAL;
+		}
+
+		desc = find_kfunc_desc(env->prog, insn->imm, insn->off);
+		if (!desc) {
+			verbose(env, "verifier internal error: kernel function descriptor not found for func_id %u\n",
+				insn->imm);
+			return -EFAULT;
+		}
+
+#ifdef CONFIG_X86_64 /* because of inlining of smp_processor_id() */
+		if (desc->func_id == special_kfunc_list[KF_bpf_lock_acquire_impl]) {
+			struct bpf_insn aux_addr[2] = { BPF_LD_IMM64(BPF_REG_4, (long)prog->aux) };
+			struct bpf_insn locks_addr[2] = { BPF_LD_IMM64(BPF_REG_0, (long)bpf_locks) };
+			struct bpf_insn *patch = &insn_buf[0];
+
+			if (!prog->jit_requested || !bpf_jit_supports_percpu_insn()) {
+				verbose(env, "bpf_lock_acquire() is not supported\n");
+				return -EFAULT;
+			}
+			/*
+			 * u64 old, new;
+			 * do {
+			 *   new = old = this_cpu_read(bpf_lock_inflight);
+			 *   new >>= BPF_LOCKS_SHIFT;
+			 * } while (this_cpu_cmpxchg(bpf_lock_inflight, old, new) != old);
+			 * R2 = old & BPF_LOCKS_MASK;
+			 */
+			*patch++ = BPF_MOV32_IMM(BPF_REG_4, (u32)(unsigned long)&bpf_lock_inflight);
+			*patch++ = BPF_MOV64_PERCPU_REG(BPF_REG_4, BPF_REG_4);
+			*patch++ = BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_4, 0);
+			*patch++ = BPF_MOV64_REG(BPF_REG_3, BPF_REG_2);
+			*patch++ = BPF_MOV64_REG(BPF_REG_0, BPF_REG_2);
+			*patch++ = BPF_ALU64_IMM(BPF_RSH, BPF_REG_3, BPF_LOCKS_SHIFT);
+			*patch++ = BPF_ATOMIC_OP(BPF_DW, BPF_CMPXCHG, BPF_REG_4, BPF_REG_3, 0);
+			*patch++ = BPF_JMP_REG(BPF_JNE, BPF_REG_0, BPF_REG_2, -6);
+			*patch++ = BPF_ALU32_IMM(BPF_AND, BPF_REG_2, BPF_LOCKS_MASK);
+
+			/* R0 = smp_processor_id() << BPF_LOCKS_SHIFT */
+			*patch++ = BPF_MOV32_IMM(BPF_REG_0, (u32)(unsigned long)&pcpu_hot.cpu_number);
+			*patch++ = BPF_MOV64_PERCPU_REG(BPF_REG_0, BPF_REG_0);
+			*patch++ = BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_0, 0);
+			*patch++ = BPF_ALU32_IMM(BPF_LSH, BPF_REG_0, BPF_LOCKS_SHIFT);
+
+			/* R3 = R2 = (cpu_id << BPF_LOCKS_SHIFT | lock_level) + 1 */
+			*patch++ = BPF_ALU32_REG(BPF_OR, BPF_REG_2, BPF_REG_0);
+			*patch++ = BPF_ALU32_IMM(BPF_ADD, BPF_REG_2, 1);
+			*patch++ = BPF_MOV64_REG(BPF_REG_3, BPF_REG_2);
+
+			/* R0 = &bpf_locks[R3] */
+			*patch++ = BPF_ALU32_IMM(BPF_MUL, BPF_REG_3, sizeof(struct bpf_lock_kern));
+			*patch++ = locks_addr[0];
+			*patch++ = locks_addr[1];
+			*patch++ = BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_3);
+
+			/* R4 = prog->aux */
+			*patch++ = aux_addr[0];
+			*patch++ = aux_addr[1];
+
+			/* lock->next = 0; lock->locked = 0; */
+			*patch++ = BPF_ST_MEM(BPF_DW, BPF_REG_0, 0, 0);
+
+			/* pred = xchg(lock_addr, R2); */
+			*patch++ = BPF_MOV64_REG(BPF_REG_3, BPF_REG_2);
+			*patch++ = BPF_ATOMIC_OP(BPF_W, BPF_XCHG, BPF_REG_1, BPF_REG_3, 0);
+
+			/* bpf_lock_acquire_impl(lock_addr, lock_id, prev_lock_id, aux); */
+			*patch++ = *insn;
+			cnt = patch - insn_buf;
+
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta	 += cnt - 1;
+			env->prog = prog = new_prog;
+			insn	  = new_prog->insnsi + i + delta;
+			env->insn_aux_data[i + delta - 1].ptr_type = PTR_TO_ARENA;
+			goto next_insn;
+		} else if (desc->func_id == special_kfunc_list[KF_bpf_lock_release_impl]) {
+			struct bpf_insn aux_addr[2] = { BPF_LD_IMM64(BPF_REG_3, (long)prog->aux) };
+			struct bpf_insn locks_addr[2] = { BPF_LD_IMM64(BPF_REG_0, (long)bpf_locks) };
+			struct bpf_insn *patch = &insn_buf[0];
+
+			/* R3 = prog->aux */
+			*patch++ = aux_addr[0];
+			*patch++ = aux_addr[1];
+
+			*patch++ = BPF_MOV32_REG(BPF_REG_4, BPF_REG_2);
+			*patch++ = BPF_ALU32_IMM(BPF_MUL, BPF_REG_4, sizeof(struct bpf_lock_kern));
+			*patch++ = locks_addr[0];
+			*patch++ = locks_addr[1];
+			*patch++ = BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_4);
+			*patch++ = BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_0, 0);
+			*patch++ = BPF_JMP32_IMM(BPF_JNE, BPF_REG_4, 0, 4);
+
+			/* prev = atomic_cmpxchg(lock, lock_id, 0); */
+			*patch++ = BPF_MOV32_IMM(BPF_REG_5, 0);
+			*patch++ = BPF_MOV32_REG(BPF_REG_0, BPF_REG_2);
+			*patch++ = BPF_ATOMIC_OP(BPF_W, BPF_CMPXCHG, BPF_REG_1, BPF_REG_5, 0);
+			*patch++ = BPF_MOV32_REG(BPF_REG_1, BPF_REG_0);
+			/* bpf_lock_release_impl(prev, lock_id, aux, next); */
+			*patch++ = *insn;
+			cnt = patch - insn_buf;
+
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta	 += cnt - 1;
+			env->prog = prog = new_prog;
+			insn	  = new_prog->insnsi + i + delta;
+			env->insn_aux_data[i + delta - 2].ptr_type = PTR_TO_ARENA;
+			goto next_insn;
+		}
+#endif
+next_insn:
+		i++;
+		insn++;
+	}
+
+	return 0;
+}
+
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -21600,6 +21748,9 @@ skip_full_check:
 		if (ret == 0)
 			sanitize_dead_code(env);
 	}
+
+	if (ret == 0)
+		ret = do_lock_fixups(env);
 
 	if (ret == 0)
 		/* program is valid, convert *(u32*)(ctx + off) accesses */

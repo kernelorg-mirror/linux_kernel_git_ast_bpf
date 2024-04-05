@@ -2744,7 +2744,381 @@ __bpf_kfunc void bpf_preempt_enable(void)
 	preempt_enable();
 }
 
+/* Array of lock nodes which are MCS qnodes */
+struct bpf_lock_kern bpf_locks[(NR_CPUS << BPF_LOCKS_SHIFT) + 1];
+
+/* queue of available lock nodes */
+DEFINE_PER_CPU(u64, bpf_lock_inflight);
+
+/* Get lock_id from per-cpu queue of available lock nodes */
+static u32 bpf_get_lock_inflight(void)
+{
+	u64 old, new;
+	do {
+		new = old = this_cpu_read(bpf_lock_inflight);
+		new >>= BPF_LOCKS_SHIFT;
+	} while (this_cpu_cmpxchg(bpf_lock_inflight, old, new) != old);
+	return old & BPF_LOCKS_MASK;
+}
+
+/* Push lock_id back to per-cpu inflight/free queue */
+static void bpf_put_lock_inflight(int lock_id)
+{
+	u64 old, new;
+
+	do {
+		new = old = this_cpu_read(bpf_lock_inflight);
+		new <<= BPF_LOCKS_SHIFT;
+		new |= (lock_id - 1) & BPF_LOCKS_MASK;
+	} while (this_cpu_cmpxchg(bpf_lock_inflight, old, new) != old);
+}
+
+/* Allocate lock_id: upper bits = cpu id, lower 4 bits = 0-15 lock id */
+static u32 bpf_get_lock_id(void)
+{
+	/* lock_id == 0 is a reserved value */
+	return ((smp_processor_id() << BPF_LOCKS_SHIFT) | bpf_get_lock_inflight()) + 1;
+}
+
+#define debug_lock(lock_id, prev_lock_id) __debug_lock(lock_id, prev_lock_id, __func__)
+static void __debug_lock(u32 lock_id, u32 prev_lock_id, const char *func)
+{
+	lock_id--;
+	prev_lock_id--;
+	if (0)
+	printk("%s(%d/%d, pred %d/%d) inflight %llx cpu %d\n", func,
+	       lock_id >> BPF_LOCKS_SHIFT, lock_id & BPF_LOCKS_MASK,
+	       prev_lock_id >> BPF_LOCKS_SHIFT, prev_lock_id & BPF_LOCKS_MASK,
+	       this_cpu_read(bpf_lock_inflight),
+	       smp_processor_id());
+}
+
+#define bad_acquire(lock_id, prev_lock_id, aux) \
+	__bad_acquire_release(lock_id, prev_lock_id, aux, true, __builtin_return_address(0))
+#define bad_release(lock_id, prev_lock_id, aux) \
+	__bad_acquire_release(lock_id, prev_lock_id, aux, false, __builtin_return_address(0))
+
+/*
+ * Cleanup lock node (struct bpf_lock_kern), so it's usable for the next spin lock.
+ * Optionally try to clean 'struct bpf_[q]lock'.
+ */
+static void __bad_acquire_release(u32 lock_id, u32 prev_lock_id, struct bpf_prog_aux *aux,
+				  bool is_acquire, void *ret_ip)
+{
+	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
+
+	if (!aux || !READ_ONCE(aux->bad_lock))
+		printk("%pS bad %s at %px\n",
+		       ret_ip, is_acquire ? "acquire" : "release", lock->lock_addr);
+	if (!aux) {
+		/*
+		 * If there were no previous lock holder or it's out of range
+		 * restore the lock to not-taken.
+		 */
+		if (!prev_lock_id)
+			WRITE_ONCE(*(u32 *)(lock->lock_addr), 0);
+	} else {
+		WRITE_ONCE(aux->bad_lock, 1);
+	}
+	/*
+	 * Do NOT try to pass the lock to previous waiter by:
+	 * WRITE_ONCE(bpf_locks[prev_lock_id].locked, 1);
+	 * since it might not be the last one. Otherwise two cpus
+	 * might believe that they grabbed the lock.
+	 *
+	 * But tell the previous lock that it's the last,
+	 * and this lock no longer in the chain and won't be
+	 * waiting.
+	 */
+	if (is_acquire)
+		WRITE_ONCE(bpf_locks[prev_lock_id].next, 0);
+
+	/* just for completeness */
+	WRITE_ONCE(lock->locked, 1);
+	/* clear the addr */
+	WRITE_ONCE(lock->lock_addr, NULL);
+	bpf_put_lock_inflight(lock_id);
+	lock_release(&lock->dep_map, _THIS_IP_);
+}
+
+/* Given lock_id return first lock on that cpu */
+static struct bpf_lock_kern *get_first_lock_on_cpu(u32 lock_id)
+{
+	return &bpf_locks[(lock_id & ~BPF_LOCKS_MASK) + 1];
+}
+
+/* Find a lock on a cpu */
+static bool has_lock(u32 lock_id, void *lock_addr, struct bpf_lock_kern *exclude)
+{
+	struct bpf_lock_kern *lock = get_first_lock_on_cpu(lock_id);
+	u64 inflight = *per_cpu_ptr(&bpf_lock_inflight, lock_id >> BPF_LOCKS_SHIFT);
+	/* max_lock is an estimate of locks taken */
+	u32 max_lock = inflight & BPF_LOCKS_MASK;
+	int i;
+
+	for (i = 0; i < max_lock; i++, lock++) {
+		if (lock == exclude)
+			continue;
+		if (lock->lock_addr == lock_addr)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Check for AA deadlock:
+ * whether this cpu is already holding the same lock.
+ * It's called only when there is a contention on the lock.
+ * When this is the first contending lock on this cpu the loop is a nop.
+ */
+static bool check_AA_deadlock(u32 lock_id, void *lock_addr)
+{
+	struct bpf_lock_kern *this_lock = &bpf_locks[lock_id];
+
+	if (has_lock(lock_id, lock_addr, this_lock)) {
+		printk("Deadlock on cpu %d. "
+		       "Attempt to grab the same lock at 0x%px\n",
+		       (lock_id - 1) >> BPF_LOCKS_SHIFT, this_lock->lock_addr);
+		return true;
+	}
+	return false;
+}
+
+static bool walk_lock_chain(u32 lock_id, void *lock_addr)
+{
+	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
+	u32 next;
+
+	for (;;) {
+		next = READ_ONCE(lock->next);
+		if (!next)
+			break;
+		lock = &bpf_locks[next];
+		if (has_lock(next, lock_addr, lock)) {
+			printk("Deadlock at %px and %px cpu %d and %d\n",
+			       lock_addr, lock->lock_addr,
+			       lock_id >> BPF_LOCKS_SHIFT, next >> BPF_LOCKS_SHIFT);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Check for ABBA deadlock:
+ * Before spinning to acquire lock_A check whether this cpu is
+ * already acquired another lock_B and if so walk all cpu-s waiting
+ * for lock_B and check whether they acquired lock_A.
+ */
+static bool check_deadlock(u32 lock_id)
+{
+	struct bpf_lock_kern *this_lock = &bpf_locks[lock_id];
+	struct bpf_lock_kern *lock = get_first_lock_on_cpu(lock_id);
+	u64 inflight = this_cpu_read(bpf_lock_inflight);
+	u32 max_lock = inflight & BPF_LOCKS_MASK;
+	void *lock_addr = this_lock->lock_addr;
+	bool ret;
+	int i;
+
+	ret = check_AA_deadlock(lock_id, lock_addr);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < max_lock; i++, lock++) {
+		if (lock == this_lock)
+			continue;
+		if (!lock->lock_addr)
+			continue;
+		/* should have been caught by check_AA */
+		WARN_ON_ONCE(lock->lock_addr == lock_addr);
+		/*
+		 * Found a lock held on this cpu. Let's walk all cpu-s
+		 * waiting for this lock and check whether they hold
+		 * a lock we're trying to acquire.
+		 */
+		ret = walk_lock_chain(lock - bpf_locks, lock_addr);
+		if (ret)
+			return ret;
+	}
+	return false;
+}
+
+__bpf_kfunc struct bpf_lock_kern *bpf_lock_acquire_impl(void *lock_addr__ign,
+							u32 lock_id, u32 prev_lock_id,
+							void *aux__ign)
+{
+	struct bpf_prog_aux *aux = aux__ign;
+	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
+	u64 timeout1, timeout2, time_ns;
+	void *prev_lock_addr;
+	int loop = 0;
+
+	debug_lock(lock_id, prev_lock_id);
+	lock_acquire(&lock->dep_map, 0, 0, 0, 1, NULL, _THIS_IP_);
+	lock->lock_addr = lock_addr__ign;
+	if (prev_lock_id == 0)
+		goto out;
+
+	if (unlikely(prev_lock_id >= ARRAY_SIZE(bpf_locks))) {
+		bad_acquire(lock_id, 0, aux);
+		return NULL;
+	}
+
+	/*
+	 * prev_lock_id is within a range, but points to wrong lock_addr.
+	 * struct bpf_lock got currupted.
+	 */
+	prev_lock_addr = READ_ONCE(bpf_locks[prev_lock_id].lock_addr);
+	if (unlikely(prev_lock_addr && prev_lock_addr != lock_addr__ign)) {
+		bad_acquire(lock_id, 0, aux);
+		return NULL;
+	}
+
+	WRITE_ONCE(bpf_locks[prev_lock_id].next, lock_id);
+
+	if (unlikely(this_cpu_read(bpf_lock_inflight) == 0 ||
+		     (aux && READ_ONCE(aux->bad_lock)) ||
+		     check_deadlock(lock_id))) {
+		bad_acquire(lock_id, prev_lock_id, aux);
+		return NULL;
+	}
+
+	time_ns = sched_clock();
+	timeout1 = time_ns + NSEC_PER_USEC;
+	timeout2 = time_ns + (in_irq() ? NSEC_PER_SEC / 4 : NSEC_PER_SEC);
+	while (READ_ONCE(lock->locked) == 0) {
+		u64 ns;
+
+		cpu_relax();
+		/* Similar to rwsem amortize the cost of calling sched_clock() */
+		if (++loop & 0xf)
+			continue;
+		ns = sched_clock();
+		if (ns > timeout1) {
+			/* if 1 usec elapsed, check for deadlocks again */
+			if (check_deadlock(lock_id)) {
+				bad_acquire(lock_id, prev_lock_id, aux);
+				return NULL;
+			}
+		}
+		if (ns > timeout2) {
+			bad_acquire(lock_id, prev_lock_id, aux);
+			return NULL;
+		}
+	}
+out:
+	return (void *)(long)lock_id;
+}
+
+__bpf_kfunc void bpf_lock_release_impl(void *lock_addr__ign, struct bpf_lock_kern *ptr,
+				       void *aux__ign, u32 next)
+{
+	struct bpf_prog_aux *aux = aux__ign;
+	u32 lock_id = (u32)(long)ptr;
+	u32 prev_lock_id = (u32)(long)lock_addr__ign;
+	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
+	void *lock_addr = lock->lock_addr, *prev_lock_addr;
+	u64 timeout;
+	int loop = 0;
+
+	debug_lock(lock_id, prev_lock_id);
+	if (unlikely((aux && prev_lock_id == 0) ||
+		     prev_lock_id >= ARRAY_SIZE(bpf_locks))) {
+		/*
+		 * Tried to release the lock, but it was released already
+		 * or something messed with 'struct bpf_lock'. Bail out.
+		 * qspinlock would be stuck in queued_spin_lock_slowpath()
+		 * in such situation, since tail and pending fields would
+		 * be wrong.
+		 */
+		bad_release(lock_id, 0, aux);
+		return;
+	}
+
+	lock->lock_addr = NULL;
+	if (likely(!next)) {
+		if (likely(prev_lock_id == lock_id))
+			goto out;
+
+		if (unlikely(aux && READ_ONCE(aux->bad_lock))) {
+			bad_release(lock_id, prev_lock_id, aux);
+			return;
+		}
+		/*
+		 * prev_lock_id is within a range, but points to wrong lock_addr.
+		 * struct bpf_lock got currupted.
+		 */
+		prev_lock_addr = READ_ONCE(bpf_locks[prev_lock_id].lock_addr);
+		if (unlikely(prev_lock_addr && prev_lock_addr != lock_addr)) {
+			bad_release(lock_id, 0, aux);
+			return;
+		}
+
+		timeout = sched_clock() + NSEC_PER_SEC / 8;
+		while (!(next = READ_ONCE(lock->next))) {
+
+			cpu_relax();
+			if (!(++loop & 0xf) && sched_clock() > timeout) {
+				bad_release(lock_id, prev_lock_id, aux);
+				return;
+			}
+		}
+	}
+
+	/* Pass the lock to the next waiter */
+	WRITE_ONCE(bpf_locks[next].locked, 1);
+out:
+	/* This lock node can be reused now */
+	bpf_put_lock_inflight(lock_id);
+	lock_release(&lock->dep_map, _THIS_IP_);
+}
+
 __bpf_kfunc_end_defs();
+
+struct bpf_lock_kern *bpf_lock_acquire(struct bpf_qlock *qlock)
+{
+	u32 lock_id = bpf_get_lock_id();
+	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
+	u32 prev_lock_id;
+
+	/* Init the node. No race here */
+	lock->next = 0;
+	lock->locked = 0;
+	prev_lock_id = atomic_xchg(&qlock->lock_id, lock_id);
+	return bpf_lock_acquire_impl(qlock, lock_id, prev_lock_id, NULL);
+}
+
+void bpf_lock_release(struct bpf_qlock *qlock, struct bpf_lock_kern *lock_kern)
+{
+	u32 lock_id = (u32)(long)lock_kern;
+	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
+	u32 prev_lock_id = 0, next = 0;
+
+	next = READ_ONCE(lock->next);
+	if (likely(!next))
+		prev_lock_id = atomic_cmpxchg(&qlock->lock_id, lock_id, 0);
+	bpf_lock_release_impl((void *)(long)prev_lock_id, (void *)(long)lock_id, NULL, next);
+}
+
+static int __init bpf_lock_init(void)
+{
+	int i, cpu;
+
+	for (i = 1; i < ARRAY_SIZE(bpf_locks); i++) {
+		static struct lock_class_key __key[1 << BPF_LOCKS_SHIFT];
+
+		lockdep_init_map_wait(&bpf_locks[i].dep_map, "bpf_lock",
+				      &__key[(i - 1) & BPF_LOCKS_MASK], 0, LD_WAIT_SPIN);
+	}
+
+	for_each_possible_cpu(cpu) {
+		u64 *inflight = per_cpu_ptr(&bpf_lock_inflight, cpu);
+
+		*inflight = 0xfedcba9876543210ull;
+	}
+	return 0;
+}
+late_initcall(bpf_lock_init);
 
 BTF_KFUNCS_START(generic_btf_ids)
 #ifdef CONFIG_CRASH_DUMP
@@ -2796,6 +3170,8 @@ BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx)
 BTF_ID_FLAGS(func, bpf_rdonly_cast)
 BTF_ID_FLAGS(func, bpf_rcu_read_lock)
 BTF_ID_FLAGS(func, bpf_rcu_read_unlock)
+BTF_ID_FLAGS(func, bpf_lock_acquire_impl, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_lock_release_impl, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_dynptr_slice, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_dynptr_slice_rdwr, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_iter_num_new, KF_ITER_NEW)

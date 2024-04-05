@@ -499,4 +499,29 @@ extern int bpf_wq_set_callback_impl(struct bpf_wq *wq,
 		unsigned int flags__k, void *aux__ign) __ksym;
 #define bpf_wq_set_callback(timer, cb, flags) \
 	bpf_wq_set_callback_impl(timer, cb, flags, NULL)
+
+struct bpf_lock {
+	__u32 lock_id;
+};
+struct bpf_lock_kern *bpf_lock_acquire_impl(void *lock_addr__ign,
+					    u32 lock_id, u32 prev_lock_id,
+					    void *aux__ign) __weak __ksym;
+void bpf_lock_release_impl(void *lock_addr__ign, struct bpf_lock_kern *lock,
+			   void *aux__ign, u32 next) __weak __ksym;
+
+#if defined(ENABLE_ATOMICS_TESTS) || defined(__BPF_FEATURE_ALU32)
+/* macro instead of static inline to make it work on __arena and normal pointers */
+#define bpf_lock_acquire(lock) \
+	({ \
+	 bpf_lock_acquire_impl((void *)lock, 0, 0, 0); \
+	})
+#define bpf_lock_release(lock, lock_kern) \
+	({ \
+	 bpf_lock_release_impl((void *)lock, lock_kern, 0, 0); \
+	})
+#else
+#define bpf_lock_acquire(lock) ({ __typeof__(lock) l = lock; l->lock_id = 0; (void *)0; })
+#define bpf_lock_release(lock, lock_kern)
+#endif
+
 #endif
