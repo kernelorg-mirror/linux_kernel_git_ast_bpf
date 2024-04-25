@@ -2773,12 +2773,26 @@ static void bpf_put_lock_inflight(int lock_id)
 	} while (this_cpu_cmpxchg(bpf_lock_inflight, old, new) != old);
 }
 
+static void bpf_put_lock_inflight_on_cpu(int lock_id, int cpu)
+{
+	u64 *inflight = per_cpu_ptr(&bpf_lock_inflight, cpu);
+	u64 old, new;
+
+	do {
+		new = old = READ_ONCE(*inflight);
+		new <<= BPF_LOCKS_SHIFT;
+		new |= (lock_id - 1) & BPF_LOCKS_MASK;
+	} while (cmpxchg(inflight, old, new) != old);
+}
+
 /* Allocate lock_id: upper bits = cpu id, lower 4 bits = 0-15 lock id */
 static u32 bpf_get_lock_id(void)
 {
 	/* lock_id == 0 is a reserved value */
 	return ((smp_processor_id() << BPF_LOCKS_SHIFT) | bpf_get_lock_inflight()) + 1;
 }
+
+#define BPF_LOCK_SENTINEL ~0U
 
 #define debug_lock(lock_id, prev_lock_id) __debug_lock(lock_id, prev_lock_id, __func__)
 static void __debug_lock(u32 lock_id, u32 prev_lock_id, const char *func)
@@ -2837,8 +2851,8 @@ static void __bad_acquire_release(u32 lock_id, u32 prev_lock_id, struct bpf_prog
 	WRITE_ONCE(lock->locked, 1);
 	/* clear the addr */
 	WRITE_ONCE(lock->lock_addr, NULL);
-	bpf_put_lock_inflight(lock_id);
 	lock_release(&lock->dep_map, _THIS_IP_);
+	bpf_put_lock_inflight(lock_id);
 }
 
 /* Given lock_id return first lock on that cpu */
@@ -2951,6 +2965,7 @@ __bpf_kfunc struct bpf_lock_kern *bpf_lock_acquire_impl(void *lock_addr__ign,
 	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
 	u64 timeout1, timeout2, time_ns;
 	void *prev_lock_addr;
+	u32 next;
 	int loop = 0;
 
 	debug_lock(lock_id, prev_lock_id);
@@ -2974,8 +2989,14 @@ __bpf_kfunc struct bpf_lock_kern *bpf_lock_acquire_impl(void *lock_addr__ign,
 		return NULL;
 	}
 
-	WRITE_ONCE(bpf_locks[prev_lock_id].next, lock_id);
+	next = xchg(&bpf_locks[prev_lock_id].next, lock_id);
 
+	if (next == BPF_LOCK_SENTINEL) {
+		/* This lock node can be reused now */
+		bpf_put_lock_inflight_on_cpu(prev_lock_id, prev_lock_id >> BPF_LOCKS_SHIFT);
+		/* got the lock */
+		goto out;
+	}
 	if (unlikely(this_cpu_read(bpf_lock_inflight) == 0 ||
 		     (aux && READ_ONCE(aux->bad_lock)) ||
 		     check_deadlock(lock_id))) {
@@ -3018,8 +3039,6 @@ __bpf_kfunc void bpf_lock_release_impl(void *lock_addr__ign, struct bpf_lock_ker
 	u32 prev_lock_id = (u32)(long)lock_addr__ign;
 	struct bpf_lock_kern *lock = &bpf_locks[lock_id];
 	void *lock_addr = lock->lock_addr, *prev_lock_addr;
-	u64 timeout;
-	int loop = 0;
 
 	debug_lock(lock_id, prev_lock_id);
 	if (unlikely((aux && prev_lock_id == 0) ||
@@ -3054,23 +3073,23 @@ __bpf_kfunc void bpf_lock_release_impl(void *lock_addr__ign, struct bpf_lock_ker
 			return;
 		}
 
-		timeout = sched_clock() + NSEC_PER_SEC / 8;
-		while (!(next = READ_ONCE(lock->next))) {
-
-			cpu_relax();
-			if (!(++loop & 0xf) && sched_clock() > timeout) {
-				bad_release(lock_id, prev_lock_id, aux);
-				return;
-			}
+		next = xchg(&lock->next, BPF_LOCK_SENTINEL);
+		if (!next) {
+			lock_release(&lock->dep_map, _THIS_IP_);
+			return;
 		}
+	}
+	if (WARN_ON_ONCE(next == BPF_LOCK_SENTINEL)) {
+		bad_release(lock_id, 0, aux);
+		return;
 	}
 
 	/* Pass the lock to the next waiter */
 	WRITE_ONCE(bpf_locks[next].locked, 1);
 out:
 	/* This lock node can be reused now */
-	bpf_put_lock_inflight(lock_id);
 	lock_release(&lock->dep_map, _THIS_IP_);
+	bpf_put_lock_inflight(lock_id);
 }
 
 __bpf_kfunc_end_defs();
