@@ -562,6 +562,10 @@ struct bpf_insn_aux_data {
 	bool is_iter_next; /* bpf_iter_<type>_next() kfunc call */
 	bool call_with_percpu_alloc_ptr; /* {this,per}_cpu_ptr() with prog percpu alloc */
 	u8 alu_state; /* used in combination with alu_limit */
+	u32 no_fallthrough;
+	int jmp_depth;
+	int depth_fallthrough;
+	int depth_jmp;
 
 	/* below fields are initialized once */
 	unsigned int orig_idx; /* original instruction index */

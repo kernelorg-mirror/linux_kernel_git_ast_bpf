@@ -15104,9 +15104,11 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	struct bpf_verifier_state *other_branch;
 	struct bpf_reg_state *regs = this_branch->frame[this_branch->curframe]->regs;
 	struct bpf_reg_state *dst_reg, *other_branch_regs, *src_reg = NULL;
+	struct bpf_insn_aux_data *aux = cur_aux(env);
 	struct bpf_reg_state *eq_branch_regs;
 	struct bpf_reg_state fake_reg = {};
 	u8 opcode = BPF_OP(insn->code);
+	int prev_depth, new_depth;
 	bool is_jmp32;
 	int pred = -1;
 	int err;
@@ -15219,10 +15221,49 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		return 0;
 	}
 
-	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx,
-				  false);
-	if (!other_branch)
-		return -EFAULT;
+	prev_depth = aux->jmp_depth;
+	new_depth = aux->jmp_depth = env->stack_size;
+	/* 2nd time visiting conditional jmp insn that jumps forward far enough */
+	if (prev_depth && new_depth - prev_depth > 0 && insn->off > 100) {
+		if (aux->no_fallthrough)
+			aux->depth_jmp = new_depth - prev_depth;
+		else
+			aux->depth_fallthrough = new_depth - prev_depth;
+		aux->no_fallthrough = false;
+		if (aux->depth_jmp == 0) {
+			/* haven't measured the number of new jumps seen
+			 * on the path to bpf_exit,
+			 * and it's large enough.
+			 */
+			if (aux->depth_fallthrough > 100)
+				aux->no_fallthrough = true;
+		} else {
+			if (aux->depth_jmp < aux->depth_fallthrough)
+				/* if exploring jmp path leads to less branches
+				 * keep it that way.
+				 */
+				aux->no_fallthrough = true;
+		}
+	}
+	if (aux->no_fallthrough) {
+		other_branch = push_stack(env, *insn_idx + 1, *insn_idx,
+					  false);
+		if (!other_branch)
+			return -EFAULT;
+		*insn_idx += insn->off;
+		swap(this_branch, other_branch);
+		regs = this_branch->frame[this_branch->curframe]->regs;
+		dst_reg = &regs[insn->dst_reg];
+		if (BPF_SRC(insn->code) == BPF_X)
+			src_reg = &regs[insn->src_reg];
+		else
+			src_reg = &fake_reg;
+	} else {
+		other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx,
+					  false);
+		if (!other_branch)
+			return -EFAULT;
+	}
 	other_branch_regs = other_branch->frame[other_branch->curframe]->regs;
 
 	if (BPF_SRC(insn->code) == BPF_X) {
