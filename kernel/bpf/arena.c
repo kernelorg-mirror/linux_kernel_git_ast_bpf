@@ -48,6 +48,7 @@ struct bpf_arena {
 	struct maple_tree mt;
 	struct list_head vma_list;
 	struct mutex lock;
+	raw_spinlock_t raw_lock;
 };
 
 u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena)
@@ -90,6 +91,37 @@ static long compute_pgoff(struct bpf_arena *arena, long uaddr)
 	return (u32)(uaddr - (u32)arena->user_vm_start) >> PAGE_SHIFT;
 }
 
+struct apply_range_data {
+	struct page **pages;
+	int i;
+};
+
+static int apply_range_cb(pte_t *pte, unsigned long addr, void *data)
+{
+	struct apply_range_data *d = data;
+	struct page *page;
+
+	if (!data)
+		return 0;
+        /* sanity check */
+        if (unlikely(!pte_none(ptep_get(pte))))
+                return -EBUSY;
+
+	page = d->pages[d->i++];
+        /* paranoia, similar to vmap_pages_pte_range() */
+        if (WARN_ON_ONCE(!pfn_valid(page_to_pfn(page))))
+                return -EINVAL;
+
+        set_pte_at(&init_mm, addr, pte, mk_pte(page, PAGE_KERNEL));
+        return 0;
+}
+
+static int populate_pgtable_except_pte(struct bpf_arena *arena)
+{
+	return apply_to_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
+				   KERN_VM_SZ - GUARD_SZ, apply_range_cb, NULL);
+}
+
 static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 {
 	struct vm_struct *kern_vm;
@@ -102,7 +134,8 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	    /* BPF_F_MMAPABLE must be set */
 	    !(attr->map_flags & BPF_F_MMAPABLE) ||
 	    /* No unsupported flags present */
-	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV)))
+	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV |
+				 BPF_F_LAZY_ALLOC)))
 		return ERR_PTR(-EINVAL);
 
 	if (attr->map_extra & ~PAGE_MASK)
@@ -131,9 +164,16 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		arena->user_vm_end = arena->user_vm_start + vm_range;
 
 	INIT_LIST_HEAD(&arena->vma_list);
+	attr->map_flags |= BPF_F_LAZY_ALLOC; /* force hack */
 	bpf_map_init_from_attr(&arena->map, attr);
 	mt_init_flags(&arena->mt, MT_FLAGS_ALLOC_RANGE);
 	mutex_init(&arena->lock);
+	if (attr->map_flags & BPF_F_LAZY_ALLOC) {
+		raw_spin_lock_init(&arena->raw_lock);
+		err = populate_pgtable_except_pte(arena);
+		if (err)
+			goto err;
+	}
 
 	return &arena->map;
 err:
@@ -420,7 +460,8 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	/* user_vm_end/start are fixed before bpf prog runs */
 	long page_cnt_max = (arena->user_vm_end - arena->user_vm_start) >> PAGE_SHIFT;
 	u64 kern_vm_start = bpf_arena_get_kern_vm_start(arena);
-	struct page **pages;
+	bool lazy_alloc = arena->map.map_flags & BPF_F_LAZY_ALLOC;
+	struct page **pages = NULL;
 	long pgoff = 0;
 	u32 uaddr32;
 	int ret, i;
@@ -443,6 +484,33 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 		return 0;
 
 	guard(mutex)(&arena->lock);
+	if (lazy_alloc) {
+		struct apply_range_data data = { .pages = pages, .i = 0 };
+
+		ret = bpf_map_alloc_pages(&arena->map, GFP_KERNEL | __GFP_ZERO,
+					  node_id, page_cnt, pages);
+		if (ret) {
+			kvfree(pages);
+			return 0;
+		}
+
+		if (uaddr)
+			ret = mtree_insert_range(&arena->mt, pgoff, pgoff + page_cnt - 1,
+						 MT_ENTRY, GFP_NOWAIT);
+		else
+			ret = mtree_alloc_range(&arena->mt, &pgoff, MT_ENTRY,
+						page_cnt, 0, page_cnt_max - 1,
+						GFP_NOWAIT);
+		if (ret)
+			goto out_free_pages;
+
+		uaddr32 = (u32)(arena->user_vm_start + pgoff * PAGE_SIZE);
+		ret = apply_to_page_range(&init_mm, kern_vm_start + uaddr32,
+					  page_cnt << PAGE_SHIFT, apply_range_cb, &data);
+		if (ret)
+			goto out;
+		return clear_lo32(arena->user_vm_start) + uaddr32;
+	}
 
 	if (uaddr)
 		ret = mtree_insert_range(&arena->mt, pgoff, pgoff + page_cnt - 1,

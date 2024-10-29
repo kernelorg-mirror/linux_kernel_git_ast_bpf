@@ -1412,6 +1412,9 @@ enum {
 
 /* Do not translate kernel bpf_arena pointers to user pointers */
 	BPF_F_NO_USER_CONV	= (1U << 18),
+
+/* Allow BPF programs fault-in arena pages */
+	BPF_F_LAZY_ALLOC	= (1U << 19),
 };
 
 /* Flags for BPF_PROG_QUERY. */
