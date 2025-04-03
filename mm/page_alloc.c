@@ -5086,6 +5086,7 @@ void free_pages_nolock(struct page *page, unsigned int order)
 {
 	___free_pages(page, order, FPI_TRYLOCK);
 }
+EXPORT_SYMBOL_GPL(free_pages_nolock);
 
 void free_pages(unsigned long addr, unsigned int order)
 {
@@ -7473,3 +7474,4 @@ struct page *alloc_pages_nolock_noprof(gfp_t gfp_flags, int nid, unsigned int or
 	kmsan_alloc_page(page, order, alloc_gfp);
 	return page;
 }
+EXPORT_SYMBOL_GPL(alloc_pages_nolock_noprof);

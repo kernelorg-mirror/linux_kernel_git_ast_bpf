@@ -8093,6 +8093,9 @@ __initcall(slab_debugfs_init);
  * The /proc/slabinfo ABI
  */
 #ifdef CONFIG_SLUB_DEBUG
+void (*debug_callback)(void);
+EXPORT_SYMBOL_GPL(debug_callback);
+
 void get_slabinfo(struct kmem_cache *s, struct slabinfo *sinfo)
 {
 	unsigned long nr_slabs = 0;

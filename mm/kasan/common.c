@@ -271,7 +271,7 @@ bool __kasan_slab_free(struct kmem_cache *cache, void *object, bool init,
 	 * onto the freelist for now. The object's metadata is kept until the
 	 * object gets evicted from quarantine.
 	 */
-	if (kasan_quarantine_put(cache, object))
+	if (0 && kasan_quarantine_put(cache, object))
 		return true;
 
 	/*
