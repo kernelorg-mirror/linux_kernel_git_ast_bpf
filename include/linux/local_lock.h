@@ -48,8 +48,16 @@
  * @lock:	The lock variable
  * @flags:      Interrupt flags to restore
  */
-#define local_unlock_irqrestore(lock, flags)			\
+#define local_unlock_irqrestore2(lock, flags)			\
 	__local_unlock_irqrestore(lock, flags)
+
+extern void (*debug_callback)(void);
+#define local_unlock_irqrestore(lock, flags)			\
+	do {			\
+		if (debug_callback) debug_callback(); \
+		__local_unlock_irqrestore(lock, flags); \
+	} while (0)
+
 
 /**
  * local_lock_init - Runtime initialize a lock instance

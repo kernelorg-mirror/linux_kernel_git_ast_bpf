@@ -5269,6 +5269,7 @@ void free_pages_nolock(struct page *page, unsigned int order)
 {
 	___free_pages(page, order, FPI_TRYLOCK);
 }
+EXPORT_SYMBOL_GPL(free_pages_nolock);
 
 void free_pages(unsigned long addr, unsigned int order)
 {

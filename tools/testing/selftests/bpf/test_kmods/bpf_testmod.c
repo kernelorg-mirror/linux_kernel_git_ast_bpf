@@ -20,6 +20,7 @@
 #include <linux/filter.h>
 #include <net/sock.h>
 #include <linux/namei.h>
+#include <linux/prandom.h>
 #include "bpf_testmod.h"
 #include "bpf_testmod_kfunc.h"
 
@@ -1530,6 +1531,236 @@ static struct bpf_struct_ops testmod_st_ops = {
 
 extern int bpf_fentry_test1(int a);
 
+static struct perf_event_attr hw_attr = {
+	.type           = PERF_TYPE_HARDWARE,
+	.config         = PERF_COUNT_HW_CPU_CYCLES,
+	.size           = sizeof(struct perf_event_attr),
+	.pinned         = 1,
+	.disabled       = 1,
+};
+
+#define ALLOC_CNT (1 << 20)
+
+static int nmi_cnt;
+static struct mem_cgroup *memcg;
+static struct rnd_state rnd;
+
+static long try_alloc_cnt, try_alloc_ok, try_alloc_fail;
+static long try_kmalloc_cnt, try_kmalloc_ok, try_kmalloc_fail;
+
+static bool test_page_alloc = false;
+static bool test_kmalloc = true;
+static u32 random_val;
+
+static void *objs[16];
+static void free_objs(void)
+{
+	for (int i = 0; i < 16; i++) {
+		void *o = objs[i];
+		if (o) {
+			kfree(o);
+			objs[i] = NULL;
+		}
+	}
+}
+static void nmi_callback(struct perf_event *event,
+			 struct perf_sample_data *data,
+			 struct pt_regs *regs)
+{
+	struct mem_cgroup *old_memcg;
+	static struct page *pages[16];
+	static int actual_cnt, obj_cnt;
+	struct page *p;
+	void *o;
+	int page_cnt, i;
+	static volatile int running;
+	u32 rval;
+
+	if (xchg(&running, 1))
+		return;
+	old_memcg = set_active_memcg(memcg);
+
+	for (i = 0; i < actual_cnt && test_page_alloc; i++) {
+		p = pages[i];
+		if (p) {
+			free_pages_nolock(p, 0);
+			pages[i] = NULL;
+		}
+	}
+	actual_cnt = 0;
+
+	for (i = 0; i < obj_cnt && test_kmalloc; i++) {
+		o = objs[i];
+		if (o) {
+			kfree_nolock(o);
+			objs[i] = NULL;
+		}
+	}
+	obj_cnt = 0;
+
+	random_val = prandom_u32_state(&rnd);
+	rval = READ_ONCE(random_val);
+	page_cnt = ((rval >> 1) & (ARRAY_SIZE(pages) - 1)) + 1;
+	if (test_page_alloc && (rval & 1)) {
+		for (i = 0; i < page_cnt; i++) {
+			p = alloc_pages_nolock(__GFP_ACCOUNT, -1, 0);
+			try_alloc_cnt++;
+			if (!p) {
+				try_alloc_fail++;
+				break;
+			}
+			try_alloc_ok++;
+			pages[i] = p;
+		}
+		actual_cnt = i;
+	}
+	if (test_kmalloc && (rval & (1 << 9))) {
+		for (i = 0; i < page_cnt; i++) {
+			u32 sz = ((rval >> 10) & 0x80f) + 8;
+			o = kmalloc_nolock(sz, 0/*__GFP_ACCOUNT*/, -1);
+			try_kmalloc_cnt++;
+			if (!o) {
+				try_kmalloc_fail++;
+				printk("fail size %d\n", sz);
+				break;
+			}
+			try_kmalloc_ok++;
+			objs[i] = o;
+		}
+		obj_cnt = i;
+	}
+	set_active_memcg(old_memcg);
+	nmi_cnt++;
+	if (event)
+		event->hw.interrupts = 0;
+	running = 0;
+}
+
+static struct perf_event *evt = NULL;
+
+extern void (*debug_callback)(void);
+
+static void my_debug_callback(void)
+{
+	nmi_callback(0, 0, 0);
+}
+
+static int setup_nmi_event(void)
+{
+	int cpu = 1;
+
+	prandom_seed_state(&rnd, 42);
+	debug_callback = my_debug_callback;
+#ifdef CONFIG_PREEMPT_RT
+	return 0;
+#endif
+
+	hw_attr.sample_period = 1000000;
+	evt = perf_event_create_kernel_counter(&hw_attr, cpu, NULL,
+					       nmi_callback, NULL);
+	if (IS_ERR(evt)) {
+		pr_debug("Perf event create on CPU %d failed with %ld\n", cpu,
+			 PTR_ERR(evt));
+		return PTR_ERR(evt);
+	}
+	return 0;
+}
+
+static struct completion wait;
+static struct obj_cgroup *objcg;
+int seconds_elapsed;
+
+static int page_alloc_kthread(void *arg)
+{
+	struct mem_cgroup *old_memcg;
+	static struct page *pages[256];
+	static void *objs[256];
+	struct page *p;
+	void *o;
+	int i, j, page_cnt, obj_cnt;
+
+	might_resched();
+	old_memcg = set_active_memcg(memcg);
+	for (i = 0; i < ALLOC_CNT && test_page_alloc; i++) {
+		random_val = prandom_u32_state(&rnd);
+		page_cnt = ((READ_ONCE(random_val) >> 9) & (ARRAY_SIZE(pages) - 1)) + 1;
+		for (j = 0; j < page_cnt; j++) {
+			p = alloc_pages(GFP_KERNEL_ACCOUNT, 0);
+			if (!p)
+				break;
+			pages[j] = p;
+		}
+		for (;j > 0; j--)
+			__free_pages(pages[j - 1], 0);
+
+	}
+	for (i = 0; i < ALLOC_CNT && test_kmalloc; i++) {
+		random_val = prandom_u32_state(&rnd);
+		obj_cnt = ((READ_ONCE(random_val) >> 9) & (ARRAY_SIZE(objs) - 1)) + 1;
+		for (j = 0; j < obj_cnt; j++) {
+			o = kmalloc(16, GFP_KERNEL);//_ACCOUNT);
+			if (!o)
+				break;
+			objs[j] = o;
+		}
+		for (;j > 0; j--)
+			kfree(objs[j - 1]);
+
+		if (seconds_elapsed > 30)
+			break;
+	}
+	set_active_memcg(old_memcg);
+	complete(&wait);
+	return 0;
+}
+
+static int page_alloc_test(void)
+{
+	struct task_struct *tsk;
+	ktime_t start;
+	u64 duration;
+	int ret;
+
+	/* Hack */
+	static_branch_enable(&memcg_kmem_online_key);
+
+	objcg = READ_ONCE(current->objcg);
+	memcg = get_mem_cgroup_from_objcg(objcg);
+
+	init_completion(&wait);
+	tsk = kthread_create_on_cpu(page_alloc_kthread, NULL, 1, "page_alloc_kthread");
+	if (IS_ERR(tsk))
+		return PTR_ERR(tsk);
+
+	setup_nmi_event();
+	start = ktime_get();
+	wake_up_process(tsk);
+	if (!IS_ERR_OR_NULL(evt))
+		perf_event_enable(evt);
+	while (!(ret = wait_for_completion_interruptible_timeout(&wait, msecs_to_jiffies(2000)))) {
+		pr_info("nmi_cnt %d page success ratio %ld%% fail %ld kmalloc ratio %ld%% fail %ld",
+			nmi_cnt,
+			try_alloc_cnt ? try_alloc_ok * 100 / try_alloc_cnt : 0, try_alloc_fail,
+			try_kmalloc_cnt ? try_kmalloc_ok * 100 / try_kmalloc_cnt : 0, try_kmalloc_fail);
+		seconds_elapsed += 2;
+	}
+	if (ret < 0) {
+		seconds_elapsed = 10000;
+		wait_for_completion(&wait);
+	}
+	debug_callback = NULL;
+	duration = (u64)ktime_ms_delta(ktime_get(), start);
+	if (!IS_ERR_OR_NULL(evt)) {
+		perf_event_disable(evt);
+		perf_event_release_kernel(evt);
+	}
+	barrier();
+	free_objs();
+	mem_cgroup_put(memcg);
+	pr_info("took %llu msec nmi_cnt %d\n", duration, nmi_cnt);
+	return 0;
+}
+
 static int bpf_testmod_init(void)
 {
 	const struct btf_id_dtor_kfunc bpf_testmod_dtors[] = {
@@ -1573,6 +1804,7 @@ static int bpf_testmod_init(void)
 	while (tramp <= (void **)&__bpf_testmod_ops.tramp_40)
 		*tramp++ = bpf_testmod_tramp;
 
+	page_alloc_test();
 	return 0;
 }
 
