@@ -1478,6 +1478,7 @@ static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 	case BPF_MAP_TYPE_CGRP_STORAGE:
 	case BPF_MAP_TYPE_BLOOM_FILTER:
 	case BPF_MAP_TYPE_LPM_TRIE:
+	case BPF_MAP_TYPE_QP_TRIE:
 	case BPF_MAP_TYPE_REUSEPORT_SOCKARRAY:
 	case BPF_MAP_TYPE_STACK_TRACE:
 	case BPF_MAP_TYPE_QUEUE:
