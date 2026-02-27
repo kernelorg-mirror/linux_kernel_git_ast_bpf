@@ -271,7 +271,6 @@ struct bpf_retval_range {
  * type of all registers and stack info
  */
 struct bpf_func_state {
-	struct bpf_reg_state regs[MAX_BPF_REG];
 	/* index of call instruction that called into this func */
 	int callsite;
 	/* stack frame number of this function state from pov of
@@ -314,10 +313,12 @@ struct bpf_func_state {
 	 * stack[allocated_stack/8 - 1] represents [*(r10-allocated_stack)..*(r10-allocated_stack+7)]
 	 */
 	struct bpf_stack_state *stack;
+	struct bpf_reg_state *regs;
 	/* Size of the current stack, in bytes. The stack state is tracked below, in
 	 * `stack`. allocated_stack is always a multiple of BPF_REG_SIZE.
 	 */
 	int allocated_stack;
+	int regs_cnt;
 };
 
 #define MAX_CALL_FRAMES 8
@@ -463,7 +464,7 @@ struct bpf_verifier_state {
 			struct bpf_reg_state *___regs;                   \
 			__state = ___vstate->frame[___i];                \
 			___regs = __state->regs;                         \
-			for (___j = 0; ___j < MAX_BPF_REG; ___j++) {     \
+			for (___j = 0; ___j < __state->regs_cnt; ___j++) { \
 				__reg = &___regs[___j];                  \
 				(void)(__expr);                          \
 			}                                                \
@@ -594,6 +595,7 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	u64 live_spills_before;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
@@ -686,6 +688,7 @@ struct backtrack_state {
 	u32 frame;
 	u32 reg_masks[MAX_CALL_FRAMES];
 	u64 stack_masks[MAX_CALL_FRAMES];
+	u64 spill_masks[MAX_CALL_FRAMES];
 };
 
 struct bpf_id_pair {
@@ -831,7 +834,7 @@ struct bpf_verifier_env {
 	/* bit mask to keep track of whether a register has been accessed
 	 * since the last time the function state was printed
 	 */
-	u32 scratched_regs;
+	u8 scratched_regs[10];
 	/* Same as scratched_regs but for stack slots */
 	u64 scratched_stack_slots;
 	u64 prev_log_pos, prev_insn_print_pos;
@@ -850,6 +853,11 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
+	struct {
+		s8 spi;
+		s8 reg;
+		s8 frame;
+	} states_equal_log;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1015,7 +1023,9 @@ static inline bool type_may_be_null(u32 type)
 
 static inline void mark_reg_scratched(struct bpf_verifier_env *env, u32 regno)
 {
-	env->scratched_regs |= 1U << regno;
+	const u32 eltsz = sizeof(*env->scratched_regs) * 8;
+
+	env->scratched_regs[regno / eltsz] |= BIT(regno % eltsz);
 }
 
 static inline void mark_stack_slot_scratched(struct bpf_verifier_env *env, u32 spi)
@@ -1025,7 +1035,9 @@ static inline void mark_stack_slot_scratched(struct bpf_verifier_env *env, u32 s
 
 static inline bool reg_scratched(const struct bpf_verifier_env *env, u32 regno)
 {
-	return (env->scratched_regs >> regno) & 1;
+	const u32 eltsz = sizeof(*env->scratched_regs) * 8;
+
+	return (env->scratched_regs[regno / eltsz]) & BIT(regno % eltsz);
 }
 
 static inline bool stack_slot_scratched(const struct bpf_verifier_env *env, u64 regno)
@@ -1035,19 +1047,24 @@ static inline bool stack_slot_scratched(const struct bpf_verifier_env *env, u64 
 
 static inline bool verifier_state_scratched(const struct bpf_verifier_env *env)
 {
-	return env->scratched_regs || env->scratched_stack_slots;
+	u32 i;
+
+	for  (i = 0; i < ARRAY_SIZE(env->scratched_regs); i++)
+		if (env->scratched_regs[i])
+			return true;
+	return env->scratched_stack_slots;
 }
 
 static inline void mark_verifier_state_clean(struct bpf_verifier_env *env)
 {
-	env->scratched_regs = 0U;
+	memset(env->scratched_regs, 0, sizeof(env->scratched_regs));
 	env->scratched_stack_slots = 0ULL;
 }
 
 /* Used for printing the entire verifier state. */
 static inline void mark_verifier_state_scratched(struct bpf_verifier_env *env)
 {
-	env->scratched_regs = ~0U;
+	memset(env->scratched_regs, ~0U, sizeof(env->scratched_regs));
 	env->scratched_stack_slots = ~0ULL;
 }
 
