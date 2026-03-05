@@ -21328,6 +21328,30 @@ static int do_check(struct bpf_verifier_env *env)
 		sanitize_mark_insn_seen(env);
 		prev_insn_idx = env->insn_idx;
 
+		/* Sanity check: precomputed constants must match verifier state */
+		if (!state->speculative && insn_aux->const_reg_mask) {
+			struct bpf_reg_state *regs = cur_regs(env);
+			u16 mask = insn_aux->const_reg_mask;
+
+			for (int r = 0; r < MAX_BPF_REG; r++) {
+				if (!(mask & BIT(r)))
+					continue;
+				if (regs[r].type != SCALAR_VALUE)
+					continue;
+				if (!tnum_is_const(regs[r].var_off))
+					continue;
+				if (verifier_bug_if(regs[r].var_off.value !=
+						    insn_aux->const_reg_vals[r],
+						    env,
+						    "const prepass r%d: prepass=%llu verifier=%llu at insn %d",
+						    r,
+						    insn_aux->const_reg_vals[r],
+						    regs[r].var_off.value,
+						    env->insn_idx))
+					return -EFAULT;
+			}
+		}
+
 		/* Reduce verification complexity by stopping speculative path
 		 * verification when a nospec is encountered.
 		 */
@@ -26083,6 +26107,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		goto skip_full_check;
 
 	ret = compute_scc(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = compute_const_regs(env);
 	if (ret < 0)
 		goto skip_full_check;
 

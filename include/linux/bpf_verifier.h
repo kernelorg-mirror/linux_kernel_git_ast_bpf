@@ -595,6 +595,13 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	/*
+	 * Bitmask of R0-R9 that hold known constants at this instruction.
+	 * Bit i corresponds to R(i). const_reg_vals[i] holds the constant value.
+	 * Populated by compute_const_regs() pre-pass.
+	 */
+	u16 const_reg_mask;
+	u64 const_reg_vals[MAX_BPF_REG];
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
@@ -1083,6 +1090,8 @@ int bpf_jmp_offset(struct bpf_insn *insn);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 void bpf_fmt_stack_mask(char *buf, ssize_t buf_sz, u64 stack_mask);
 bool bpf_calls_callback(struct bpf_verifier_env *env, int insn_idx);
+
+int compute_const_regs(struct bpf_verifier_env *env);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);

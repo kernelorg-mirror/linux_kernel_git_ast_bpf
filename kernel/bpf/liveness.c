@@ -752,3 +752,192 @@ bool bpf_stack_slot_alive(struct bpf_verifier_env *env, u32 frameno, u32 spi)
 
 	return false;
 }
+
+/*
+ * Forward dataflow analysis to determine constant register values at every
+ * instruction. Tracks 64-bit constant values in R0-R9 through the program,
+ * using a fixed-point iteration in reverse postorder. Records which registers
+ * hold known constants and their values in
+ * env->insn_aux_data[].{const_reg_mask, const_reg_vals}.
+ */
+
+enum const_arg_state {
+	CONST_ARG_UNVISITED,	/* instruction not yet reached */
+	CONST_ARG_UNKNOWN,	/* register value not a known constant */
+	CONST_ARG_CONST,	/* register holds a known constant */
+};
+
+struct const_arg_info {
+	enum const_arg_state state;
+	u64 val;
+};
+
+/*
+ * Transfer function: compute output register state from instruction.
+ * ci_out[] is initialized to the input state before calling this.
+ */
+static void const_reg_transfer(struct const_arg_info *ci_out,
+			       struct bpf_insn *insn, struct bpf_insn *insns,
+			       int idx)
+{
+	u8 class = BPF_CLASS(insn->code);
+	u8 code = BPF_OP(insn->code);
+	int r;
+
+	if (class == BPF_ALU64 && BPF_SRC(insn->code) == BPF_K) {
+		if (code == BPF_MOV) {
+			ci_out[insn->dst_reg].state = CONST_ARG_CONST;
+			ci_out[insn->dst_reg].val = (s64)insn->imm;
+		} else if (code == BPF_ADD && ci_out[insn->dst_reg].state == CONST_ARG_CONST) {
+			ci_out[insn->dst_reg].val += insn->imm;
+		} else if (code == BPF_SUB && ci_out[insn->dst_reg].state == CONST_ARG_CONST) {
+			ci_out[insn->dst_reg].val -= insn->imm;
+		} else {
+			ci_out[insn->dst_reg].state = CONST_ARG_UNKNOWN;
+		}
+	} else if (class == BPF_ALU64 && BPF_SRC(insn->code) == BPF_X) {
+		if (code == BPF_MOV) {
+			ci_out[insn->dst_reg] = ci_out[insn->src_reg];
+			/* Sign-extending move */
+			if (insn->off && ci_out[insn->dst_reg].state == CONST_ARG_CONST) {
+				s64 val = ci_out[insn->dst_reg].val;
+
+				if (insn->off == 8)
+					val = (s8)val;
+				else if (insn->off == 16)
+					val = (s16)val;
+				else if (insn->off == 32)
+					val = (s32)val;
+				ci_out[insn->dst_reg].val = val;
+			}
+		} else {
+			ci_out[insn->dst_reg].state = CONST_ARG_UNKNOWN;
+		}
+	} else if (class == BPF_ALU && BPF_SRC(insn->code) == BPF_K) {
+		if (code == BPF_MOV) {
+			ci_out[insn->dst_reg].state = CONST_ARG_CONST;
+			ci_out[insn->dst_reg].val = (u32)insn->imm;
+		} else {
+			ci_out[insn->dst_reg].state = CONST_ARG_UNKNOWN;
+		}
+	} else if (class == BPF_ALU) {
+		ci_out[insn->dst_reg].state = CONST_ARG_UNKNOWN;
+	} else if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM &&
+		   BPF_SIZE(insn->code) == BPF_DW) {
+		/* LD_IMM64: two-insn encoding */
+		ci_out[insn->dst_reg].state = CONST_ARG_CONST;
+		ci_out[insn->dst_reg].val = (u64)(u32)insn->imm | ((u64)(u32)insns[idx + 1].imm << 32);
+	} else if (class == BPF_JMP && code == BPF_CALL) {
+		/* Calls clobber R0-R5 */
+		for (r = BPF_REG_0; r <= BPF_REG_5; r++)
+			ci_out[r].state = CONST_ARG_UNKNOWN;
+	} else if (class == BPF_LDX) {
+		ci_out[insn->dst_reg].state = CONST_ARG_UNKNOWN;
+	} else if (class == BPF_STX && BPF_MODE(insn->code) == BPF_ATOMIC) {
+		if (insn->imm == BPF_CMPXCHG)
+			ci_out[BPF_REG_0].state = CONST_ARG_UNKNOWN;
+		else if (insn->imm == BPF_LOAD_ACQ)
+			ci_out[insn->dst_reg].state = CONST_ARG_UNKNOWN;
+		else if (insn->imm & BPF_FETCH)
+			ci_out[insn->src_reg].state = CONST_ARG_UNKNOWN;
+	}
+}
+
+/*
+ * Join function: merge output state into a successor's input state.
+ * Returns true if the successor's state changed.
+ */
+static bool const_reg_join(struct const_arg_info *ci_target,
+			   struct const_arg_info *ci_out)
+{
+	bool changed = false;
+	int r;
+
+	for (r = 0; r < MAX_BPF_REG; r++) {
+		struct const_arg_info *old = &ci_target[r];
+		struct const_arg_info *new = &ci_out[r];
+
+		if (old->state == CONST_ARG_UNVISITED) {
+			ci_target[r] = *new;
+			changed = true;
+		} else if (old->state == CONST_ARG_CONST &&
+			   (new->state != CONST_ARG_CONST || new->val != old->val)) {
+			old->state = CONST_ARG_UNKNOWN;
+			changed = true;
+		}
+		/* UNKNOWN stays UNKNOWN */
+	}
+	return changed;
+}
+
+int compute_const_regs(struct bpf_verifier_env *env)
+{
+	struct bpf_insn_aux_data *insn_aux = env->insn_aux_data;
+	struct bpf_insn *insns = env->prog->insnsi;
+	int insn_cnt = env->prog->len;
+	struct const_arg_info (*ci_in)[MAX_BPF_REG];
+	struct const_arg_info ci_out[MAX_BPF_REG];
+	struct bpf_iarray *succ;
+	bool changed;
+	int i, r;
+
+	ci_in = kvzalloc_objs(*ci_in, insn_cnt, GFP_KERNEL_ACCOUNT);
+	if (!ci_in)
+		return -ENOMEM;
+
+	/* kvzalloc zeroes memory, so all entries start as CONST_ARG_UNVISITED (0) */
+
+	/* Entry point: all registers unknown */
+	for (r = 0; r < MAX_BPF_REG; r++)
+		ci_in[0][r].state = CONST_ARG_UNKNOWN;
+
+	/* Subprogram entries: all registers unknown */
+	for (i = 0; i < env->subprog_cnt; i++) {
+		int start = env->subprog_info[i].start;
+
+		for (r = 0; r < MAX_BPF_REG; r++)
+			ci_in[start][r].state = CONST_ARG_UNKNOWN;
+	}
+
+	/* Forward fixed-point: iterate in reverse postorder */
+	changed = true;
+	while (changed) {
+		changed = false;
+		for (i = env->cfg.cur_postorder - 1; i >= 0; i--) {
+			int idx = env->cfg.insn_postorder[i];
+			struct bpf_insn *insn = &insns[idx];
+
+			/* Skip unvisited instructions */
+			if (ci_in[idx][0].state == CONST_ARG_UNVISITED)
+				continue;
+
+			memcpy(ci_out, ci_in[idx], sizeof(ci_out));
+
+			const_reg_transfer(ci_out, insn, insns, idx);
+
+			/* Propagate to successors */
+			succ = bpf_insn_successors(env, idx);
+			for (int s = 0; s < succ->cnt; s++)
+				changed |= const_reg_join(ci_in[succ->items[s]], ci_out);
+		}
+	}
+
+	/* Extract constant R0-R9 at all instruction sites */
+	for (i = 0; i < insn_cnt; i++) {
+		u16 mask = 0;
+
+		if (ci_in[i][0].state == CONST_ARG_UNVISITED)
+			continue;
+
+		for (r = BPF_REG_0; r < MAX_BPF_REG; r++) {
+			if (ci_in[i][r].state == CONST_ARG_CONST) {
+				mask |= BIT(r);
+				insn_aux[i].const_reg_vals[r] =	ci_in[i][r].val;
+			}
+		}
+		insn_aux[i].const_reg_mask = mask;
+	}
+
+	kvfree(ci_in);
+	return 0;
+}
