@@ -210,6 +210,8 @@ int btf_type_seq_show_flags(const struct btf *btf, u32 type_id, void *obj,
  * Return: length that would have been/was copied as per snprintf, or
  *	   negative error.
  */
+int btf_type_snprintf(const struct btf *btf, u32 type_id,
+		      char *buf, int buf_sz);
 int btf_type_snprintf_show(const struct btf *btf, u32 type_id, void *obj,
 			   char *buf, int len, u64 flags);
 

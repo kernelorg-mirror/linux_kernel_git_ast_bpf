@@ -8090,6 +8090,95 @@ __printf(2, 0) static void btf_snprintf_show(struct btf_show *show, const char *
 	}
 }
 
+/* Print a BTF type_id as a simplified C-like string into buf.
+ * Handles ptr, struct, int, void, typedef, const, volatile, etc.
+ * Returns the number of characters written (excluding NUL).
+ */
+int btf_type_snprintf(const struct btf *btf, u32 type_id,
+		      char *buf, int buf_sz)
+{
+	const struct btf_type *t;
+	const char *name;
+	int len = 0;
+
+#define SNPRINTF_APPEND(fmt, ...) do {					\
+	int __r = snprintf(buf + len, max(buf_sz - len, 0), fmt,	\
+			   ##__VA_ARGS__);				\
+	len += __r;							\
+} while (0)
+
+	if (!btf || !type_id) {
+		SNPRINTF_APPEND("void");
+		return len;
+	}
+
+	t = btf_type_by_id(btf, type_id);
+	if (!t) {
+		SNPRINTF_APPEND("unknown");
+		return len;
+	}
+
+	switch (BTF_INFO_KIND(t->info)) {
+	case BTF_KIND_INT:
+		name = btf_name_by_offset(btf, t->name_off);
+		SNPRINTF_APPEND("%s", name ?: "int");
+		break;
+	case BTF_KIND_PTR:
+		len += btf_type_snprintf(btf, t->type, buf + len,
+					 buf_sz - len);
+		SNPRINTF_APPEND(" *");
+		break;
+	case BTF_KIND_CONST:
+		SNPRINTF_APPEND("const ");
+		len += btf_type_snprintf(btf, t->type, buf + len,
+					 buf_sz - len);
+		break;
+	case BTF_KIND_VOLATILE:
+		SNPRINTF_APPEND("volatile ");
+		len += btf_type_snprintf(btf, t->type, buf + len,
+					 buf_sz - len);
+		break;
+	case BTF_KIND_RESTRICT:
+		SNPRINTF_APPEND("restrict ");
+		len += btf_type_snprintf(btf, t->type, buf + len,
+					 buf_sz - len);
+		break;
+	case BTF_KIND_TYPEDEF:
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION:
+	case BTF_KIND_ENUM:
+	case BTF_KIND_ENUM64:
+	case BTF_KIND_FLOAT:
+		name = btf_name_by_offset(btf, t->name_off);
+		if (btf_type_is_struct(t))
+			SNPRINTF_APPEND("struct ");
+		else if (BTF_INFO_KIND(t->info) == BTF_KIND_UNION)
+			SNPRINTF_APPEND("union ");
+		else if (BTF_INFO_KIND(t->info) == BTF_KIND_ENUM ||
+			 BTF_INFO_KIND(t->info) == BTF_KIND_ENUM64)
+			SNPRINTF_APPEND("enum ");
+		SNPRINTF_APPEND("%s", name ?: "?");
+		break;
+	case BTF_KIND_ARRAY:
+		SNPRINTF_APPEND("array");
+		break;
+	case BTF_KIND_FWD:
+		name = btf_name_by_offset(btf, t->name_off);
+		SNPRINTF_APPEND("fwd %s", name ?: "?");
+		break;
+	case BTF_KIND_TYPE_TAG:
+		len += btf_type_snprintf(btf, t->type, buf + len,
+					 buf_sz - len);
+		break;
+	default:
+		SNPRINTF_APPEND("kind#%d", BTF_INFO_KIND(t->info));
+		break;
+	}
+
+#undef SNPRINTF_APPEND
+	return len;
+}
+
 int btf_type_snprintf_show(const struct btf *btf, u32 type_id, void *obj,
 			   char *buf, int len, u64 flags)
 {
