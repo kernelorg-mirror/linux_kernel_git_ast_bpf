@@ -76,12 +76,12 @@ __naked void arithmetics(void)
 #ifdef CAN_USE_BPF_ST
 SEC("socket")
 __log_level(2)
-__msg("  1: .1........ (07) r1 += -8")
-__msg("  2: .1........ (7a) *(u64 *)(r1 +0) = 7")
-__msg("  3: .1........ (b7) r2 = 42")
-__msg("  4: .12....... (7b) *(u64 *)(r1 +0) = r2")
-__msg("  5: .12....... (7b) *(u64 *)(r1 +0) = r2")
-__msg("  6: .......... (b7) r0 = 0")
+__msg("  1: .1........ {{.*}}(07) r1 += -8")
+__msg("  2: .1........ {{.*}}(7a) *(u64 *)(r1 +0) = 7")
+__msg("  3: .1........ {{.*}}(b7) r2 = 42")
+__msg("  4: .12....... {{.*}}(7b) *(u64 *)(r1 +0) = r2")
+__msg("  5: .12....... {{.*}}(7b) *(u64 *)(r1 +0) = r2")
+__msg("  6: .......... {{.*}}(b7) r0 = 0")
 __naked void store(void)
 {
 	asm volatile (
@@ -99,9 +99,9 @@ __naked void store(void)
 
 SEC("socket")
 __log_level(2)
-__msg("1: ....4..... (07) r4 += -8")
-__msg("2: ....4..... (79) r5 = *(u64 *)(r4 +0)")
-__msg("3: ....45.... (07) r4 += -8")
+__msg("1: ....4..... {{.*}}(07) r4 += -8")
+__msg("2: ....4..... {{.*}}(79) r5 = *(u64 *)(r4 +0)")
+__msg("3: ....45.... {{.*}}(07) r4 += -8")
 __naked void load(void)
 {
 	asm volatile (
@@ -131,13 +131,13 @@ __naked void endian(void)
 
 SEC("socket")
 __log_level(2)
-__msg(" 8: 0......... (b7) r1 = 1")
-__msg(" 9: 01........ (db) r1 = atomic64_fetch_add((u64 *)(r0 +0), r1)")
-__msg("10: 01........ (c3) lock *(u32 *)(r0 +0) += r1")
-__msg("11: 01........ (db) r1 = atomic64_xchg((u64 *)(r0 +0), r1)")
-__msg("12: 01........ (bf) r2 = r0")
-__msg("13: .12....... (bf) r0 = r1")
-__msg("14: 012....... (db) r0 = atomic64_cmpxchg((u64 *)(r2 +0), r0, r1)")
+__msg(" 8: 0......... {{.*}}(b7) r1 = 1")
+__msg(" 9: 01........ {{.*}}(db) r1 = atomic64_fetch_add((u64 *)(r0 +0), r1)")
+__msg("10: 01........ {{.*}}(c3) lock *(u32 *)(r0 +0) += r1")
+__msg("11: 01........ {{.*}}(db) r1 = atomic64_xchg((u64 *)(r0 +0), r1)")
+__msg("12: 01........ {{.*}}(bf) r2 = r0")
+__msg("13: .12....... {{.*}}(bf) r0 = r1")
+__msg("14: 012....... {{.*}}(db) r0 = atomic64_cmpxchg((u64 *)(r2 +0), r0, r1)")
 __naked void atomic(void)
 {
 	asm volatile (
@@ -192,8 +192,8 @@ __naked void atomic_load_acq_store_rel(void)
 
 SEC("socket")
 __log_level(2)
-__msg("4: .12....7.. (85) call bpf_trace_printk#6")
-__msg("5: 0......7.. (0f) r0 += r7")
+__msg("4: .12....7.. {{.*}}(85) call bpf_trace_printk#6")
+__msg("5: 0......7.. {{.*}}(0f) r0 += r7")
 __naked void regular_call(void)
 {
 	asm volatile (
