@@ -254,24 +254,6 @@ static void bpf_map_key_store(struct bpf_insn_aux_data *aux, u64 state)
 			     (poisoned ? BPF_MAP_KEY_POISON : 0ULL);
 }
 
-static bool bpf_helper_call(const struct bpf_insn *insn)
-{
-	return insn->code == (BPF_JMP | BPF_CALL) &&
-	       insn->src_reg == 0;
-}
-
-static bool bpf_pseudo_call(const struct bpf_insn *insn)
-{
-	return insn->code == (BPF_JMP | BPF_CALL) &&
-	       insn->src_reg == BPF_PSEUDO_CALL;
-}
-
-static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
-{
-	return insn->code == (BPF_JMP | BPF_CALL) &&
-	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
-}
-
 struct bpf_map_desc {
 	struct bpf_map *ptr;
 	int uid;
@@ -369,7 +351,7 @@ static const char *btf_type_name(const struct btf *btf, u32 id)
 static DEFINE_MUTEX(bpf_verifier_lock);
 static DEFINE_MUTEX(bpf_percpu_ma_lock);
 
-__printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
+__printf(2, 3) void verbose(void *private_data, const char *fmt, ...)
 {
 	struct bpf_verifier_env *env = private_data;
 	va_list args;
@@ -3073,7 +3055,7 @@ struct bpf_subprog_info *bpf_find_containing_subprog(struct bpf_verifier_env *en
 }
 
 /* Find subprogram that starts exactly at 'off' */
-static int find_subprog(struct bpf_verifier_env *env, int off)
+int find_subprog(struct bpf_verifier_env *env, int off)
 {
 	struct bpf_subprog_info *p;
 
@@ -4177,7 +4159,7 @@ static const char *disasm_kfunc_name(void *data, const struct bpf_insn *insn)
 	return btf_name_by_offset(desc_btf, func->name_off);
 }
 
-static void verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn)
+void verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	const struct bpf_insn_cbs cbs = {
 		.cb_call	= disasm_kfunc_name,
@@ -13905,6 +13887,167 @@ static int fetch_kfunc_arg_meta(struct bpf_verifier_env *env,
 	return 0;
 }
 
+/*
+ * Determine how many bytes a helper accesses through a stack pointer at
+ * argument position @arg (0-based, corresponding to R1-R5).
+ *
+ * Returns:
+ *   > 0   known read access size in bytes (stack use)
+ *     0   no access (e.g. size argument is constant 0)
+ * S64_MIN unknown -- caller must fall back to conservative marking
+ *   < 0   known write access of (-return) bytes (stack def, MEM_UNINIT arg)
+ */
+static s64 helper_arg_stack_access_bytes(struct bpf_verifier_env *env,
+					 const struct bpf_func_proto *fn,
+					 int arg, int insn_idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	enum bpf_arg_type at = fn->arg_type[arg];
+
+	switch (base_type(at)) {
+	case ARG_PTR_TO_MAP_KEY:
+	case ARG_PTR_TO_MAP_VALUE: {
+		struct bpf_map *map = NULL;
+		u64 val;
+		int i, map_reg;
+
+		for (i = 0; i < arg; i++) {
+			if (base_type(fn->arg_type[i]) == ARG_CONST_MAP_PTR)
+				break;
+		}
+		if (i == arg)
+			return S64_MIN;
+
+		map_reg = BPF_REG_1 + i;
+
+		if (!(aux->const_reg_mask & BIT(map_reg)))
+			return S64_MIN;
+
+		val = aux->const_reg_vals[map_reg];
+		/*
+		 * Verify the constant is actually a map pointer and not an
+		 * arbitrary user value.
+		 */
+		for (i = 0; i < env->used_map_cnt; i++) {
+			if ((u64)(long)env->used_maps[i] == val) {
+				map = env->used_maps[i];
+				break;
+			}
+		}
+		if (!map)
+			return S64_MIN;
+		return base_type(at) == ARG_PTR_TO_MAP_KEY ?
+			map->key_size : map->value_size;
+	}
+	case ARG_PTR_TO_MEM:
+		if (at & MEM_FIXED_SIZE)
+			return fn->arg_size[arg];
+		if (arg + 1 < ARRAY_SIZE(fn->arg_type) &&
+		    arg_type_is_mem_size(fn->arg_type[arg + 1])) {
+			int size_reg = BPF_REG_1 + arg + 1;
+
+			if (aux->const_reg_mask & BIT(size_reg))
+				return (s64)aux->const_reg_vals[size_reg];
+		}
+		return S64_MIN;
+	case ARG_PTR_TO_DYNPTR:
+		return BPF_DYNPTR_SIZE;
+	default:
+		return S64_MIN;
+	}
+}
+
+/*
+ * Determine how many bytes a kfunc accesses through a stack pointer at
+ * argument position @arg (0-based, corresponding to R1-R5).
+ *
+ * Returns:
+ *   > 0      known read access size in bytes (stack use)
+ *     0      no access (e.g. size argument is constant 0)
+ *   S64_MIN  unknown -- caller must fall back to conservative marking
+ *   < 0      known write access of (-return) bytes (stack def, e.g. iter init)
+ */
+static s64 kfunc_arg_stack_access_bytes(struct bpf_verifier_env *env,
+					struct bpf_kfunc_call_arg_meta *meta,
+					int arg, int insn_idx)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	const struct btf *btf = meta->btf;
+	const struct btf_param *args;
+	const struct btf_type *t, *ref_t;
+	u32 nargs, type_size;
+
+	args = btf_params(meta->func_proto);
+	nargs = btf_type_vlen(meta->func_proto);
+	if (arg >= nargs)
+		return S64_MIN;
+
+	t = btf_type_skip_modifiers(btf, args[arg].type, NULL);
+	if (!t || !btf_type_is_ptr(t))
+		return S64_MIN;
+
+	/* dynptr: fixed 16-byte on-stack representation */
+	if (is_kfunc_arg_dynptr(btf, &args[arg]))
+		return BPF_DYNPTR_SIZE;
+
+	/* ptr + __sz/__szk pair: size is in the next register */
+	if (arg + 1 < nargs &&
+	    (btf_param_match_suffix(btf, &args[arg + 1], "__sz") ||
+	     btf_param_match_suffix(btf, &args[arg + 1], "__szk"))) {
+		int size_reg = BPF_REG_1 + arg + 1;
+
+		if (aux->const_reg_mask & BIT(size_reg))
+			return (s64)aux->const_reg_vals[size_reg];
+		return S64_MIN;
+	}
+
+	/* fixed-size pointed-to type: resolve via BTF */
+	ref_t = btf_type_skip_modifiers(btf, t->type, NULL);
+	if (ref_t && !IS_ERR(btf_resolve_size(btf, ref_t, &type_size)))
+		return type_size;
+
+	return S64_MIN;
+}
+
+s64 bpf_helper_stack_access_bytes(struct bpf_verifier_env *env,
+				  struct bpf_insn *insn, int arg,
+				  int insn_idx)
+{
+	const struct bpf_func_proto *fn;
+	s64 size;
+
+	if (get_helper_proto(env, insn->imm, &fn) < 0)
+		return S64_MIN;
+	size = helper_arg_stack_access_bytes(env, fn, arg, insn_idx);
+
+	/* MEM_UNINIT args are write-only: the helper initializes the
+	 * buffer without reading it. Signal stack def by negating.
+	 */
+	if (size > 0 && fn->arg_type[arg] & MEM_UNINIT)
+		return -size;
+	return size;
+}
+
+s64 bpf_kfunc_stack_access_bytes(struct bpf_verifier_env *env,
+				 struct bpf_insn *insn, int arg,
+				 int insn_idx)
+{
+	struct bpf_kfunc_call_arg_meta meta;
+	s64 size;
+
+	if (fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta) < 0)
+		return S64_MIN;
+	size = kfunc_arg_stack_access_bytes(env, &meta, arg, insn_idx);
+
+	/* KF_ITER_NEW kfuncs initialize the iterator state at arg 0,
+	 * making it a stack def rather than a stack use. Signal this
+	 * to the caller by negating the size.
+	 */
+	if (size > 0 && arg == 0 && meta.kfunc_flags & KF_ITER_NEW)
+		return -size;
+	return size;
+}
+
 /* check special kfuncs and return:
  *  1  - not fall-through to 'else' branch, continue verification
  *  0  - fall-through to 'else' branch
@@ -18330,17 +18473,11 @@ static bool verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm)
 	}
 }
 
-struct call_summary {
-	u8 num_params;
-	bool is_void;
-	bool fastcall;
-};
-
 /* If @call is a kfunc or helper call, fills @cs and returns true,
  * otherwise returns false.
  */
-static bool get_call_summary(struct bpf_verifier_env *env, struct bpf_insn *call,
-			     struct call_summary *cs)
+bool get_call_summary(struct bpf_verifier_env *env, struct bpf_insn *call,
+		      struct call_summary *cs)
 {
 	struct bpf_kfunc_call_arg_meta meta;
 	const struct bpf_func_proto *fn;
