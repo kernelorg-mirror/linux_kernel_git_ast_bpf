@@ -580,12 +580,12 @@ __description("valid map access into an array using natural aligned 32-bit const
 __success __retval(4)
 unsigned int an_array_with_a_32bit_constant_0_no_nullness(void)
 {
-	/* Unlike the above tests, 32-bit zeroing is precisely tracked even
-	 * if writes are not aligned to BPF_REG_SIZE. This tests that our
-	 * STACK_ZERO handling functions.
+	/* Use aligned(8) to ensure the compiler spills the constant as
+	 * a full 64-bit STACK_SPILL, enabling constant folding of the
+	 * map lookup key.
 	 */
 	struct test_val *val;
-	__u32 key = 0;
+	__u32 __attribute__((aligned(8))) key = 0;
 
 	val = bpf_map_lookup_elem(&map_array, &key);
 	val->index = offsetof(struct test_val, foo);

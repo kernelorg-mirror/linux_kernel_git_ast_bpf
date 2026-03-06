@@ -85,11 +85,8 @@ static bool nfp_bpf_map_update_value_ok(struct bpf_verifier_env *env)
 	const struct bpf_reg_state *reg1 = cur_regs(env) + BPF_REG_1;
 	const struct bpf_reg_state *reg3 = cur_regs(env) + BPF_REG_3;
 	struct bpf_offloaded_map *offmap;
-	struct bpf_func_state *state;
 	struct nfp_bpf_map *nfp_map;
 	int off, i;
-
-	state = env->cur_state->frame[reg3->frameno];
 
 	/* We need to record each time update happens with non-zero words,
 	 * in case such word is used in atomic operations.
@@ -101,15 +98,9 @@ static bool nfp_bpf_map_update_value_ok(struct bpf_verifier_env *env)
 	off = reg3->var_off.value;
 
 	for (i = 0; i < offmap->map.value_size; i++) {
-		struct bpf_stack_state *stack_entry;
-		unsigned int soff;
-
-		soff = -(off + i) - 1;
-		stack_entry = &state->stack[soff / BPF_REG_SIZE];
-		if (stack_entry->slot_type[soff % BPF_REG_SIZE] == STACK_ZERO)
-			continue;
-
 		if (nfp_map->use_map[i / 4].type == NFP_MAP_USE_ATOMIC_CNT) {
+			unsigned int soff = -(off + i) - 1;
+
 			pr_vlog(env, "value at offset %d/%d may be non-zero, bpf_map_update_elem() is required to initialize atomic counters to zero to avoid offload endian issues\n",
 				i, soff);
 			return false;

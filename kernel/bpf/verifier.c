@@ -1348,7 +1348,6 @@ static bool is_stack_slot_special(const struct bpf_stack_state *stack)
 		return true;
 	case STACK_INVALID:
 	case STACK_MISC:
-	case STACK_ZERO:
 		return false;
 	default:
 		WARN_ONCE(1, "unknown stack slot type %d\n", type);
@@ -1376,9 +1375,7 @@ static bool is_spilled_scalar_reg64(const struct bpf_stack_state *stack)
 	       stack->spilled_ptr.type == SCALAR_VALUE;
 }
 
-/* Mark stack slot as STACK_MISC, unless it is already STACK_INVALID, in which
- * case they are equivalent, or it's STACK_ZERO, in which case we preserve
- * more precise STACK_ZERO.
+/* Mark stack slot as STACK_MISC, unless it is already STACK_INVALID.
  * Regardless of allow_ptr_leaks setting (i.e., privileged or unprivileged
  * mode), we won't promote STACK_INVALID to STACK_MISC. In privileged case it is
  * unnecessary as both are considered equivalent when loading data and pruning,
@@ -1387,8 +1384,6 @@ static bool is_spilled_scalar_reg64(const struct bpf_stack_state *stack)
  */
 static void mark_stack_slot_misc(struct bpf_verifier_env *env, u8 *stype)
 {
-	if (*stype == STACK_ZERO)
-		return;
 	if (*stype == STACK_INVALID)
 		return;
 	*stype = STACK_MISC;
@@ -5256,7 +5251,7 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 		for (i = 0; i < size; i++) {
 			u8 type = state->stack[spi].slot_type[i];
 
-			if (type != STACK_MISC && type != STACK_ZERO) {
+			if (type != STACK_MISC) {
 				sanitize = true;
 				break;
 			}
@@ -5325,21 +5320,6 @@ static int check_stack_write_fixed_off(struct bpf_verifier_env *env,
 			for (i = 0; i < BPF_REG_SIZE; i++)
 				scrub_spilled_slot(&state->stack[spi].slot_type[i]);
 
-		/* when we zero initialize stack slots mark them as such */
-		if ((reg && register_is_null(reg)) ||
-		    (!reg && is_bpf_st_mem(insn) && insn->imm == 0)) {
-			/* STACK_ZERO case happened because register spill
-			 * wasn't properly aligned at the stack slot boundary,
-			 * so it's not a register spill anymore; force
-			 * originating register to be precise to make
-			 * STACK_ZERO correct for subsequent states
-			 */
-			err = mark_chain_precision(env, value_regno);
-			if (err)
-				return err;
-			type = STACK_ZERO;
-		}
-
 		/* Mark slots affected by this stack write. */
 		for (i = 0; i < size; i++)
 			state->stack[spi].slot_type[(slot - i) % BPF_REG_SIZE] = type;
@@ -5377,14 +5357,10 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 {
 	struct bpf_func_state *cur; /* state of the current function */
 	int min_off, max_off;
-	int i, err;
+	int i, j, err;
 	struct bpf_reg_state *ptr_reg = NULL, *value_reg = NULL;
 	struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
 	bool writing_zero = false;
-	/* set if the fact that we're writing a zero is used to let any
-	 * stack slots remain STACK_ZERO
-	 */
-	bool zero_used = false;
 
 	cur = env->cur_state->frame[env->cur_state->curframe];
 	ptr_reg = &cur->regs[ptr_regno];
@@ -5416,7 +5392,7 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 		stype = &state->stack[spi].slot_type[slot % BPF_REG_SIZE];
 		mark_stack_slot_scratched(env, spi);
 
-		if (!env->allow_ptr_leaks && *stype != STACK_MISC && *stype != STACK_ZERO) {
+		if (!env->allow_ptr_leaks && *stype != STACK_MISC) {
 			/* Reject the write if range we may write to has not
 			 * been initialized beforehand. If we didn't reject
 			 * here, the ptr status would be erased below (even
@@ -5440,21 +5416,22 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 		    is_spilled_scalar_reg(&state->stack[spi])) {
 			struct bpf_reg_state *spill_reg = &state->stack[spi].spilled_ptr;
 
-			if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0) {
-				zero_used = true;
+			if (tnum_is_const(spill_reg->var_off) && spill_reg->var_off.value == 0)
 				continue;
-			}
 		}
 
 		/* Erase all other spilled pointers. */
 		state->stack[spi].spilled_ptr.type = NOT_INIT;
+		/* Scrub remaining STACK_SPILL bytes in this SPI that are
+		 * outside the write range, to avoid leaving an inconsistent
+		 * state where is_spilled_reg() returns true but spilled_ptr
+		 * is NOT_INIT.
+		 */
+		for (j = 0; j < BPF_REG_SIZE; j++)
+			scrub_spilled_slot(&state->stack[spi].slot_type[j]);
 
 		/* Update the slot type. */
 		new_type = STACK_MISC;
-		if (writing_zero && *stype == STACK_ZERO) {
-			new_type = STACK_ZERO;
-			zero_used = true;
-		}
 		/* If the slot is STACK_INVALID, we check whether it's OK to
 		 * pretend that it will be initialized by this write. The slot
 		 * might not actually be written to, and so if we mark it as
@@ -5470,22 +5447,14 @@ static int check_stack_write_var_off(struct bpf_verifier_env *env,
 		}
 		*stype = new_type;
 	}
-	if (zero_used) {
-		/* backtracking doesn't work for STACK_ZERO yet. */
-		err = mark_chain_precision(env, value_regno);
-		if (err)
-			return err;
-	}
 	return 0;
 }
 
 /* When register 'dst_regno' is assigned some values from stack[min_off,
  * max_off), we set the register's type according to the types of the
- * respective stack slots. If all the stack values are known to be zeros, then
- * so is the destination reg. Otherwise, the register is considered to be
- * SCALAR. This function does not deal with register filling; the caller must
- * ensure that all spilled registers in the stack range have been marked as
- * read.
+ * respective stack slots. This function does not deal with register filling;
+ * the caller must ensure that all spilled registers in the stack range have
+ * been marked as read.
  */
 static void mark_reg_stack_read(struct bpf_verifier_env *env,
 				/* func where src register points to */
@@ -5495,27 +5464,13 @@ static void mark_reg_stack_read(struct bpf_verifier_env *env,
 	struct bpf_verifier_state *vstate = env->cur_state;
 	struct bpf_func_state *state = vstate->frame[vstate->curframe];
 	int i, slot, spi;
-	u8 *stype;
-	int zeros = 0;
 
 	for (i = min_off; i < max_off; i++) {
 		slot = -i - 1;
 		spi = slot / BPF_REG_SIZE;
 		mark_stack_slot_scratched(env, spi);
-		stype = ptr_state->stack[spi].slot_type;
-		if (stype[slot % BPF_REG_SIZE] != STACK_ZERO)
-			break;
-		zeros++;
 	}
-	if (zeros == max_off - min_off) {
-		/* Any access_size read into register is zero extended,
-		 * so the whole register == const_zero.
-		 */
-		__mark_reg_const_zero(env, &state->regs[dst_regno]);
-	} else {
-		/* have read misc data from the stack */
-		mark_reg_unknown(env, state->regs, dst_regno);
-	}
+	mark_reg_unknown(env, state->regs, dst_regno);
 }
 
 /* Read the stack at 'off' and put the results into the register indicated by
@@ -5587,7 +5542,7 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				if (get_reg_width(reg) > size * BITS_PER_BYTE)
 					state->regs[dst_regno].id = 0;
 			} else {
-				int spill_cnt = 0, zero_cnt = 0;
+				int spill_cnt = 0;
 
 				for (i = 0; i < size; i++) {
 					type = stype[(slot - i) % BPF_REG_SIZE];
@@ -5597,10 +5552,6 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 					}
 					if (type == STACK_MISC)
 						continue;
-					if (type == STACK_ZERO) {
-						zero_cnt++;
-						continue;
-					}
 					if (type == STACK_INVALID && env->allow_uninit_stack)
 						continue;
 					verbose(env, "invalid read from stack off %d+%d size %d\n",
@@ -5612,10 +5563,6 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 				    tnum_is_const(reg->var_off) && reg->var_off.value == 0) {
 					__mark_reg_const_zero(env, &state->regs[dst_regno]);
 					/* this IS register fill, so keep insn_flags */
-				} else if (zero_cnt == size) {
-					/* similarly to mark_reg_stack_read(), preserve zeroes */
-					__mark_reg_const_zero(env, &state->regs[dst_regno]);
-					insn_flags = 0; /* not restoring original register state */
 				} else {
 					mark_reg_unknown(env, state->regs, dst_regno);
 					insn_flags = 0; /* not restoring original register state */
@@ -5648,8 +5595,6 @@ static int check_stack_read_fixed_off(struct bpf_verifier_env *env,
 		for (i = 0; i < size; i++) {
 			type = stype[(slot - i) % BPF_REG_SIZE];
 			if (type == STACK_MISC)
-				continue;
-			if (type == STACK_ZERO)
 				continue;
 			if (type == STACK_INVALID && env->allow_uninit_stack)
 				continue;
@@ -8274,8 +8219,7 @@ static int check_stack_range_initialized(
 		stype = &state->stack[spi].slot_type[slot % BPF_REG_SIZE];
 		if (*stype == STACK_MISC)
 			goto mark;
-		if ((*stype == STACK_ZERO) ||
-		    (*stype == STACK_INVALID && env->allow_uninit_stack)) {
+		if (*stype == STACK_INVALID && env->allow_uninit_stack) {
 			if (clobber) {
 				/* helper can write anything into the stack */
 				*stype = STACK_MISC;
@@ -9784,7 +9728,6 @@ static int get_constant_map_key(struct bpf_verifier_env *env,
 	struct bpf_reg_state *reg;
 	int slot, spi, off;
 	int spill_size = 0;
-	int zero_size = 0;
 	int stack_off;
 	int i, err;
 	u8 *stype;
@@ -9801,14 +9744,6 @@ static int get_constant_map_key(struct bpf_verifier_env *env,
 	spi = slot / BPF_REG_SIZE;
 	off = slot % BPF_REG_SIZE;
 	stype = state->stack[spi].slot_type;
-
-	/* First handle precisely tracked STACK_ZERO */
-	for (i = off; i >= 0 && stype[i] == STACK_ZERO; i--)
-		zero_size++;
-	if (zero_size >= key_size) {
-		*value = 0;
-		return 0;
-	}
 
 	/* Check that stack contains a scalar spill of expected size */
 	if (!is_spilled_scalar_reg(&state->stack[spi]))
@@ -20030,13 +19965,6 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 			continue;
 		}
 
-		/* if old state was safe with misc data in the stack
-		 * it will be safe with zero-initialized stack.
-		 * The opposite is not true
-		 */
-		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_MISC &&
-		    cur->stack[spi].slot_type[i % BPF_REG_SIZE] == STACK_ZERO)
-			continue;
 		if (old->stack[spi].slot_type[i % BPF_REG_SIZE] !=
 		    cur->stack[spi].slot_type[i % BPF_REG_SIZE])
 			/* Ex: old explored (safe) state has STACK_SPILL in
@@ -20096,7 +20024,6 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 				return false;
 			break;
 		case STACK_MISC:
-		case STACK_ZERO:
 		case STACK_INVALID:
 			continue;
 		/* Ensure that new unhandled slot types return false by default */

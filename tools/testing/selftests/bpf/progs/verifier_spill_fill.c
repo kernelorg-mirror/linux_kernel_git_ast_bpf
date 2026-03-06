@@ -464,28 +464,28 @@ l0_%=:	r1 >>= 16;					\
 SEC("raw_tp")
 __log_level(2)
 __success
-__msg("fp-8=0m??scalar()")
-__msg("fp-16=00mm??scalar()")
-__msg("fp-24=00mm???scalar()")
+__msg("fp-8=mm??scalar()")
+__msg("fp-16=mmmm??scalar()")
+__msg("fp-24=mmmm???scalar()")
 __naked void spill_subregs_preserve_stack_zero(void)
 {
 	asm volatile (
 		"call %[bpf_get_prandom_u32];"
 
-		/* 32-bit subreg spill with ZERO, MISC, and INVALID */
-		".8byte %[fp1_u8_st_zero];"   /* ZERO, LLVM-18+: *(u8 *)(r10 -1) = 0; */
+		/* 32-bit subreg spill with MISC and INVALID */
+		".8byte %[fp1_u8_st_zero];"   /* MISC, LLVM-18+: *(u8 *)(r10 -1) = 0; */
 		"*(u8 *)(r10 -2) = r0;"       /* MISC */
 		/* fp-3 and fp-4 stay INVALID */
 		"*(u32 *)(r10 -8) = r0;"
 
-		/* 16-bit subreg spill with ZERO, MISC, and INVALID */
-		".8byte %[fp10_u16_st_zero];" /* ZERO, LLVM-18+: *(u16 *)(r10 -10) = 0; */
+		/* 16-bit subreg spill with MISC and INVALID */
+		".8byte %[fp10_u16_st_zero];" /* MISC, LLVM-18+: *(u16 *)(r10 -10) = 0; */
 		"*(u16 *)(r10 -12) = r0;"     /* MISC */
 		/* fp-13 and fp-14 stay INVALID */
 		"*(u16 *)(r10 -16) = r0;"
 
-		/* 8-bit subreg spill with ZERO, MISC, and INVALID */
-		".8byte %[fp18_u16_st_zero];" /* ZERO, LLVM-18+: *(u16 *)(r18 -10) = 0; */
+		/* 8-bit subreg spill with MISC and INVALID */
+		".8byte %[fp18_u16_st_zero];" /* MISC, LLVM-18+: *(u16 *)(r18 -10) = 0; */
 		"*(u16 *)(r10 -20) = r0;"     /* MISC */
 		/* fp-21, fp-22, and fp-23 stay INVALID */
 		"*(u8 *)(r10 -24) = r0;"
@@ -573,7 +573,7 @@ __naked void partial_stack_load_preserves_zeros(void)
 		"r1 += r2;"
 		"*(u8 *)(r1 + 0) = r2;" /* this should be fine */
 
-		/* for completeness, load U64 from STACK_ZERO slot */
+		/* for completeness, load U64 from STACK_MISC slot */
 		"r1 = %[single_byte_buf];"
 		"r2 = *(u64 *)(r10 -8);"
 		"r1 += r2;"
@@ -595,13 +595,11 @@ __naked void partial_stack_load_preserves_zeros(void)
 
 SEC("raw_tp")
 __log_level(2)
-__success
-/* fp-4 is STACK_ZERO */
-__msg("2: (62) *(u32 *)(r10 -4) = 0          ; R10=fp0 fp-8=0000????")
-__msg("4: (71) r2 = *(u8 *)(r10 -1)          ; R2=0 R10=fp0 fp-8=0000????")
-__msg("5: (0f) r1 += r2")
-__msg("mark_precise: frame0: last_idx 5 first_idx 0 subseq_idx -1")
-__msg("mark_precise: frame0: regs=r2 stack= before 4: (71) r2 = *(u8 *)(r10 -1)")
+__failure
+/* Without STACK_ZERO, sub-register zero writes are tracked as STACK_MISC.
+ * Reads back produce unknown scalar, which fails bounds check.
+ */
+__msg("invalid access to map value")
 __naked void partial_stack_load_preserves_partial_zeros(void)
 {
 	asm volatile (

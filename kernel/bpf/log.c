@@ -539,7 +539,6 @@ static char slot_type_char[] = {
 	[STACK_INVALID]	= '?',
 	[STACK_SPILL]	= 'r',
 	[STACK_MISC]	= 'm',
-	[STACK_ZERO]	= '0',
 	[STACK_DYNPTR]	= 'd',
 	[STACK_ITER]	= 'i',
 	[STACK_IRQ_FLAG] = 'f'
@@ -826,7 +825,6 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 				reg->iter.depth);
 			break;
 		case STACK_MISC:
-		case STACK_ZERO:
 		default:
 			verbose(env, " fp%d=%s", (-i - 1) * BPF_REG_SIZE, types_buf);
 			break;
