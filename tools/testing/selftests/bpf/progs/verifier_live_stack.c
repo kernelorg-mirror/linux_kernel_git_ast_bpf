@@ -13,6 +13,13 @@ struct {
 	__type(value, long long);
 } map SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} array_map_8b SEC(".maps");
+
 SEC("socket")
 __log_level(2)
 __naked void simple_read_simple_write(void)
@@ -485,6 +492,59 @@ static __used __naked void do_nothing2(void)
 	"r0 = 0;"
 	"exit;"
 	::: __clobber_all);
+}
+
+/*
+ * Reproducer for unsound pruning when clean_verifier_state() promotes
+ * live STACK_ZERO bytes to STACK_MISC.
+ *
+ * Program shape:
+ * - Build key at fp-4:
+ *   - path A keeps key byte as STACK_ZERO;
+ *   - path B writes unknown byte making it STACK_MISC.
+ * - Branches merge at a prune point before map_lookup.
+ * - map_lookup on ARRAY map is value-sensitive to constant zero key:
+ *   - path A: const key 0 => PTR_TO_MAP_VALUE (non-NULL);
+ *   - path B: non-const key => PTR_TO_MAP_VALUE_OR_NULL.
+ * - Dereference lookup result without null check.
+ *
+ * Note this behavior won't trigger at fp-8, since the verifier will
+ * track 32-bit scalar spill differently as spilled_ptr.
+ *
+ * Correct verifier behavior: reject (path B unsafe).
+ * With blanket STACK_ZERO->STACK_MISC promotion on live slots, cached path A
+ * state can be generalized and incorrectly prune path B, making program load.
+ */
+SEC("socket")
+__flag(BPF_F_TEST_STATE_FREQ)
+__failure __msg("R0 invalid mem access 'map_value_or_null'")
+__naked void stack_zero_to_misc_unsound_array_lookup(void)
+{
+	asm volatile (
+	/* key at fp-4: all bytes STACK_ZERO */
+	"*(u32 *)(r10 - 4) = 0;"
+	"call %[bpf_get_prandom_u32];"
+	/* fall-through (path A) explored first */
+	"if r0 != 0 goto l_nonconst%=;"
+	/* path A: keep key constant zero */
+	"goto l_lookup%=;"
+"l_nonconst%=:"
+	/* path B: key byte turns to STACK_MISC, key no longer const */
+	"*(u8 *)(r10 - 4) = r0;"
+"l_lookup%=:"
+	/* value-sensitive lookup */
+	"r2 = r10;"
+	"r2 += -4;"
+	"r1 = %[array_map_8b] ll;"
+	"call %[bpf_map_lookup_elem];"
+	/* unsafe when lookup result is map_value_or_null */
+	"r0 = *(u64 *)(r0 + 0);"
+	"exit;"
+	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm(bpf_map_lookup_elem),
+	  __imm_addr(array_map_8b)
+	: __clobber_all);
 }
 
 /* BTF FUNC records are not generated for kfuncs referenced
