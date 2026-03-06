@@ -147,6 +147,33 @@ static __used __naked void read_first_param(void)
 }
 
 SEC("socket")
+__success
+__naked void arg_track_join_convergence(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"r2 = 2;"
+	"call arg_track_join_convergence_subprog;"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+static __used __naked void arg_track_join_convergence_subprog(void)
+{
+	asm volatile (
+	"if r1 == 0 goto 1f;"
+	"r0 = r1;"
+	"goto 2f;"
+"1:"
+	"r0 = r2;"
+"2:"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+SEC("socket")
 __flag(BPF_F_TEST_STATE_FREQ)
 __log_level(2)
 /* read_first_param2() function */
