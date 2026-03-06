@@ -720,3 +720,265 @@ __naked void spill_ptr_liveness_type_confusion(void)
 	  __imm_addr(map)
 	: __clobber_all);
 }
+
+/* === Tests for 4-byte stack slot liveness granularity === */
+
+/* Test that a 4-byte aligned write is stack_def and kills liveness.
+ *
+ *   0: *(u64 *)(r10 - 8) = 0      def slots 0,1 (full SPI 0)
+ *   1: *(u32 *)(r10 - 8) = 0      def slot 1 (4-byte write kills slot 1)
+ *   2: r0 = *(u64 *)(r10 - 8)     use slots 0,1
+ *   3: r0 = 0
+ *   4: exit
+ *
+ * At insn 1, the 4-byte write defines slot 1. Slot 0 still flows
+ * backward from insn 2's read: live_stack_before = 0x1.
+ */
+SEC("socket")
+__log_level(2)
+__msg("1: {{.*}} 0000000000000000:0000000000000001 (62) *(u32 *)(r10 -8) = 0")
+__naked void four_byte_write_kills_slot(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 8) = 0;"
+	"*(u32 *)(r10 - 8) = 0;"
+	"r0 = *(u64 *)(r10 - 8);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that a write to the upper half of an SPI is dead when only
+ * the lower half is read. This was impossible at SPI granularity
+ * where any read of the SPI kept the entire SPI live.
+ *
+ *   0: *(u32 *)(r10 - 8) = 0      def slot 1 (DEAD: never read)
+ *   1: *(u32 *)(r10 - 4) = 0      def slot 0
+ *   2: r0 = *(u32 *)(r10 - 4)     use slot 0 only
+ *   3: r0 = 0
+ *   4: exit
+ *
+ * At insn 0, nothing is live (0x0). Previously at SPI granularity,
+ * the read at insn 2 would mark the full SPI 0 as live and the
+ * 4-byte writes wouldn't count as def, so insn 0 would have had
+ * SPI 0 live (0x1).
+ */
+SEC("socket")
+__log_level(2)
+__msg("0: {{.*}} 0000000000000000:0000000000000000 (62) *(u32 *)(r10 -8) = 0")
+__msg("2: {{.*}} 0000000000000000:0000000000000001 (61) r0 = *(u32 *)(r10 -4)")
+__naked void dead_half_spi_write(void)
+{
+	asm volatile (
+	"*(u32 *)(r10 - 8) = 0;"
+	"*(u32 *)(r10 - 4) = 0;"
+	"r0 = *(u32 *)(r10 - 4);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that a 4-byte read from the upper half of SPI 0 makes only
+ * slot 1 live (0x2), not the full SPI (0x3).
+ *
+ *   0: *(u64 *)(r10 - 8) = 0      def slots 0,1
+ *   1: r0 = *(u32 *)(r10 - 8)     use slot 1 only (upper half)
+ *   2: r0 = 0
+ *   3: exit
+ *
+ * At insn 1, live_stack_before = 0x2 (slot 1 only).
+ */
+SEC("socket")
+__log_level(2)
+__msg("1: {{.*}} 0000000000000000:0000000000000002 (61) r0 = *(u32 *)(r10 -8)")
+__naked void four_byte_read_upper_half(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 8) = 0;"
+	"r0 = *(u32 *)(r10 - 8);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that a 2-byte write does NOT count as stack_def.
+ * Sub-4-byte writes don't fully cover a 4-byte slot,
+ * so liveness passes through.
+ *
+ *   0: *(u64 *)(r10 - 8) = 0      def slots 0,1
+ *   1: *(u16 *)(r10 - 4) = 0      NOT stack_def (2 < 4 bytes)
+ *   2: r0 = *(u32 *)(r10 - 4)     use slot 0
+ *   3: r0 = 0
+ *   4: exit
+ *
+ * At insn 1, slot 0 still live (0x1) because 2-byte write
+ * didn't kill it.
+ */
+SEC("socket")
+__log_level(2)
+__msg("1: {{.*}} 0000000000000000:0000000000000001 (6a) *(u16 *)(r10 -4) = 0")
+__naked void two_byte_write_no_kill(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 8) = 0;"
+	"*(u16 *)(r10 - 4) = 0;"
+	"r0 = *(u32 *)(r10 - 4);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that a 1-byte write does NOT count as stack_def.
+ *
+ *   0: *(u64 *)(r10 - 8) = 0      def slots 0,1
+ *   1: *(u8 *)(r10 - 4) = 0       NOT stack_def (1 < 4 bytes)
+ *   2: r0 = *(u32 *)(r10 - 4)     use slot 0
+ *   3: r0 = 0
+ *   4: exit
+ *
+ * At insn 1, slot 0 still live (0x1).
+ */
+SEC("socket")
+__log_level(2)
+__msg("1: {{.*}} 0000000000000000:0000000000000001 (72) *(u8 *)(r10 -4) = 0")
+__naked void one_byte_write_no_kill(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 8) = 0;"
+	"*(u8 *)(r10 - 4) = 0;"
+	"r0 = *(u32 *)(r10 - 4);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test stack access beyond fp-256 exercising the second bitmask word.
+ * fp-264 is SPI 32, slots 64-65, which are bits 0-1 of live_stack[1].
+ *
+ *   0: *(u64 *)(r10 - 264) = 0     def slots 64,65
+ *   1: r0 = *(u64 *)(r10 - 264)    use slots 64,65
+ *   2: r0 = 0
+ *   3: exit
+ *
+ * At insn 1, live_stack high word has bits 0,1 set: 0x3:0x0.
+ */
+SEC("socket")
+__log_level(2)
+__msg("1: {{.*}} 0000000000000003:0000000000000000 (79) r0 = *(u64 *)(r10 -264)")
+__naked void high_stack_second_bitmask_word(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 264) = 0;"
+	"r0 = *(u64 *)(r10 - 264);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that two separate 4-byte writes to each half of an SPI
+ * together kill liveness for the full SPI.
+ *
+ *   0: *(u32 *)(r10 - 8) = 0      def slot 1 (upper half)
+ *   1: *(u32 *)(r10 - 4) = 0      def slot 0 (lower half)
+ *   2: r0 = *(u64 *)(r10 - 8)     use slots 0,1
+ *   3: r0 = 0
+ *   4: exit
+ *
+ * At insn 0: live_stack_before = 0x0 (both slots killed by insns 0,1).
+ * At insn 1: live_stack_before = 0x2 (slot 1 still live, slot 0 killed here).
+ */
+SEC("socket")
+__log_level(2)
+__msg("0: {{.*}} 0000000000000000:0000000000000000 (62) *(u32 *)(r10 -8) = 0")
+__msg("1: {{.*}} 0000000000000000:0000000000000002 (62) *(u32 *)(r10 -4) = 0")
+__naked void two_four_byte_writes_kill_full_spi(void)
+{
+	asm volatile (
+	"*(u32 *)(r10 - 8) = 0;"
+	"*(u32 *)(r10 - 4) = 0;"
+	"r0 = *(u64 *)(r10 - 8);"
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Test that 4-byte writes on both branches kill a slot at the
+ * join point. Previously at SPI granularity, a 4-byte write was
+ * not stack_def, so liveness would flow backward through the
+ * branch that only had a 4-byte write.
+ *
+ *   0: call bpf_get_prandom_u32
+ *   1: if r0 != 0 goto 1f
+ *   2: *(u64 *)(r10 - 8) = 0       path A: def slots 0,1
+ *   3: goto 2f
+ * 1:4: *(u32 *)(r10 - 4) = 0       path B: def slot 0
+ * 2:5: r0 = *(u32 *)(r10 - 4)      use slot 0
+ *   6: r0 = 0
+ *   7: exit
+ *
+ * Both paths define slot 0 before the read. At insn 1 (branch),
+ * live_stack_before = 0x0 because slot 0 is killed on both paths.
+ */
+SEC("socket")
+__log_level(2)
+__msg("1: {{.*}} 0000000000000000:0000000000000000 (55) if r0 != 0x0 goto pc+2")
+__naked void both_branches_kill_slot(void)
+{
+	asm volatile (
+	"call %[bpf_get_prandom_u32];"
+	"if r0 != 0 goto 1f;"
+	"*(u64 *)(r10 - 8) = 0;"
+	"goto 2f;"
+"1:"
+	"*(u32 *)(r10 - 4) = 0;"
+"2:"
+	"r0 = *(u32 *)(r10 - 4);"
+	"r0 = 0;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* Soundness: cleaning the dead upper half of an SPI must not
+ * affect the live lower half's type information for pruning.
+ *
+ * Both halves of SPI 0 are written separately. Only the lower
+ * half (slot 0) is used as a 4-byte map key. The upper half
+ * (slot 1) is dead and cleaned to STACK_INVALID.
+ *
+ * Path A: key stays 0 (STACK_ZERO) → non-null array lookup
+ * Path B: key byte turns STACK_MISC → may-null array lookup
+ * Deref without null check: safe for A, unsafe for B.
+ *
+ * If half-SPI cleaning incorrectly corrupted the live half's
+ * type info, path A's cached state could generalize and unsoundly
+ * prune path B.
+ *
+ * Expected: reject (path B unsafe).
+ */
+SEC("socket")
+__flag(BPF_F_TEST_STATE_FREQ)
+__failure __msg("R0 invalid mem access 'map_value_or_null'")
+__naked void half_spi_clean_preserves_stack_zero(void)
+{
+	asm volatile (
+	"*(u32 *)(r10 - 4) = 0;"           /* slot 0: STACK_ZERO */
+	"*(u32 *)(r10 - 8) = 0;"           /* slot 1: STACK_ZERO (dead) */
+	"call %[bpf_get_prandom_u32];"
+	"if r0 != 0 goto l_nonconst%=;"
+	"goto l_lookup%=;"
+"l_nonconst%=:"
+	"*(u8 *)(r10 - 4) = r0;"           /* slot 0: STACK_MISC */
+"l_lookup%=:"
+	"r2 = r10;"
+	"r2 += -4;"
+	"r1 = %[array_map_8b] ll;"
+	"call %[bpf_map_lookup_elem];"
+	"r0 = *(u64 *)(r0 + 0);"           /* unsafe if null */
+	"exit;"
+	:
+	: __imm(bpf_get_prandom_u32),
+	  __imm(bpf_map_lookup_elem),
+	  __imm_addr(array_map_8b)
+	: __clobber_all);
+}
