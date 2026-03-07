@@ -224,6 +224,114 @@ enum bpf_stack_slot_type {
 
 #define BPF_REG_SIZE 8	/* size of eBPF register in bytes */
 
+/* 4-byte stack slot granularity for liveness analysis */
+#define STACK_SLOT_SZ	4
+#define STACK_SLOTS		(MAX_BPF_STACK / STACK_SLOT_SZ)	/* 128 */
+
+static inline bool spis_is_zero(const u64 spis[2])
+{
+	return spis[0] == 0 && spis[1] == 0;
+}
+
+static inline void spis_copy(u64 dst[2], const u64 src[2])
+{
+	dst[0] = src[0];
+	dst[1] = src[1];
+}
+
+static inline void spis_or(u64 dst[2], const u64 src[2])
+{
+	dst[0] |= src[0];
+	dst[1] |= src[1];
+}
+
+static inline void spis_set_all(u64 spis[2])
+{
+	spis[0] = U64_MAX;
+	spis[1] = U64_MAX;
+}
+
+static inline bool spis_is_all(const u64 spis[2])
+{
+	return spis[0] == U64_MAX && spis[1] == U64_MAX;
+}
+
+static inline void spis_clear(u64 spis[2])
+{
+	spis[0] = 0;
+	spis[1] = 0;
+}
+
+static inline void spis_set_bit(u64 spis[2], u32 slot)
+{
+	spis[slot / 64] |= BIT_ULL(slot % 64);
+}
+
+static inline bool spis_equal(const u64 a[2], const u64 b[2])
+{
+	return a[0] == b[0] && a[1] == b[1];
+}
+
+static inline void spis_or_range(u64 mask[2], u32 lo, u32 hi)
+{
+	u32 w;
+
+	for (w = lo; w <= hi && w < STACK_SLOTS; w++)
+		mask[w / 64] |= BIT_ULL(w % 64);
+}
+
+/*
+ * Check if shifting a u64[2] bitmask left by @shift would lose any set bits.
+ */
+static inline bool spis_shift_would_overflow(const u64 src[2], int shift)
+{
+	if (shift >= STACK_SLOTS)
+		return !spis_is_zero(src);
+	if (shift == 0)
+		return false;
+	if (shift == 64)
+		return src[1] != 0;
+	if (shift > 64)
+		return src[1] != 0 || (src[0] >> (128 - shift));
+	return (src[1] >> (64 - shift)) != 0;
+}
+
+/*
+ * Shift a u64[2] bitmask left by @shift positions and OR into @dst.
+ */
+static inline void spis_shift_or(u64 dst[2], const u64 src[2], int shift)
+{
+	if (shift >= STACK_SLOTS || shift < 0)
+		return;
+	if (shift >= 64) {
+		dst[1] |= src[0] << (shift - 64);
+	} else if (shift > 0) {
+		dst[1] |= (src[1] << shift) | (src[0] >> (64 - shift));
+		dst[0] |= src[0] << shift;
+	} else {
+		dst[0] |= src[0];
+		dst[1] |= src[1];
+	}
+}
+
+/*
+ * Shift a u64[2] bitmask right by @shift positions and OR into @dst.
+ */
+static inline void spis_shift_right_or(u64 dst[2], const u64 src[2], int shift)
+{
+	if (shift >= STACK_SLOTS || shift < 0)
+		return;
+	if (shift >= 64) {
+		dst[0] |= src[1] >> (shift - 64);
+	} else if (shift > 0) {
+		dst[0] |= (src[0] >> shift) | (src[1] << (64 - shift));
+		dst[1] |= src[1] >> shift;
+	} else {
+		dst[0] |= src[0];
+		dst[1] |= src[1];
+	}
+}
+
 #define BPF_REGMASK_ARGS ((1 << BPF_REG_1) | (1 << BPF_REG_2) | \
 			  (1 << BPF_REG_3) | (1 << BPF_REG_4) | \
 			  (1 << BPF_REG_5))

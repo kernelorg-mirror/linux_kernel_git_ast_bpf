@@ -941,3 +941,28 @@ int compute_const_regs(struct bpf_verifier_env *env)
 	kvfree(ci_in);
 	return 0;
 }
+
+static inline int spis_hweight(const u64 spis[2])
+{
+	return hweight64(spis[0]) + hweight64(spis[1]);
+}
+
+static inline int spis_ffs(const u64 spis[2])
+{
+	if (spis[0])
+		return __ffs(spis[0]);
+	if (spis[1])
+		return 64 + __ffs(spis[1]);
+	return -1;
+}
+
+/* Returns true if a has any bits set that are not in b: (a & ~b) != 0 */
+static inline bool spis_any_new(const u64 a[2], const u64 b[2])
+{
+	return (a[0] & ~b[0]) || (a[1] & ~b[1]);
+}
+
+static inline bool spis_and_nonzero(const u64 a[2], const u64 b[2])
+{
+	return (a[0] & b[0]) || (a[1] & b[1]);
+}
