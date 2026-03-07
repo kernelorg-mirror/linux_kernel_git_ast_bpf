@@ -224,6 +224,57 @@ enum bpf_stack_slot_type {
 
 #define BPF_REG_SIZE 8	/* size of eBPF register in bytes */
 
+/* 4-byte stack slot granularity for liveness analysis */
+#define STACK_SLOT_SZ	4
+#define STACK_SLOTS	(MAX_BPF_STACK / STACK_SLOT_SZ)	/* 128 */
+
+static inline bool spis_is_zero(const u64 spis[2])
+{
+	return spis[0] == 0 && spis[1] == 0;
+}
+
+static inline void spis_copy(u64 dst[2], const u64 src[2])
+{
+	dst[0] = src[0];
+	dst[1] = src[1];
+}
+
+static inline void spis_or(u64 dst[2], const u64 src[2])
+{
+	dst[0] |= src[0];
+	dst[1] |= src[1];
+}
+
+static inline void spis_set_all(u64 spis[2])
+{
+	spis[0] = U64_MAX;
+	spis[1] = U64_MAX;
+}
+
+static inline void spis_clear(u64 spis[2])
+{
+	spis[0] = 0;
+	spis[1] = 0;
+}
+
+static inline void spis_set_bit(u64 spis[2], u32 slot)
+{
+	spis[slot / 64] |= BIT_ULL(slot % 64);
+}
+
+static inline bool spis_equal(const u64 a[2], const u64 b[2])
+{
+	return a[0] == b[0] && a[1] == b[1];
+}
+
+static inline void spis_or_range(u64 mask[2], u32 lo, u32 hi)
+{
+	u32 w;
+
+	for (w = lo; w <= hi && w < STACK_SLOTS; w++)
+		mask[w / 64] |= BIT_ULL(w % 64);
+}
+
 #define BPF_REGMASK_ARGS ((1 << BPF_REG_1) | (1 << BPF_REG_2) | \
 			  (1 << BPF_REG_3) | (1 << BPF_REG_4) | \
 			  (1 << BPF_REG_5))
