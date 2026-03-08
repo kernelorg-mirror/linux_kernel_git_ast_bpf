@@ -1030,6 +1030,13 @@ static inline bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
 }
 
+struct insn_live_regs {
+	u16 use;	/* registers read by instruction */
+	u16 def;	/* registers written by instruction */
+	u16 in;		/* registers that may be alive before instruction */
+	u16 out;	/* registers that may be alive after instruction */
+};
+
 __printf(2, 3) void verbose(void *private_data, const char *fmt, ...);
 __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
 				      const char *fmt, va_list args);
@@ -1265,6 +1272,8 @@ s64 bpf_kfunc_stack_access_bytes(struct bpf_verifier_env *env,
 				 struct bpf_insn *insn, int arg,
 				 int insn_idx);
 int compute_subprog_arg_access(struct bpf_verifier_env *env);
+int compute_stack_access(struct bpf_verifier_env *env, struct bpf_insn *insns,
+			    struct insn_live_regs *state, int insn_cnt);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);

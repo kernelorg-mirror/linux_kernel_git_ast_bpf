@@ -25683,14 +25683,6 @@ static int process_fd_array(struct bpf_verifier_env *env, union bpf_attr *attr, 
 	return 0;
 }
 
-/* Each field is a register bitmask */
-struct insn_live_regs {
-	u16 use;	/* registers read by instruction */
-	u16 def;	/* registers written by instruction */
-	u16 in;		/* registers that may be alive before instruction */
-	u16 out;	/* registers that may be alive after instruction */
-};
-
 /* Bitmask with 1s for all caller saved registers */
 #define ALL_CALLER_SAVED_REGS ((1u << CALLER_SAVED_REGS) - 1)
 
@@ -25874,6 +25866,11 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 
 	for (i = 0; i < insn_cnt; ++i)
 		compute_insn_live_regs(env, &insns[i], &state[i]);
+
+	/* Forward pass: resolve stack access through FP-derived pointers */
+	err = compute_stack_access(env, insns, state, insn_cnt);
+	if (err)
+		goto out;
 
 	changed = true;
 	while (changed) {

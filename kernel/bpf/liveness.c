@@ -1881,3 +1881,399 @@ err_free:
 	kvfree(info);
 	return err;
 }
+
+enum fp_off_state {
+	FP_OFF_UNVISITED,	/* instruction not yet reached */
+	FP_OFF_UNKNOWN,		/* register doesn't hold a known FP offset */
+	FP_OFF_KNOWN,		/* FP-derived; spis is bitmask of possible slots */
+};
+
+struct fp_off_info {
+	enum fp_off_state state;
+	u64 spis[2];	/* bitmask of possible 4-byte stack slots; all-zero means FP itself */
+};
+
+static void verbose_fp_off(struct bpf_verifier_env *env, struct fp_off_info *info)
+{
+	switch (info->state) {
+	case FP_OFF_UNVISITED: verbose(env, "?");                            break;
+	case FP_OFF_UNKNOWN:   verbose(env, "_");                            break;
+	case FP_OFF_KNOWN:
+		if (spis_is_zero(info->spis)) {
+			verbose(env, "fp");
+		} else if (spis_hweight(info->spis) == 1) {
+			int slot = spis_ffs(info->spis);
+			s64 off = -(s64)((u64)(slot + 1) * STACK_SLOT_SZ);
+
+			verbose(env, "fp%+lld", off);
+		} else {
+			verbose(env, "fp(spis=%llx:%llx)", info->spis[1], info->spis[0]);
+		}
+		break;
+	default:               verbose(env, "???");                          break;
+	}
+}
+
+
+/*
+ * Per-instruction transfer function for FP-offset tracking.
+ * Updates fp_out[] and fp_stack_out based on how the instruction
+ * modifies register state relative to the frame pointer.
+ */
+static void fp_off_insn_xfer(struct bpf_insn *insn,
+			     struct fp_off_info *fp_out,
+			     u64 *fp_stack_out)
+{
+	u8 class = BPF_CLASS(insn->code);
+	u8 code = BPF_OP(insn->code);
+
+	if (class == BPF_ALU64 && BPF_SRC(insn->code) == BPF_K) {
+		if (code == BPF_MOV) {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		} else if ((code == BPF_ADD || code == BPF_SUB) &&
+			   fp_out[insn->dst_reg].state == FP_OFF_KNOWN) {
+			s64 delta = (code == BPF_ADD) ? insn->imm : -(s64)insn->imm;
+
+			if (spis_is_zero(fp_out[insn->dst_reg].spis) && delta < 0) {
+				/* FP itself + negative imm => precise slot */
+				u32 slot = (-delta - 1) / STACK_SLOT_SZ;
+
+				if (slot < STACK_SLOTS)
+					spis_set_bit(fp_out[insn->dst_reg].spis, slot);
+				else
+					spis_set_all(fp_out[insn->dst_reg].spis);
+			} else {
+				/*
+				 * Already at some slot or positive offset;
+				 * can't track precisely, go conservative.
+				 */
+				spis_set_all(fp_out[insn->dst_reg].spis);
+			}
+		} else if (fp_out[insn->dst_reg].state == FP_OFF_KNOWN) {
+			/* Other ALU op on FP-derived register: lose tracking */
+			spis_set_all(fp_out[insn->dst_reg].spis);
+		} else {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		}
+	} else if (class == BPF_ALU64 && BPF_SRC(insn->code) == BPF_X) {
+		if (code == BPF_MOV) {
+			if (insn->off == 0) {
+				fp_out[insn->dst_reg] = fp_out[insn->src_reg];
+			} else {
+				/* addr_space_cast */
+				fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+				spis_clear(fp_out[insn->dst_reg].spis);
+			}
+		} else if (fp_out[insn->dst_reg].state == FP_OFF_KNOWN) {
+			/* Other ALU op on FP-derived register: lose tracking */
+			spis_set_all(fp_out[insn->dst_reg].spis);
+		} else {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		}
+	} else if (class == BPF_JMP && code == BPF_CALL) {
+		int r;
+
+		for (r = BPF_REG_0; r <= BPF_REG_5; r++) {
+			fp_out[r].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[r].spis);
+		}
+	} else if (class == BPF_ALU) {
+		if (code == BPF_MOV) {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		} else if (fp_out[insn->dst_reg].state == FP_OFF_KNOWN) {
+			/* Other ALU op on FP-derived register: lose tracking */
+			spis_set_all(fp_out[insn->dst_reg].spis);
+		} else {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		}
+	} else if (class == BPF_LDX) {
+		/*
+		 * If loading from a stack slot that may hold an FP-derived
+		 * value, propagate as KNOWN with all slots set.
+		 */
+		bool fp_reload = false;
+
+		if (BPF_MODE(insn->code) == BPF_MEM &&
+		    fp_out[insn->src_reg].state == FP_OFF_KNOWN && BPF_SIZE(insn->code) == BPF_DW) {
+			u64 *src_spis = fp_out[insn->src_reg].spis;
+			u64 load_spis[2];
+
+			spis_set_all(load_spis);
+
+			if (spis_is_zero(src_spis) && insn->off < 0) {
+				/*
+				 * .. = *(u64 *)(fp - const)
+				 *   or
+				 * rX = r10
+				 * .. = *(u64 *)(rX - const)
+				 */
+				u32 slot = (-insn->off - 1) / STACK_SLOT_SZ;
+				u32 slot2 = (-insn->off - BPF_REG_SIZE) / STACK_SLOT_SZ;
+
+				spis_clear(load_spis);
+				if (slot < STACK_SLOTS)
+					spis_set_bit(load_spis, slot);
+				if (slot2 < STACK_SLOTS)
+					spis_set_bit(load_spis, slot2);
+				if (spis_is_zero(load_spis))
+					spis_set_all(load_spis);
+			} else if (!spis_is_zero(src_spis) && insn->off == 0) {
+				/*
+				 * rX = r10
+				 * rX += -const
+				 * .. = *(u64 *)(rX)
+				 */
+				spis_copy(load_spis, src_spis);
+			}
+			if (spis_and_nonzero(load_spis, fp_stack_out))
+				fp_reload = true;
+		}
+		if (fp_reload) {
+			fp_out[insn->dst_reg].state = FP_OFF_KNOWN;
+			spis_set_all(fp_out[insn->dst_reg].spis);
+		} else {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		}
+	} else if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM) {
+		fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+		spis_clear(fp_out[insn->dst_reg].spis);
+	} else if (class == BPF_STX && BPF_MODE(insn->code) == BPF_ATOMIC) {
+		if (insn->imm == BPF_CMPXCHG) {
+			fp_out[BPF_REG_0].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[BPF_REG_0].spis);
+		} else if (insn->imm == BPF_LOAD_ACQ) {
+			fp_out[insn->dst_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->dst_reg].spis);
+		} else if (insn->imm & BPF_FETCH) {
+			fp_out[insn->src_reg].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_out[insn->src_reg].spis);
+		}
+	}
+
+	/*
+	 * Track FP-derived values spilled to the stack. When a register with
+	 * FP_OFF_KNOWN is stored to a stack slot, mark that slot in
+	 * fp_stack_out so that subsequent reloads produce FP_OFF_KNOWN with
+	 * all slots set.
+	 */
+	if (class == BPF_STX && BPF_MODE(insn->code) == BPF_MEM && BPF_SIZE(insn->code) == BPF_DW &&
+	    fp_out[insn->dst_reg].state == FP_OFF_KNOWN && fp_out[insn->src_reg].state == FP_OFF_KNOWN) {
+		u64 *dst_spis = fp_out[insn->dst_reg].spis;
+		u64 store_spis[2];
+
+		spis_set_all(store_spis);
+
+		if (spis_is_zero(dst_spis) && insn->off < 0 && !((-insn->off) % BPF_REG_SIZE)) {
+			/*
+			 * *(u64 *)(fp - const) = rY where rY is FP-derived
+			 *   or
+			 * rX = r10
+			 * *(u64 *)(rX - const) = rY where rY is FP-derived
+			 */
+			u32 slot = (-insn->off - 1) / STACK_SLOT_SZ;
+			u32 slot2 = (-insn->off - BPF_REG_SIZE) / STACK_SLOT_SZ;
+
+			spis_clear(store_spis);
+			if (slot < STACK_SLOTS)
+				spis_set_bit(store_spis, slot);
+			if (slot2 < STACK_SLOTS)
+				spis_set_bit(store_spis, slot2);
+			if (spis_is_zero(store_spis))
+				spis_set_all(store_spis);
+		} else if (!spis_is_zero(dst_spis) && insn->off == 0) {
+			/*
+			 * rX = r10
+			 * rX += -const
+			 * *(u64 *)(rX) = rY where rY is FP-derived
+			 */
+			spis_copy(store_spis, dst_spis);
+		}
+		spis_or(fp_stack_out, store_spis);
+	}
+}
+
+/*
+ * JOIN a single successor's fp_off state with the output of the current
+ * instruction. Returns true if any state changed (requires another iteration).
+ *
+ * Lattice per register:
+ *   UNVISITED  -- not yet reached, absorbs any incoming value
+ *   UNKNOWN    -- not FP-derived on any path seen so far
+ *   KNOWN(spis) -- FP-derived; spis is union of possible slot sets
+ *
+ * Transitions:
+ *   UNVISITED + X       => X          (first visit)
+ *   KNOWN     + KNOWN   => KNOWN(OR)  (widen slot set)
+ *   KNOWN     + UNKNOWN => KNOWN      (some path is FP-derived)
+ *   UNKNOWN   + KNOWN   => KNOWN      (promote)
+ *   UNKNOWN   + UNKNOWN => UNKNOWN    (no change)
+ */
+static bool fp_off_join(struct bpf_verifier_env *env, int idx, int target,
+			struct fp_off_info *fp_out, struct fp_off_info *fp_target,
+			u64 fp_stack_out[2], u64 fp_stack_target[2])
+{
+	bool changed = false;
+	int r;
+
+	/* JOIN fp_stack: OR (may-contain-FP union) */
+	if (spis_any_new(fp_stack_out, fp_stack_target)) {
+		spis_or(fp_stack_target, fp_stack_out);
+		changed = true;
+	}
+
+	for (r = 0; r < MAX_BPF_REG; r++) {
+		struct fp_off_info *old = &fp_target[r];
+		struct fp_off_info *new = &fp_out[r];
+
+		if (old->state == FP_OFF_UNVISITED) {
+			*old = *new;
+			changed = true;
+		} else if (old->state == FP_OFF_KNOWN && new->state == FP_OFF_KNOWN) {
+			/* KNOWN + KNOWN: OR the slot bitmasks */
+			if (spis_any_new(new->spis, old->spis)) {
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "fp_off: JOIN %d -> %d r%d: ",
+						idx, target, r);
+					verbose_fp_off(env, old);
+					verbose(env, " + ");
+					verbose_fp_off(env, new);
+					verbose(env, " => ");
+				}
+				spis_or(old->spis, new->spis);
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose_fp_off(env, old);
+					verbose(env, "\n");
+				}
+				changed = true;
+			}
+		} else if (old->state == FP_OFF_UNKNOWN && new->state == FP_OFF_KNOWN) {
+			/* UNKNOWN + KNOWN: promote to KNOWN */
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				verbose(env, "fp_off: JOIN %d -> %d r%d: ",
+					idx, target, r);
+				verbose_fp_off(env, old);
+				verbose(env, " + ");
+				verbose_fp_off(env, new);
+				verbose(env, " => ");
+			}
+			*old = *new;
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				verbose_fp_off(env, old);
+				verbose(env, "\n");
+			}
+			changed = true;
+		}
+		/* KNOWN + UNKNOWN or UNKNOWN + UNKNOWN: no change */
+	}
+	return changed;
+}
+
+/*
+ * Forward fixed-point analysis: track FP-derived offsets per register
+ * and compute stack_use/stack_def for indirect stack accesses and
+ * stack pointer arguments at call sites.
+ */
+int compute_stack_access(struct bpf_verifier_env *env,
+			 struct bpf_insn *insns,
+			 struct insn_live_regs *state,
+			 int insn_cnt)
+{
+	struct fp_off_info (*fp_in)[MAX_BPF_REG];
+	struct fp_off_info fp_out[MAX_BPF_REG];
+	struct bpf_iarray *succ;
+	u64 fp_stack_out[2];
+	bool changed;
+	u64 (*fp_stack)[2];
+	int i, r;
+
+	fp_in = kvzalloc_objs(*fp_in, insn_cnt, GFP_KERNEL_ACCOUNT);
+	if (!fp_in)
+		return -ENOMEM;
+
+	/* Per-instruction bitmask: which slots may hold FP-derived values.
+	 * Used to propagate FP-offset knowledge through stack spill/reload.
+	 */
+	fp_stack = kvzalloc_objs(*fp_stack, insn_cnt, GFP_KERNEL_ACCOUNT);
+	if (!fp_stack) {
+		kvfree(fp_in);
+		return -ENOMEM;
+	}
+
+	/* kvzalloc zeroes memory, so all entries start as FP_OFF_UNVISITED (0) */
+
+	/* Entry point: R10 has FP offset 0, rest unknown */
+	for (r = 0; r < MAX_BPF_REG; r++) {
+		fp_in[0][r].state = FP_OFF_UNKNOWN;
+		spis_clear(fp_in[0][r].spis);
+	}
+	fp_in[0][BPF_REG_FP].state = FP_OFF_KNOWN;
+	spis_clear(fp_in[0][BPF_REG_FP].spis);
+
+	/* Subprogram entries: same initialization */
+	for (i = 0; i < env->subprog_cnt; i++) {
+		int start = env->subprog_info[i].start;
+
+		for (r = 0; r < MAX_BPF_REG; r++) {
+			fp_in[start][r].state = FP_OFF_UNKNOWN;
+			spis_clear(fp_in[start][r].spis);
+		}
+		fp_in[start][BPF_REG_FP].state = FP_OFF_KNOWN;
+		spis_clear(fp_in[start][BPF_REG_FP].spis);
+	}
+
+	/* Forward fixed-point: iterate in reverse postorder */
+	changed = true;
+	while (changed) {
+		changed = false;
+		for (i = env->cfg.cur_postorder - 1; i >= 0; i--) {
+			int idx = env->cfg.insn_postorder[i];
+			struct bpf_insn *insn = &insns[idx];
+
+			/* Skip unvisited instructions */
+			if (fp_in[idx][0].state == FP_OFF_UNVISITED)
+				continue;
+
+			/* Start with fp_in, apply transfer function */
+			memcpy(fp_out, fp_in[idx], sizeof(fp_out));
+			spis_copy(fp_stack_out, fp_stack[idx]);
+			fp_off_insn_xfer(insn, fp_out, fp_stack_out);
+
+			/* Log transfer function changes */
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				for (r = 0; r < MAX_BPF_REG; r++) {
+					if (fp_out[r].state != fp_in[idx][r].state ||
+					    !spis_equal(fp_out[r].spis, fp_in[idx][r].spis)) {
+						verbose(env, "%3d: ", idx);
+						verbose_insn(env, insn);
+						bpf_vlog_reset(&env->log, env->log.end_pos - 1);
+						verbose(env, "\tr%d: ", r);
+						verbose_fp_off(env, &fp_in[idx][r]);
+						verbose(env, " -> ");
+						verbose_fp_off(env, &fp_out[r]);
+						verbose(env, "\n");
+					}
+				}
+			}
+
+			/* Propagate to successors with JOIN */
+			succ = bpf_insn_successors(env, idx);
+			for (int s = 0; s < succ->cnt; s++) {
+				int target = succ->items[s];
+
+				changed |= fp_off_join(env, idx, target,
+						       fp_out, fp_in[target],
+						       fp_stack_out, fp_stack[target]);
+			}
+		}
+	}
+
+	kvfree(fp_stack);
+	kvfree(fp_in);
+	return 0;
+}
