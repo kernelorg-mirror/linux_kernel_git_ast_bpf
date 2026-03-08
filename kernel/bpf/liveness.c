@@ -1888,6 +1888,30 @@ enum fp_off_state {
 	FP_OFF_KNOWN,		/* FP-derived; spis is bitmask of possible slots */
 };
 
+/*
+ * Convert arg-relative 4-byte slot bitmask to absolute stack slot bitmask.
+ * Arg-relative slot K (access at arg + K*4) maps to absolute stack slot
+ * (base_slot - K).
+ */
+static inline void arg_slots_to_spis(u64 mask[2], int base_slot,
+				     const u64 arg_mask[2])
+{
+	int w;
+
+	for (w = 0; w < 2; w++) {
+		u64 bits = arg_mask[w];
+
+		while (bits) {
+			int k = w * 64 + __ffs(bits);
+			int abs_slot = base_slot - k;
+
+			if (abs_slot >= 0 && abs_slot < STACK_SLOTS)
+				mask[abs_slot / 64] |= BIT_ULL(abs_slot % 64);
+			bits &= bits - 1;
+		}
+	}
+}
+
 struct fp_off_info {
 	enum fp_off_state state;
 	u64 spis[2];	/* bitmask of possible 4-byte stack slots; all-zero means FP itself */
@@ -1913,6 +1937,35 @@ static void verbose_fp_off(struct bpf_verifier_env *env, struct fp_off_info *inf
 	default:               verbose(env, "???");                          break;
 	}
 }
+
+
+/* Apply access_bytes from helper/kfunc resolution to stack_use/stack_def.
+ *   access_bytes > 0:      stack read  — mark touched slots as stack_use
+ *   access_bytes < 0:      stack write — mark touched slots as stack_def
+ *   access_bytes == S64_MIN: unknown   — conservative, mark [0..slot] as stack_use
+ *   access_bytes == 0:      no access
+ */
+static void apply_stack_access_bytes(struct insn_live_regs *st,
+				     s64 fp_off, u32 slot, s64 access_bytes)
+{
+	u32 slot_last;
+
+	if (access_bytes == S64_MIN) {
+		spis_or_range(st->stack_use, 0, slot);
+	} else if (access_bytes > 0) {
+		slot_last = (-fp_off - access_bytes) / STACK_SLOT_SZ;
+		if (slot_last > slot)
+			slot_last = slot;
+		spis_or_range(st->stack_use, slot_last, slot);
+	} else if (access_bytes < 0) {
+		access_bytes = -access_bytes;
+		slot_last = (-fp_off - access_bytes) / STACK_SLOT_SZ;
+		if (slot_last > slot)
+			slot_last = slot;
+		spis_or_range(st->stack_def, slot_last, slot);
+	}
+}
+
 
 
 /*
@@ -2099,6 +2152,303 @@ static void fp_off_insn_xfer(struct bpf_insn *insn,
 }
 
 /*
+ * Apply subprogram argument access masks to caller's stack_use.
+ * Maps callee's per-argument read/write bitmasks onto the caller's
+ * stack slots starting at @spi.
+ */
+static void apply_callee_stack_access(struct insn_live_regs *st,
+				      struct subprog_arg_access *sa,
+				      int arg, u32 slot)
+{
+	u64 combined[2];
+
+	if (spis_is_all(sa->read[arg]) || spis_is_all(sa->write[arg])) {
+		/*
+		 * Unknown access pattern: mark slots from 0 up to the
+		 * argument's base slot as live. The callee cannot access
+		 * above the argument's base, so avoid marking the entire
+		 * 512B stack live.
+		 */
+		spis_or_range(st->stack_use, 0, slot);
+		return;
+	}
+
+	/*
+	 * Both read and write-only bits become stack_use.
+	 * Write-only bits are "may write" not "must write",
+	 * so they cannot be stack_def.
+	 */
+	spis_copy(combined, sa->read[arg]);
+	spis_or(combined, sa->write[arg]);
+	arg_slots_to_spis(st->stack_use, slot, combined);
+}
+
+/*
+ * Check for stack access via FP-derived (or R10 directly) register.
+ * LDX: stack read => stack_use.
+ * STX/ST MEM: stack write => stack_def (if slot-aligned and fully covered).
+ * Atomics: LOAD_ACQ => read, STORE_REL => write, others => read (conservative).
+ */
+static void set_indirect_stack_access(struct bpf_verifier_env *env,
+				      struct bpf_insn *insn, int insn_idx,
+				      struct insn_live_regs *st,
+				      struct fp_off_info *fp_regs)
+{
+	u8 class = BPF_CLASS(insn->code);
+	int ptr_reg = -1;
+	bool is_write = false;
+	const char *op_name = NULL;
+
+	if (class == BPF_LDX && (BPF_MODE(insn->code) == BPF_MEM ||
+				 BPF_MODE(insn->code) == BPF_MEMSX)) {
+		ptr_reg = insn->src_reg;
+		op_name = "LDX";
+	} else if (class == BPF_STX && BPF_MODE(insn->code) == BPF_MEM) {
+		ptr_reg = insn->dst_reg;
+		is_write = true;
+		op_name = "STX";
+	} else if (class == BPF_ST && BPF_MODE(insn->code) == BPF_MEM) {
+		ptr_reg = insn->dst_reg;
+		is_write = true;
+		op_name = "ST";
+	} else if (class == BPF_STX && BPF_MODE(insn->code) == BPF_ATOMIC) {
+		switch (insn->imm) {
+		case BPF_LOAD_ACQ:
+			ptr_reg = insn->src_reg;
+			op_name = "LOAD_ACQ";
+			break;
+		case BPF_STORE_REL:
+			ptr_reg = insn->dst_reg;
+			is_write = true;
+			op_name = "STORE_REL";
+			break;
+		default:
+			/* Other atomics may write conditionally; treat as read */
+			ptr_reg = insn->dst_reg;
+			op_name = "ATOMIC";
+			break;
+		}
+	}
+
+	if (ptr_reg < 0)
+		/* not a load and not a store */
+		return;
+
+	if (fp_regs[ptr_reg].state != FP_OFF_KNOWN)
+		/* load/store through non-FP-derived register */
+		return;
+
+	if (spis_is_zero(fp_regs[ptr_reg].spis)) {
+		/* Register is FP itself; compute precise slot */
+		s64 stack_off = insn->off;
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+		if (stack_off < 0 &&
+		    (!is_write || (sz >= STACK_SLOT_SZ &&
+				   !((-stack_off) % STACK_SLOT_SZ)))) {
+			u32 slot_hi = (-stack_off - 1) / STACK_SLOT_SZ;
+			u32 slot_lo = (-stack_off - sz) / STACK_SLOT_SZ;
+
+			if (slot_hi < STACK_SLOTS) {
+				if (is_write)
+					spis_or_range(st->stack_def, slot_lo, slot_hi);
+				else
+					spis_or_range(st->stack_use, slot_lo, slot_hi);
+				if (env->log.level & BPF_LOG_LEVEL2) {
+					verbose(env, "fp_off: %s insn %d r%d ",
+						op_name, insn_idx, ptr_reg);
+					verbose_fp_off(env, &fp_regs[ptr_reg]);
+					verbose(env, " +%d => fp%lld %s slots[%u..%u]\n",
+						insn->off, stack_off,
+						is_write ? "stack_def" : "stack_use",
+						slot_lo, slot_hi);
+				}
+			}
+		}
+	} else {
+		/* Register points to known slot(s); work at 4-byte granularity */
+		u64 slot_mask[2];
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+		spis_copy(slot_mask, fp_regs[ptr_reg].spis);
+
+		if (insn->off != 0) {
+			/*
+			 * Shift slot bitmask by -insn->off / STACK_SLOT_SZ.
+			 * Positive shift = deeper into stack (left shift).
+			 * Negative shift = closer to FP (right shift).
+			 */
+			int shift = -insn->off / (int)STACK_SLOT_SZ;
+			u64 shifted[2] = {};
+
+			if (shift >= 0 && shift < STACK_SLOTS) {
+				spis_shift_or(shifted, slot_mask, shift);
+			} else if (shift < 0 && -shift < STACK_SLOTS) {
+				spis_shift_right_or(shifted, slot_mask, -shift);
+			} else {
+				spis_set_all(shifted);
+			}
+			spis_copy(slot_mask, shifted);
+
+			/* If not 4-byte aligned, expand ±1 slot for boundary */
+			if (insn->off % (int)STACK_SLOT_SZ) {
+				u64 expanded[2] = {};
+
+				spis_shift_or(expanded, slot_mask, 1);
+				spis_shift_right_or(expanded, slot_mask, 1);
+				spis_or(slot_mask, expanded);
+			}
+		}
+
+		/* DW access spans 2 slots; expand one slot closer to FP */
+		if (sz > STACK_SLOT_SZ)
+			spis_shift_right_or(slot_mask, slot_mask, 1);
+
+		if (is_write)
+			spis_or(st->stack_def, slot_mask);
+		else
+			spis_or(st->stack_use, slot_mask);
+		if (env->log.level & BPF_LOG_LEVEL2) {
+			verbose(env, "fp_off: %s insn %d r%d ",
+				op_name, insn_idx, ptr_reg);
+			verbose_fp_off(env, &fp_regs[ptr_reg]);
+			verbose(env, " +%d => %s|=%llx:%llx\n",
+				insn->off,
+				is_write ? "stack_def" : "stack_use",
+				slot_mask[1], slot_mask[0]);
+		}
+	}
+}
+
+/* Resolve stack access for a single FP-derived argument at a call site. */
+static void resolve_arg_stack_access(struct bpf_verifier_env *env,
+				     struct bpf_insn *insn, int insn_idx,
+				     struct insn_live_regs *st,
+				     struct fp_off_info *fp_regs, int r)
+{
+	int param = r - BPF_REG_1;	/* 0-based param index for helpers/kfuncs */
+	int at_id = r - BPF_REG_1 + 1;	/* 1-based arg-track identity for call_arg_slot */
+	u64 spis[2];
+
+	spis[0] = fp_regs[r].spis[0];
+	spis[1] = fp_regs[r].spis[1];
+
+	while (!spis_is_zero(spis)) {
+		u32 slot = spis_ffs(spis);
+		s64 synth_off = -(s64)((u64)(slot + 1) * STACK_SLOT_SZ);
+
+		spis[slot / 64] &= ~BIT_ULL(slot % 64);
+
+		if (bpf_helper_call(insn)) {
+			s64 bytes = bpf_helper_stack_access_bytes(env, insn, param, insn_idx);
+
+			apply_stack_access_bytes(st, synth_off, slot, bytes);
+		} else if (bpf_pseudo_call(insn)) {
+			int target = insn_idx + insn->imm + 1;
+			/* callee is valid, already checked in arg_track_insn_xfer */
+			int callee = find_subprog(env, target);
+
+			/*
+			 * For single slot, record it for cross-subprog tracking.
+			 * For multi-slot, set -1 (conservative).
+			 */
+			if (spis_hweight(fp_regs[r].spis) == 1)
+				env->insn_aux_data[insn_idx].call_arg_slot[at_id] =
+					spis_ffs(fp_regs[r].spis);
+
+			apply_callee_stack_access(st,
+						  &env->subprog_arg_access[callee],
+						  at_id, slot);
+		} else if (bpf_pseudo_kfunc_call(insn)) {
+			s64 bytes = bpf_kfunc_stack_access_bytes(env, insn, param, insn_idx);
+
+			apply_stack_access_bytes(st, synth_off, slot, bytes);
+		} else {
+			/* unknown call: conservative */
+			spis_or_range(st->stack_use, 0, slot);
+		}
+	}
+}
+
+/*
+ * Resolve stack access for a single call instruction by examining
+ * FP-derived pointer arguments. Sets stack_use/stack_def based on
+ * helper, kfunc, or subprog access patterns.
+ */
+static void set_call_stack_access(struct bpf_verifier_env *env,
+				  struct bpf_insn *insn, int insn_idx,
+				  struct insn_live_regs *st,
+				  struct fp_off_info *fp_regs)
+{
+	struct call_summary cs;
+	int r, num_params;
+
+	num_params = 5;
+	if (get_call_summary(env, insn, &cs))
+		num_params = cs.num_params;
+
+	if (env->log.level & BPF_LOG_LEVEL2) {
+		verbose(env, "fp_off: CALL insn %d ", insn_idx);
+		verbose_insn(env, insn);
+		bpf_vlog_reset(&env->log, env->log.end_pos - 1);
+		for (r = BPF_REG_1; r <= BPF_REG_5 && r < BPF_REG_1 + num_params; r++) {
+			verbose(env, "  r%d: ", r);
+			verbose_fp_off(env, &fp_regs[r]);
+		}
+		verbose(env, "\n");
+	}
+
+	if (bpf_pseudo_call(insn)) {
+		for (int a = 0; a < NUM_AT_IDS; a++)
+			env->insn_aux_data[insn_idx].call_arg_slot[a] = -1;
+	}
+
+	for (r = BPF_REG_1; r <= BPF_REG_5 && r < BPF_REG_1 + num_params; r++) {
+		if (fp_regs[r].state != FP_OFF_KNOWN)
+			continue;
+
+		if (spis_is_zero(fp_regs[r].spis)) {
+			/* Pointer is FP itself (e.g. bpf_loop ctx).
+			 * A helper or its callback may access stack
+			 * at negative offsets from this pointer.
+			 * Mark all stack slots as used.
+			 */
+			if (env->log.level & BPF_LOG_LEVEL2)
+				verbose(env, "insn %d reg %d spis == 0 (FP)\n",
+					insn_idx, r);
+			spis_set_all(st->stack_use);
+			continue;
+		}
+
+		resolve_arg_stack_access(env, insn, insn_idx, st, fp_regs, r);
+	}
+}
+
+/*
+ * Use converged fp_in from the forward analysis to set stack_use/stack_def
+ * at CALL instructions (helper, subprog, kfunc) and indirect memory accesses
+ * (LDX/STX/ST via FP-derived registers).
+ */
+static void set_stack_access(struct bpf_verifier_env *env,
+				struct bpf_insn *insns,
+				struct insn_live_regs *state,
+				struct fp_off_info (*fp_in)[MAX_BPF_REG],
+				int insn_cnt)
+{
+	int i;
+
+	for (i = 0; i < insn_cnt; i++) {
+		struct bpf_insn *insn = &insns[i];
+
+		set_indirect_stack_access(env, insn, i, &state[i], fp_in[i]);
+
+		if (BPF_CLASS(insn->code) == BPF_JMP &&
+		    BPF_OP(insn->code) == BPF_CALL)
+			set_call_stack_access(env, insn, i, &state[i], fp_in[i]);
+	}
+}
+
+/*
  * JOIN a single successor's fp_off state with the output of the current
  * instruction. Returns true if any state changed (requires another iteration).
  *
@@ -2274,6 +2624,9 @@ int compute_stack_access(struct bpf_verifier_env *env,
 	}
 
 	kvfree(fp_stack);
+
+	set_stack_access(env, insns, state, fp_in, insn_cnt);
+
 	kvfree(fp_in);
 	return 0;
 }

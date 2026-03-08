@@ -712,6 +712,16 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	u64 live_stack_before[2];
+	/*
+	 * For bpf_pseudo_call: 4-byte stack slot that each arg (R1-R5)
+	 * points to. -1 = not FP-derived or ambiguous.
+	 * Indexed by arg-track identity (0=FP, 1-5=R1-R5).
+	 * Set by compute_stack_access().
+	 * Used by clean_verifier_state() to translate arg_live
+	 * to caller stack slots.
+	 */
+	s16 call_arg_slot[NUM_AT_IDS];
 	/*
 	 * Bitmask of R0-R9 that hold known constants at this instruction.
 	 * Bit i corresponds to R(i). const_reg_vals[i] holds the constant value.
@@ -1035,6 +1045,10 @@ struct insn_live_regs {
 	u16 def;	/* registers written by instruction */
 	u16 in;		/* registers that may be alive before instruction */
 	u16 out;	/* registers that may be alive after instruction */
+	u64 stack_use[2];
+	u64 stack_def[2];
+	u64 stack_in[2];
+	u64 stack_out[2];
 };
 
 __printf(2, 3) void verbose(void *private_data, const char *fmt, ...);

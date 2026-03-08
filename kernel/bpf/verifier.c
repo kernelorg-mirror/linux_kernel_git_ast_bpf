@@ -25838,6 +25838,7 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	int insn_cnt = env->prog->len;
 	int err = 0, i, j;
 	bool changed;
+	bool stacks;
 
 	/* Use the following algorithm:
 	 * - define the following:
@@ -25879,23 +25880,40 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 			int insn_idx = env->cfg.insn_postorder[i];
 			struct insn_live_regs *live = &state[insn_idx];
 			struct bpf_iarray *succ;
+			u64 new_stack_out[2] = {};
+			u64 new_stack_in[2] = {};
 			u16 new_out = 0;
 			u16 new_in = 0;
 
 			succ = bpf_insn_successors(env, insn_idx);
-			for (int s = 0; s < succ->cnt; ++s)
+			for (int s = 0; s < succ->cnt; ++s) {
 				new_out |= state[succ->items[s]].in;
+				spis_or(new_stack_out,
+					     state[succ->items[s]].stack_in);
+			}
 			new_in = (new_out & ~live->def) | live->use;
-			if (new_out != live->out || new_in != live->in) {
+			new_stack_in[0] = (new_stack_out[0] & ~live->stack_def[0]) |
+					  live->stack_use[0];
+			new_stack_in[1] = (new_stack_out[1] & ~live->stack_def[1]) |
+					  live->stack_use[1];
+			if (new_out != live->out || new_in != live->in ||
+			    memcmp(new_stack_out, live->stack_out, sizeof(new_stack_out)) ||
+			    memcmp(new_stack_in, live->stack_in, sizeof(new_stack_in))) {
 				live->in = new_in;
 				live->out = new_out;
+				spis_copy(live->stack_in, new_stack_in);
+				spis_copy(live->stack_out, new_stack_out);
 				changed = true;
 			}
 		}
 	}
 
-	for (i = 0; i < insn_cnt; ++i)
+	stacks = false;
+	for (i = 0; i < insn_cnt; ++i) {
 		insn_aux[i].live_regs_before = state[i].in;
+		spis_copy(insn_aux[i].live_stack_before, state[i].stack_in);
+		stacks |= !spis_is_zero(state[i].stack_in);
+	}
 
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		verbose(env, "Live regs before insn:\n");
@@ -25911,7 +25929,25 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 				else
 					verbose(env, ".");
 			verbose(env, " ");
+			if (stacks)
+				verbose(env, "%016llx:%016llx ",
+					insn_aux[i].live_stack_before[1],
+					insn_aux[i].live_stack_before[0]);
 			verbose_insn(env, &insns[i]);
+			if (!spis_is_zero(state[i].stack_use) ||
+			    !spis_is_zero(state[i].stack_def)) {
+				bpf_vlog_reset(&env->log, env->log.end_pos - 1);
+				verbose(env, " //");
+				if (!spis_is_zero(state[i].stack_use))
+					verbose(env, " stack_use=%llx:%llx",
+						state[i].stack_use[1],
+						state[i].stack_use[0]);
+				if (!spis_is_zero(state[i].stack_def))
+					verbose(env, " stack_def=%llx:%llx",
+						state[i].stack_def[1],
+						state[i].stack_def[0]);
+				verbose(env, "\n");
+			}
 			if (bpf_is_ldimm64(&insns[i]))
 				i++;
 		}
