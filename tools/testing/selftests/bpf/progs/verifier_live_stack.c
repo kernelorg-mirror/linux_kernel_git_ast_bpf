@@ -574,6 +574,173 @@ __naked void stack_zero_to_misc_unsound_array_lookup(void)
 	: __clobber_all);
 }
 
+/*
+ * Subprog variant of stack_zero_to_misc_unsound_array_lookup.
+ *
+ * Check unsound pruning when a callee modifies the caller's
+ * stack through a pointer argument.
+ *
+ * Program shape:
+ *   main:
+ *     *(u32)(fp - 4) = 0            key = 0 (all bytes STACK_ZERO)
+ *     r1 = fp - 4
+ *     call maybe_clobber_key        may overwrite key[0] with scalar
+ *     <-- prune point: two states meet here -->
+ *     r2 = fp - 4
+ *     r1 = array_map_8b
+ *     call bpf_map_lookup_elem      value-sensitive on const-zero key
+ *     r0 = *(u64)(r0 + 0)           deref without null check
+ *     exit
+ *
+ *   maybe_clobber_key(r1):
+ *     r6 = r1                       save &key
+ *     call bpf_get_prandom_u32
+ *     if r0 == 0 goto skip          path A: key stays STACK_ZERO
+ *     *(u8)(r6 + 0) = r0            path B: key[0] becomes STACK_MISC
+ *   skip:
+ *     r0 = 0
+ *     exit
+ *
+ * Path A: const-zero key => array lookup => PTR_TO_MAP_VALUE => deref OK.
+ * Path B: non-const key  => array lookup => PTR_TO_MAP_VALUE_OR_NULL => UNSAFE.
+ *
+ * If the cleaner collapses STACK_ZERO -> STACK_MISC for the live key
+ * slot, path A's cached state matches path B, pruning the unsafe path.
+ *
+ * Correct verifier behaviour: reject.
+ */
+SEC("socket")
+__flag(BPF_F_TEST_STATE_FREQ)
+__failure __msg("R0 invalid mem access 'map_value_or_null'")
+__naked void subprog_stack_zero_to_misc_unsound(void)
+{
+	asm volatile (
+	/* key at fp-4: all bytes STACK_ZERO */
+	"*(u32 *)(r10 - 4) = 0;"
+	/* subprog may clobber key[0] with a scalar byte */
+	"r1 = r10;"
+	"r1 += -4;"
+	"call maybe_clobber_key;"
+	/* value-sensitive array lookup */
+	"r2 = r10;"
+	"r2 += -4;"
+	"r1 = %[array_map_8b] ll;"
+	"call %[bpf_map_lookup_elem];"
+	/* unsafe when result is map_value_or_null (path B) */
+	"r0 = *(u64 *)(r0 + 0);"
+	"exit;"
+	:
+	: __imm(bpf_map_lookup_elem),
+	  __imm_addr(array_map_8b)
+	: __clobber_all);
+}
+
+static __used __naked void maybe_clobber_key(void)
+{
+	asm volatile (
+	"r6 = r1;"
+	"call %[bpf_get_prandom_u32];"
+	/* path A (r0==0): key stays STACK_ZERO, explored first */
+	"if r0 == 0 goto 1f;"
+	/* path B (r0!=0): overwrite key[0] with scalar */
+	"*(u8 *)(r6 + 0) = r0;"
+	"1:"
+	"r0 = 0;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/*
+ * Demonstrate that subprog arg spill/reload breaks arg tracking,
+ * inflating caller stack liveness and preventing state pruning.
+ *
+ * modifier2(fp-24) has two paths: one writes a scalar to *(r1+8)
+ * = caller fp-16, the other leaves it as zero.  After modifier2
+ * returns, fp-16 is never read again — it is dead.
+ *
+ * spill_reload_reader2(fp-24) only reads caller fp-8 via
+ * *(r1+16), but it spills r1 across a helper call.  This
+ * breaks compute_subprog_arg_access(): the reload from callee
+ * stack cannot be connected back to arg1, so arg1 access goes
+ * "all (conservative)".  At the call site (r1 = fp-24, slot 5)
+ * apply_callee_stack_access() marks slots 0..5 as stack_use —
+ * pulling fp-16 (slots 2-3) into live_stack_before even though
+ * the reader never touches it.
+ *
+ * Result: at modifier2's return point two states with different
+ * fp-16 values cannot be pruned.
+ *
+ * With correct (or old dynamic) liveness fp-16 is dead at that
+ * point and the states prune → "6: safe" appears in the log.
+ */
+SEC("socket")
+__flag(BPF_F_TEST_STATE_FREQ)
+__log_level(2)
+__success
+__msg("6: safe")
+__naked void spill_reload_inflates_stack_liveness(void)
+{
+	asm volatile (
+	/* struct at fp-24: { ctx; ptr; tail; } */
+	"*(u64 *)(r10 - 24) = r1;"		/* fp-24 = ctx */
+	"*(u64 *)(r10 - 16) = r1;"		/* fp-16 = ctx (STACK_SPILL ptr) */
+	"*(u64 *)(r10 - 8) = 0;"		/* fp-8  = tail */
+	/* modifier2 writes different values to fp-16 on two paths */
+	"r1 = r10;"
+	"r1 += -24;"
+	"call modifier2;"
+	/* insn 6: prune point — two states with different fp-16
+	 * path A: fp-16 = STACK_MISC  (scalar overwrote pointer)
+	 * path B: fp-16 = STACK_SPILL (original ctx pointer)
+	 * STACK_MISC does NOT subsume STACK_SPILL(ptr),
+	 * so pruning fails unless fp-16 is cleaned (dead).
+	 */
+	"r1 = r10;"
+	"r1 += -24;"
+	"call spill_reload_reader2;"		/* reads fp-8 via *(r1+16) */
+	"r0 = 0;"
+	"exit;"
+	::: __clobber_all);
+}
+
+/* Two paths: one writes a scalar to *(r1+8) = caller fp-16,
+ * the other leaves it unchanged.  Both return 0 via separate
+ * exits to prevent pruning inside the subprog at the merge.
+ */
+static __used __naked void modifier2(void)
+{
+	asm volatile (
+	"r6 = r1;"
+	"call %[bpf_get_prandom_u32];"
+	"if r0 == 0 goto 1f;"
+	"*(u64 *)(r6 + 8) = r0;"		/* fp-16 = random */
+	"r0 = 0;"
+	"exit;"					/* path A exit */
+	"1:"
+	"r0 = 0;"
+	"exit;"					/* path B exit */
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
+/* Receives r1 = caller fp-24.  Only reads *(r1+16) = fp-8.
+ * Spills r1 across a helper call → arg tracking goes conservative →
+ * slots 0..5 all appear used instead of just slot 1 (fp-8).
+ */
+static __used __naked void spill_reload_reader2(void)
+{
+	asm volatile (
+	"*(u64 *)(r10 - 8) = r1;"		/* spill arg1 */
+	"call %[bpf_get_prandom_u32];"		/* clobbers r1-r5 */
+	"r1 = *(u64 *)(r10 - 8);"		/* reload arg1 */
+	"r0 = *(u64 *)(r1 + 16);"		/* read caller fp-8 */
+	"r0 = 0;"
+	"exit;"
+	:: __imm(bpf_get_prandom_u32)
+	: __clobber_all);
+}
+
 /* BTF FUNC records are not generated for kfuncs referenced
  * from inline assembly. These records are necessary for
  * libbpf to link the program. The function below is a hack
