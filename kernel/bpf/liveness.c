@@ -1171,6 +1171,68 @@ static void verbose_arg_track(struct bpf_verifier_env *env, struct arg_track *at
 	}
 }
 
+/*
+ * Record an argument-derived memory access in the read/write bitmasks.
+ * @is_read:      true for reads (LDX), false for writes (STX/ST)
+ * @access_size:  access size in bytes (1, 2, 4, or 8)
+ *
+ * Operates at 4-byte slot granularity. For writes: only slot-aligned
+ * accesses that fully cover the 4-byte slot go to the write mask;
+ * sub-slot or unaligned writes are treated as reads (conservative).
+ */
+static void record_arg_mem_access(struct subprog_arg_access *access,
+				  u64 (*arg_use)[NUM_AT_IDS][2],
+				  int local_idx,
+				  struct arg_track *ptr, s16 insn_off,
+				  bool is_read, u32 access_size)
+{
+	u32 slot, slot_hi, s;
+	s64 acc_off;
+	int arg;
+
+	if (ptr->arg < 1 || ptr->arg >= NUM_AT_IDS)
+		return;
+	arg = ptr->arg;
+
+	if (ptr->off == OFF_IMPRECISE) {
+		spis_set_all(access->read[arg]);
+		if (!is_read)
+			spis_set_all(access->write[arg]);
+		spis_set_all(arg_use[local_idx][arg]);
+		return;
+	}
+
+	acc_off = ptr->off + insn_off;
+	if (acc_off < 0) {
+		spis_set_all(access->read[arg]);
+		if (!is_read)
+			spis_set_all(access->write[arg]);
+		spis_set_all(arg_use[local_idx][arg]);
+		return;
+	}
+
+	slot = acc_off / STACK_SLOT_SZ;
+	if (slot >= STACK_SLOTS)
+		return;
+
+	slot_hi = (acc_off + access_size - 1) / STACK_SLOT_SZ;
+	if (slot_hi >= STACK_SLOTS)
+		slot_hi = STACK_SLOTS - 1;
+
+	if (!is_read && access_size >= STACK_SLOT_SZ &&
+	    !(acc_off % STACK_SLOT_SZ)) {
+		/* Write covers full 4-byte slot(s) */
+		for (s = slot; s <= slot_hi; s++)
+			spis_set_bit(access->write[arg], s);
+	} else {
+		/* Reads, or sub-slot/unaligned writes treated as reads */
+		for (s = slot; s <= slot_hi; s++) {
+			spis_set_bit(access->read[arg], s);
+			spis_set_bit(arg_use[local_idx][arg], s);
+		}
+	}
+}
+
 
 /*
  * Compute effective FP offset for a memory access through @reg + insn->off.
@@ -1352,6 +1414,52 @@ static void arg_track_xfer(struct bpf_verifier_env *env,
 	}
 }
 
+/*
+ * Record all argument-derived memory accesses for a single instruction,
+ * using the converged arg_track state at that instruction.
+ */
+static void record_insn_mem_accesses(struct bpf_insn *insn,
+				     struct subprog_arg_access *access,
+				     u64 (*arg_use)[NUM_AT_IDS][2],
+				     int local_idx,
+				     struct arg_track *at)
+{
+	u8 class = BPF_CLASS(insn->code);
+
+	if (class == BPF_LDX) {
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+		if (BPF_MODE(insn->code) == BPF_MEM ||
+		    BPF_MODE(insn->code) == BPF_MEMSX)
+			record_arg_mem_access(access, arg_use, local_idx,
+					      &at[insn->src_reg],
+					      insn->off, true, sz);
+	} else if (class == BPF_STX) {
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+		if (BPF_MODE(insn->code) == BPF_MEM)
+			record_arg_mem_access(access, arg_use, local_idx,
+					      &at[insn->dst_reg],
+					      insn->off, false, sz);
+		if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+			if (insn->imm == BPF_STORE_REL)
+				record_arg_mem_access(access, arg_use, local_idx,
+						      &at[insn->dst_reg],
+						      insn->off, false, sz);
+			else
+				record_arg_mem_access(access, arg_use, local_idx,
+						      &at[insn->dst_reg],
+						      insn->off, true, sz);
+		}
+	} else if (class == BPF_ST && BPF_MODE(insn->code) == BPF_MEM) {
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+
+		record_arg_mem_access(access, arg_use, local_idx,
+				      &at[insn->dst_reg],
+				      insn->off, false, sz);
+	}
+}
+
 
 /* Per-subprog intermediate state kept alive across analysis phases */
 struct subprog_at_info {
@@ -1362,7 +1470,8 @@ struct subprog_at_info {
 
 /*
  * Phase 1: Compute arg tracking dataflow for a single subprog.
- * Runs forward fixed-point with arg_track_xfer().
+ * Runs forward fixed-point with arg_track_xfer(), then records
+ * memory accesses in a single linear pass over converged state.
  * Stores at_in and arg_use in info for later phases.
  */
 static int compute_subprog_arg_tracking(struct bpf_verifier_env *env,
@@ -1521,6 +1630,17 @@ static int compute_subprog_arg_tracking(struct bpf_verifier_env *env,
 	}
 
 	kvfree(at_stack_in);
+
+	/* Linear pass: record memory accesses using converged at_in */
+	for (i = 0; i < len; i++) {
+		struct bpf_insn *insn = &insns[start + i];
+
+		if (at_in[i][0].arg == ARG_UNVISITED &&
+		    at_in[i][1].arg == ARG_UNVISITED)
+			continue;
+
+		record_insn_mem_accesses(insn, access, arg_use, i, at_in[i]);
+	}
 
 	if (env->log.level & BPF_LOG_LEVEL2)
 		print_subprog_arg_access(env, subprog, access);
