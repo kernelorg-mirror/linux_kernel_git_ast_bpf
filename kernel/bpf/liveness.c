@@ -1516,6 +1516,69 @@ static void record_insn_mem_accesses(struct bpf_insn *insn,
 	}
 }
 
+/*
+ * Backward pass: compute per-instruction argument read liveness.
+ * arg_live[i][arg] = union of arg_use[j][arg] for all j reachable from i.
+ * No def-kills: conservative (reads through written slots stay live).
+ *
+ * For nested calls (subprog0 -> subprog1 -> subprog2), this works
+ * transitively: the forward pass folds inner callee reads into arg_use
+ * at each BPF-to-BPF call instruction, so arg_live for subprog1 already
+ * includes reads that subprog2 makes through subprog1's arguments.
+ * clean_verifier_state() only needs to consult the immediate child's
+ * arg_live to get correct liveness for any call depth.
+ */
+static int compute_arg_live(struct bpf_verifier_env *env,
+			    int subprog, int start, int len,
+			    struct subprog_arg_access *access,
+			    u64 (*arg_use)[NUM_AT_IDS][2])
+{
+	int po_start = env->subprog_info[subprog].postorder_start;
+	int po_end = (subprog + 1 < env->subprog_cnt)
+		     ? env->subprog_info[subprog + 1].postorder_start
+		     : env->cfg.cur_postorder;
+	bool changed = true;
+
+	access->subprog_len = len;
+	access->arg_live = kvzalloc_objs(*access->arg_live, len, GFP_KERNEL_ACCOUNT);
+	if (!access->arg_live)
+		return -ENOMEM;
+
+	while (changed) {
+		changed = false;
+		for (int p = po_start; p < po_end; p++) {
+			int insn_idx = env->cfg.insn_postorder[p];
+			int li = insn_idx - start;
+			struct bpf_iarray *succ;
+			u64 new_live[NUM_AT_IDS][2] = {};
+			int a;
+
+			succ = bpf_insn_successors(env, insn_idx);
+			for (int s = 0; s < succ->cnt; s++) {
+				int target = succ->items[s];
+
+				if (target < start || target >= start + len)
+					continue;
+				for (a = 0; a < NUM_AT_IDS; a++)
+					spis_or(new_live[a],
+						access->arg_live[target - start][a]);
+			}
+			for (a = 0; a < NUM_AT_IDS; a++)
+				spis_or(new_live[a], arg_use[li][a]);
+
+			for (a = 0; a < NUM_AT_IDS; a++) {
+				if (!spis_equal(new_live[a],
+						access->arg_live[li][a])) {
+					spis_copy(access->arg_live[li][a],
+						  new_live[a]);
+					changed = true;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
 /* Per-subprog intermediate state kept alive across analysis phases */
 struct subprog_at_info {
 	struct arg_track (*at_in)[MAX_BPF_REG];
@@ -1798,6 +1861,17 @@ int compute_subprog_arg_access(struct bpf_verifier_env *env)
 
 	/* Phase 2: fold callee access into callers (iterate until convergence) */
 	fold_subprog_callee_accesses(env, insns, info);
+
+	/* Phase 3: compute backward arg liveness per subprog */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int start = env->subprog_info[i].start;
+		struct subprog_arg_access *access = &env->subprog_arg_access[i];
+
+		err = compute_arg_live(env, i, start, info[i].len,
+				       access, info[i].arg_use);
+		if (err)
+			goto err_free;
+	}
 
 err_free:
 	for (i = 1; i < env->subprog_cnt; i++) {

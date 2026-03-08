@@ -808,6 +808,14 @@ struct subprog_arg_access {
 	u64 read[NUM_AT_IDS][2];   /* 4-byte slot bitmask: callee reads */
 	u64 write[NUM_AT_IDS][2];  /* 4-byte slot bitmask: callee writes */
 	u32 unknown_args;
+	/*
+	 * Per-instruction backward liveness of argument reads.
+	 * arg_live[i][arg] is u64[2] bitmask of 4-byte slots
+	 * still read from instruction (subprog_start + i) onward.
+	 * NULL when not computed or conservative fallback.
+	 */
+	u64 (*arg_live)[NUM_AT_IDS][2];
+	u32 subprog_len;
 };
 
 struct bpf_verifier_env;

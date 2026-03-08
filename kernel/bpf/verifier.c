@@ -26271,6 +26271,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 
 skip_full_check:
 	if (env->subprog_arg_access) {
+		for (i = 0; i < env->subprog_cnt; i++)
+			kvfree(env->subprog_arg_access[i].arg_live);
 		kvfree(env->subprog_arg_access);
 		env->subprog_arg_access = NULL;
 	}
