@@ -245,6 +245,18 @@ static inline void spis_or(u64 dst[2], const u64 src[2])
 	dst[1] |= src[1];
 }
 
+static inline void spis_and(u64 dst[2], const u64 src[2])
+{
+	dst[0] &= src[0];
+	dst[1] &= src[1];
+}
+
+static inline void spis_andnot(u64 dst[2], const u64 src[2])
+{
+	dst[0] &= ~src[0];
+	dst[1] &= ~src[1];
+}
+
 static inline void spis_set_all(u64 spis[2])
 {
 	spis[0] = U64_MAX;
@@ -817,6 +829,7 @@ struct bpf_subprog_info {
 struct subprog_arg_access {
 	u64 read[NUM_AT_IDS][2];   /* 4-byte slot bitmask: callee reads */
 	u64 write[NUM_AT_IDS][2];  /* 4-byte slot bitmask: callee writes */
+	u64 must_write[NUM_AT_IDS][2]; /* 4-byte slot bitmask: callee MUST write */
 	u32 unknown_args;
 	/*
 	 * Per-instruction backward liveness of argument reads.
