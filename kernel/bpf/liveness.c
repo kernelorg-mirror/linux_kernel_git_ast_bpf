@@ -2,6 +2,7 @@
 /* Copyright (c) 2025 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bpf_verifier.h>
+#include <linux/btf.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
 #include <linux/slab.h>
@@ -965,4 +966,611 @@ static inline bool spis_any_new(const u64 a[2], const u64 b[2])
 static inline bool spis_and_nonzero(const u64 a[2], const u64 b[2])
 {
 	return (a[0] & b[0]) || (a[1] & b[1]);
+}
+
+/* Print the BTF function prototype and detected access pattern for a subprog */
+static void print_subprog_arg_access(struct bpf_verifier_env *env,
+				     int subprog,
+				     struct subprog_arg_access *access)
+{
+	struct bpf_prog_aux *aux = env->prog->aux;
+	const struct btf_type *func, *func_proto;
+	const struct btf_param *args;
+	struct btf *btf = aux->btf;
+	char buf[256];
+	u32 nr_args;
+	int len, i;
+
+	if (!aux->func_info)
+		return;
+	if (!btf)
+		return;
+
+	func = btf_type_by_id(btf, aux->func_info[subprog].type_id);
+	if (!func || !btf_type_is_func(func))
+		return;
+	func_proto = btf_type_by_id(btf, func->type);
+	if (!func_proto || !btf_type_is_func_proto(func_proto))
+		return;
+
+	nr_args = btf_type_vlen(func_proto);
+	args = btf_params(func_proto);
+
+	/* Print C-like prototype */
+	len = btf_type_snprintf(btf, func_proto->type, buf, sizeof(buf));
+	len += snprintf(buf + len, max((int)sizeof(buf) - len, 0), " %s(",
+			btf_name_by_offset(btf, func->name_off) ?: "?");
+	for (i = 0; i < nr_args; i++) {
+		if (i)
+			len += snprintf(buf + len,
+					max((int)sizeof(buf) - len, 0), ", ");
+		len += btf_type_snprintf(btf, args[i].type, buf + len,
+					 sizeof(buf) - len);
+		len += snprintf(buf + len, max((int)sizeof(buf) - len, 0),
+				" %s",
+				btf_name_by_offset(btf, args[i].name_off) ?: "");
+	}
+	len += snprintf(buf + len, max((int)sizeof(buf) - len, 0), ")");
+
+	verbose(env, "subprog#%d: %s\n", subprog, buf);
+
+	/* Print access pattern per argument */
+	for (i = 1; i < NUM_AT_IDS && i <= nr_args; i++) {
+		u64 *r = access->read[i];
+		u64 *w = access->write[i];
+
+		if (spis_is_all(r) || spis_is_all(w))
+			verbose(env, "  r%d: all (conservative)\n", i);
+		else if (!spis_is_zero(r) || !spis_is_zero(w))
+			verbose(env, "  r%d read: 0x%llx:%llx  write: 0x%llx:%llx\n",
+				i, r[1], r[0], w[1], w[0]);
+	}
+}
+
+/*
+ * Per-register tracking state for compute_subprog_arg_tracking().
+ * Tracks which argument register (R1-R5) a value is derived from
+ * and the byte offset from that argument's original value.
+ *
+ * The .arg field forms a lattice with three levels of precision:
+ *
+ *   precise {arg=0..5, off=N}     -- known arg identity and byte offset
+ *        |                          (0=FP, 1-5=R1-R5)
+ *   offset-imprecise {arg=0..5, off=OFF_IMPRECISE}
+ *        |                        -- known arg identity, unknown offset
+ *   fully-imprecise {arg=ARG_IMPRECISE}
+ *                                 -- unknown arg identity and offset
+ *
+ * At CFG merge points, arg_track_join() moves down the lattice:
+ *   - same arg + same offset  -> precise
+ *   - same arg + different offset -> offset-imprecise
+ *   - different args          -> fully-imprecise
+ *
+ * At memory access sites (LDX/STX/ST), offset-imprecise marks only
+ * the known arg's access mask as U64_MAX, while fully-imprecise must
+ * conservatively mark all args.
+ */
+struct arg_track {
+	s64 off;	/* byte offset, or OFF_IMPRECISE if unknown */
+	s8 arg;		/* 0=FP, 1-5=R1-R5, or enum arg_track_state */
+};
+
+enum arg_track_state {
+	ARG_NONE	= -1,	/* not derived from any argument */
+	ARG_UNVISITED	= -2,	/* not yet reached by dataflow */
+	ARG_IMPRECISE	= -3,	/* arg-derived but lost arg identity and offset */
+};
+
+#define OFF_IMPRECISE	S64_MIN	/* arg identity known but offset unknown */
+
+/* Track callee stack slots fp-8 through fp-64 (8 slots of 8 bytes each) */
+#define MAX_ARG_SPILL_SLOTS 8
+
+/*
+ * Convert a byte offset from FP to a callee stack slot index (0-7).
+ * Returns -1 if out of range or not 8-byte aligned.
+ * Slot 0 = fp-8, slot 1 = fp-16, ..., slot 7 = fp-64.
+ */
+static int fp_byte_off_to_slot(s64 off)
+{
+	if (off >= 0 || off < -(s64)(MAX_ARG_SPILL_SLOTS * 8))
+		return -1;
+	if (off % 8)
+		return -1;
+	return (int)((-off) / 8) - 1;
+}
+
+/*
+ * Clear all tracked callee stack slots overlapping the byte range
+ * [off, off+sz-1] where off is a negative FP-relative offset.
+ */
+static void clear_overlapping_stack_slots(struct arg_track *at_stack,
+					  s64 off, u32 sz)
+{
+	s64 end = off + sz;
+	int i;
+
+	for (i = 0; i < MAX_ARG_SPILL_SLOTS; i++) {
+		s64 slot_start = -(s64)((i + 1) * 8);
+		s64 slot_end = slot_start + 8;
+
+		if (slot_start < end && slot_end > off)
+			at_stack[i] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+	}
+}
+
+/*
+ * Join two arg_track values at merge points.
+ * Same arg+off = keep, same arg+different off = keep arg with imprecise
+ * offset, different args = fully imprecise.
+ */
+static struct arg_track arg_track_join(struct subprog_arg_access *access,
+				       struct arg_track a, struct arg_track b)
+{
+	if (b.arg == ARG_UNVISITED)
+		return a;
+	if (a.arg == ARG_UNVISITED)
+		return b;
+	if (a.arg == b.arg && a.off == b.off)
+		return a;
+	/* Same arg, different offset: preserve arg identity */
+	if (a.arg >= 0 && a.arg == b.arg)
+		return (struct arg_track){ .off = OFF_IMPRECISE, .arg = a.arg };
+	if (a.arg >= 0 && b.arg == ARG_NONE)
+		return (struct arg_track){ .off = OFF_IMPRECISE, .arg = a.arg };
+	if (b.arg >= 0 && a.arg == ARG_NONE)
+		return (struct arg_track){ .off = OFF_IMPRECISE, .arg = b.arg };
+	if (a.arg >= 0)
+		access->unknown_args |= BIT(a.arg);
+	if (b.arg >= 0)
+		access->unknown_args |= BIT(b.arg);
+	return (struct arg_track){ .off = 0, .arg = ARG_IMPRECISE };
+}
+
+/*
+ * Compute the result when an ALU op destroys offset precision.
+ * If a single arg is identifiable, preserve it with OFF_IMPRECISE.
+ * If two different args are involved or one is already ARG_IMPRECISE,
+ * the result is fully ARG_IMPRECISE.
+ */
+static struct arg_track arg_track_lose_offset(struct subprog_arg_access *access, s8 arg1, s8 arg2)
+{
+	if (arg1 >= 0 && (arg2 == ARG_NONE || arg2 == arg1))
+		return (struct arg_track){ .off = OFF_IMPRECISE, .arg = arg1 };
+	if (arg2 >= 0 && arg1 == ARG_NONE)
+		return (struct arg_track){ .off = OFF_IMPRECISE, .arg = arg2 };
+	if (arg1 == ARG_IMPRECISE || arg2 == ARG_IMPRECISE ||
+	    (arg1 >= 0 && arg2 >= 0)) {
+		if (arg1 >= 0)
+			access->unknown_args |= BIT(arg1);
+		if (arg2 >= 0)
+			access->unknown_args |= BIT(arg2);
+		return (struct arg_track){ .off = 0, .arg = ARG_NONE };
+	}
+	return (struct arg_track){ .off = 0, .arg = ARG_NONE };
+}
+
+static void verbose_arg_track(struct bpf_verifier_env *env, struct arg_track *at)
+{
+	switch (at->arg) {
+	case ARG_NONE:      verbose(env, "_");                          break;
+	case ARG_UNVISITED: verbose(env, "?");                          break;
+	case ARG_IMPRECISE: verbose(env, "IMP");                        break;
+	case AT_FP:
+		if (at->off == OFF_IMPRECISE)
+			verbose(env, "fp ?");
+		else
+			verbose(env, "fp%+lld", at->off);
+		break;
+	default:
+		if (at->off == OFF_IMPRECISE)
+			verbose(env, "r%d ?", at->arg);
+		else
+			verbose(env, "r%d%+lld", at->arg, at->off);
+		break;
+	}
+}
+
+
+/*
+ * Compute effective FP offset for a memory access through @reg + insn->off.
+ * If @reg is R10 (FP), the offset is simply insn->off.
+ * If @reg is FP-derived with a known offset, combine them.
+ * Returns OFF_IMPRECISE when the effective offset cannot be determined.
+ */
+static s64 effective_fp_off(struct bpf_insn *insn, struct arg_track *at_out,
+			    int reg)
+{
+	if (reg == BPF_REG_FP)
+		return insn->off;
+	if (at_out[reg].off == OFF_IMPRECISE)
+		return OFF_IMPRECISE;
+	return at_out[reg].off + insn->off;
+}
+
+/*
+ * Pure dataflow transfer function for arg_track state.
+ * Updates at_out[] based on how the instruction modifies registers.
+ * Does not record memory accesses or handle inter-procedural folding.
+ */
+static void arg_track_xfer(struct bpf_verifier_env *env,
+			   struct bpf_insn *insn,
+			   struct subprog_arg_access *access,
+			   struct arg_track *at_out,
+			   struct arg_track *at_stack_out)
+{
+	u8 class = BPF_CLASS(insn->code);
+	u8 code = BPF_OP(insn->code);
+	int r;
+
+	if (class == BPF_ALU64 && BPF_SRC(insn->code) == BPF_K) {
+		if (code == BPF_MOV) {
+			at_out[insn->dst_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+		} else if (code == BPF_ADD && at_out[insn->dst_reg].arg >= 0) {
+			if (at_out[insn->dst_reg].off != OFF_IMPRECISE)
+				at_out[insn->dst_reg].off += insn->imm;
+		} else if (code == BPF_SUB && at_out[insn->dst_reg].arg >= 0) {
+			if (at_out[insn->dst_reg].off != OFF_IMPRECISE)
+				at_out[insn->dst_reg].off -= insn->imm;
+		} else if (at_out[insn->dst_reg].arg == ARG_IMPRECISE ||
+			   (at_out[insn->dst_reg].arg >= 0 &&
+			    at_out[insn->dst_reg].off == OFF_IMPRECISE)) {
+			; /* keep imprecise state unchanged */
+		} else {
+			at_out[insn->dst_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+		}
+	} else if (class == BPF_ALU64 && BPF_SRC(insn->code) == BPF_X) {
+		if (code == BPF_MOV) {
+			if (insn->off == 0) {
+				at_out[insn->dst_reg] = at_out[insn->src_reg];
+			} else {
+				/* addr_space_cast */
+				at_out[insn->dst_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+			}
+		} else {
+			at_out[insn->dst_reg] = arg_track_lose_offset(access,
+				at_out[insn->dst_reg].arg,
+				at_out[insn->src_reg].arg);
+		}
+	} else if (class == BPF_ALU || class == BPF_ALU64) {
+		s8 sa = BPF_SRC(insn->code) == BPF_X ?
+			at_out[insn->src_reg].arg : ARG_NONE;
+
+		if (code == BPF_MOV)
+			at_out[insn->dst_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+		else
+			at_out[insn->dst_reg] = arg_track_lose_offset(access,
+								      at_out[insn->dst_reg].arg, sa);
+	} else if (class == BPF_JMP && code == BPF_CALL) {
+		/* Calls clobber R0-R5 */
+		for (r = BPF_REG_0; r <= BPF_REG_5; r++)
+			at_out[r] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+	} else if (class == BPF_LDX) {
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+		bool src_is_fp = (insn->src_reg == BPF_REG_FP ||
+				  at_out[insn->src_reg].arg == AT_FP);
+
+		/*
+		 * Reload from callee stack: if src is FP-derived with
+		 * precise offset, 8-byte BPF_MEM load, and the slot
+		 * holds an arg identity, restore it to dst.
+		 */
+		if (src_is_fp &&
+		    BPF_MODE(insn->code) == BPF_MEM && sz == 8) {
+			s64 eff_off = effective_fp_off(insn, at_out, insn->src_reg);
+			int slot;
+
+			slot = (eff_off != OFF_IMPRECISE) ?
+				fp_byte_off_to_slot(eff_off) : -1;
+			if (slot >= 0 && at_stack_out[slot].arg >= 1) {
+				at_out[insn->dst_reg] = at_stack_out[slot];
+			} else {
+				at_out[insn->dst_reg] = (struct arg_track){
+					.off = 0, .arg = ARG_NONE };
+			}
+		} else {
+			at_out[insn->dst_reg] = (struct arg_track){
+				.off = 0, .arg = ARG_NONE };
+		}
+	} else if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM) {
+		at_out[insn->dst_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+	} else if (class == BPF_STX) {
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+		bool dst_is_fp;
+		s64 eff_off;
+
+		/* Track spills to FP-derived callee stack */
+		dst_is_fp = (insn->dst_reg == BPF_REG_FP ||
+			     at_out[insn->dst_reg].arg == AT_FP);
+		if (dst_is_fp && BPF_MODE(insn->code) == BPF_MEM) {
+			eff_off = effective_fp_off(insn, at_out, insn->dst_reg);
+			if (eff_off != OFF_IMPRECISE) {
+				int slot = fp_byte_off_to_slot(eff_off);
+
+				if (slot >= 0 && sz == 8) {
+					/* Precise 8-byte spill: track src */
+					at_stack_out[slot] = at_out[insn->src_reg];
+				} else {
+					/* Partial or misaligned: clear overlapping */
+					clear_overlapping_stack_slots(at_stack_out,
+								     eff_off, sz);
+					if (at_out[insn->src_reg].arg >= 1)
+						access->unknown_args |=
+							BIT(at_out[insn->src_reg].arg);
+				}
+			} else {
+				/* Imprecise offset: clear all slots */
+				for (r = 0; r < MAX_ARG_SPILL_SLOTS; r++)
+					at_stack_out[r] = (struct arg_track){
+						.off = 0, .arg = ARG_NONE };
+				if (at_out[insn->src_reg].arg >= 1)
+					access->unknown_args |=
+						BIT(at_out[insn->src_reg].arg);
+			}
+		}
+
+		if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+			/* Atomics to FP-derived dst: clear overlapping slots */
+			dst_is_fp = (insn->dst_reg == BPF_REG_FP ||
+				     at_out[insn->dst_reg].arg == AT_FP);
+			if (dst_is_fp) {
+				eff_off = effective_fp_off(insn, at_out,
+							   insn->dst_reg);
+				if (eff_off != OFF_IMPRECISE)
+					clear_overlapping_stack_slots(at_stack_out,
+								     eff_off, sz);
+				else
+					for (r = 0; r < MAX_ARG_SPILL_SLOTS; r++)
+						at_stack_out[r] = (struct arg_track){
+							.off = 0, .arg = ARG_NONE };
+			}
+
+			if (insn->imm == BPF_CMPXCHG)
+				at_out[BPF_REG_0] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+			else if (insn->imm == BPF_LOAD_ACQ)
+				at_out[insn->dst_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+			else if (insn->imm & BPF_FETCH)
+				at_out[insn->src_reg] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+		}
+	} else if (class == BPF_ST && BPF_MODE(insn->code) == BPF_MEM) {
+		u32 sz = bpf_size_to_bytes(BPF_SIZE(insn->code));
+		bool dst_is_fp = (insn->dst_reg == BPF_REG_FP ||
+				  at_out[insn->dst_reg].arg == AT_FP);
+
+		/* BPF_ST to FP-derived dst: clear overlapping stack slots */
+		if (dst_is_fp) {
+			s64 eff_off = effective_fp_off(insn, at_out,
+						       insn->dst_reg);
+			if (eff_off != OFF_IMPRECISE)
+				clear_overlapping_stack_slots(at_stack_out,
+							     eff_off, sz);
+			else
+				for (r = 0; r < MAX_ARG_SPILL_SLOTS; r++)
+					at_stack_out[r] = (struct arg_track){
+						.off = 0, .arg = ARG_NONE };
+		}
+	}
+}
+
+
+/* Per-subprog intermediate state kept alive across analysis phases */
+struct subprog_at_info {
+	struct arg_track (*at_in)[MAX_BPF_REG];
+	u64 (*arg_use)[NUM_AT_IDS][2];
+	int len;
+};
+
+/*
+ * Phase 1: Compute arg tracking dataflow for a single subprog.
+ * Runs forward fixed-point with arg_track_xfer().
+ * Stores at_in and arg_use in info for later phases.
+ */
+static int compute_subprog_arg_tracking(struct bpf_verifier_env *env,
+					struct bpf_insn *insns,
+					int subprog,
+					struct subprog_arg_access *access,
+					struct subprog_at_info *info)
+{
+	int start = env->subprog_info[subprog].start;
+	int end = env->subprog_info[subprog + 1].start;
+	int len = end - start;
+	struct arg_track (*at_in)[MAX_BPF_REG] = NULL;
+	struct arg_track at_out[MAX_BPF_REG];
+	struct arg_track (*at_stack_in)[MAX_ARG_SPILL_SLOTS] = NULL;
+	struct arg_track at_stack_out[MAX_ARG_SPILL_SLOTS];
+	u64 (*arg_use)[NUM_AT_IDS][2] = NULL;
+	bool changed;
+	u32 mask;
+	int i, r, err;
+
+	for (i = 0; i < NUM_AT_IDS; i++) {
+		spis_clear(access->read[i]);
+		spis_clear(access->write[i]);
+	}
+
+	at_in = kvmalloc_array(len, sizeof(*at_in), GFP_KERNEL_ACCOUNT);
+	if (!at_in) {
+		err = -ENOMEM;
+		goto err_free;
+	}
+
+	at_stack_in = kvmalloc_array(len, sizeof(*at_stack_in), GFP_KERNEL_ACCOUNT);
+	if (!at_stack_in) {
+		err = -ENOMEM;
+		goto err_free;
+	}
+
+	arg_use = kvzalloc_objs(*arg_use, len, GFP_KERNEL_ACCOUNT);
+	if (!arg_use) {
+		err = -ENOMEM;
+		goto err_free;
+	}
+
+	/* Initialize all registers to unvisited */
+	for (i = 0; i < len; i++)
+		for (r = 0; r < MAX_BPF_REG; r++)
+			at_in[i][r] = (struct arg_track){ .off = 0, .arg = ARG_UNVISITED };
+
+	/* Initialize all stack slots to unvisited */
+	for (i = 0; i < len; i++)
+		for (r = 0; r < MAX_ARG_SPILL_SLOTS; r++)
+			at_stack_in[i][r] = (struct arg_track){ .off = 0, .arg = ARG_UNVISITED };
+
+	/* Entry: R1-R5 are arg-derived with offset 0, FP is identity 0 */
+	for (r = 0; r < MAX_BPF_REG; r++)
+		at_in[0][r] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+	at_in[0][BPF_REG_FP] = (struct arg_track){ .off = 0, .arg = AT_FP };
+	for (r = BPF_REG_1; r <= BPF_REG_5; r++)
+		at_in[0][r] = (struct arg_track){ .off = 0, .arg = r - BPF_REG_1 + 1 };
+
+	/* Entry: all stack slots are ARG_NONE (empty) */
+	for (r = 0; r < MAX_ARG_SPILL_SLOTS; r++)
+		at_stack_in[0][r] = (struct arg_track){ .off = 0, .arg = ARG_NONE };
+
+	if (env->log.level & BPF_LOG_LEVEL2)
+		verbose(env, "subprog#%d: analyzing...\n", subprog);
+
+	/* Forward fixed-point iteration (dataflow only) */
+	changed = true;
+	while (changed) {
+		changed = false;
+		for (i = 0; i < len; i++) {
+			int idx = start + i;
+			struct bpf_insn *insn = &insns[idx];
+			struct bpf_iarray *succ;
+
+			if (at_in[i][0].arg == ARG_UNVISITED &&
+			    at_in[i][1].arg == ARG_UNVISITED)
+				continue;
+
+			memcpy(at_out, at_in[i], sizeof(at_out));
+			memcpy(at_stack_out, at_stack_in[i], sizeof(at_stack_out));
+			arg_track_xfer(env, insn, access, at_out, at_stack_out);
+
+			/* Log transfer function changes */
+			if (env->log.level & BPF_LOG_LEVEL2) {
+				for (r = 0; r < MAX_BPF_REG; r++) {
+					if (at_out[r].arg != at_in[i][r].arg ||
+					    at_out[r].off != at_in[i][r].off) {
+						verbose(env, "%3d: ", idx);
+						verbose_insn(env, insn);
+						bpf_vlog_reset(&env->log, env->log.end_pos - 1);
+						verbose(env, "\tr%d: ", r);
+						verbose_arg_track(env, &at_in[i][r]);
+						verbose(env, " -> ");
+						verbose_arg_track(env, &at_out[r]);
+						verbose(env, "\n");
+					}
+				}
+			}
+
+			/* Propagate to successors within this subprogram */
+			succ = bpf_insn_successors(env, idx);
+			for (int s = 0; s < succ->cnt; s++) {
+				int target = succ->items[s];
+				int ti;
+
+				/* Filter: stay within the subprogram's range */
+				if (target < start || target >= end)
+					continue;
+				ti = target - start;
+
+				for (r = 0; r < MAX_BPF_REG; r++) {
+					struct arg_track old = at_in[ti][r];
+					struct arg_track new_val = arg_track_join(access, old, at_out[r]);
+
+					if (new_val.arg != old.arg || new_val.off != old.off) {
+						if ((env->log.level & BPF_LOG_LEVEL2) && old.arg != ARG_UNVISITED) {
+							verbose(env, "arg_track: JOIN insn %d -> %d r%d: ",
+								idx, target, r);
+							verbose_arg_track(env, &old);
+							verbose(env, " + ");
+							verbose_arg_track(env, &at_out[r]);
+							verbose(env, " => ");
+							verbose_arg_track(env, &new_val);
+							verbose(env, "\n");
+						}
+						at_in[ti][r] = new_val;
+						changed = true;
+					}
+				}
+
+				/* Join callee stack slots */
+				for (r = 0; r < MAX_ARG_SPILL_SLOTS; r++) {
+					struct arg_track old = at_stack_in[ti][r];
+					struct arg_track new_val = arg_track_join(access, old,
+										  at_stack_out[r]);
+
+					if (new_val.arg != old.arg || new_val.off != old.off) {
+						at_stack_in[ti][r] = new_val;
+						changed = true;
+					}
+				}
+			}
+		}
+	}
+
+	/* Apply unknown_args to access masks */
+	mask = access->unknown_args;
+	while (mask) {
+		int k = __ffs(mask);
+
+		spis_set_all(access->read[k]);
+		spis_set_all(access->write[k]);
+		mask &= mask - 1;
+	}
+
+	kvfree(at_stack_in);
+
+	if (env->log.level & BPF_LOG_LEVEL2)
+		print_subprog_arg_access(env, subprog, access);
+
+	info->at_in = at_in;
+	info->arg_use = arg_use;
+	info->len = len;
+	return 0;
+
+err_free:
+	kvfree(arg_use);
+	kvfree(at_stack_in);
+	kvfree(at_in);
+	return err;
+}
+
+
+int compute_subprog_arg_access(struct bpf_verifier_env *env)
+{
+	struct bpf_insn *insns = env->prog->insnsi;
+	struct subprog_at_info *info;
+	int i, err;
+
+	if (env->subprog_cnt <= 1)
+		return 0;
+
+	env->subprog_arg_access = kvcalloc(env->subprog_cnt,
+					   sizeof(*env->subprog_arg_access),
+					   GFP_KERNEL_ACCOUNT);
+	if (!env->subprog_arg_access)
+		return -ENOMEM;
+
+	info = kvcalloc(env->subprog_cnt, sizeof(*info), GFP_KERNEL_ACCOUNT);
+	if (!info)
+		return -ENOMEM;
+
+	/* Phase 1: compute arg tracking per subprog (independent) */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		err = compute_subprog_arg_tracking(env, insns, i,
+						   &env->subprog_arg_access[i],
+						   &info[i]);
+		if (err)
+			goto err_free;
+	}
+
+err_free:
+	for (i = 1; i < env->subprog_cnt; i++) {
+		kvfree(info[i].at_in);
+		kvfree(info[i].arg_use);
+	}
+	kvfree(info);
+	return err;
 }

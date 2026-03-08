@@ -630,6 +630,15 @@ struct bpf_iarray {
 	u32 items[];
 };
 
+/*
+ * Arg-track identity encoding:
+ *   0 = FP (AT_FP)
+ *   1..5 = R1..R5
+ * NUM_AT_IDS = 6 covers FP + 5 argument registers.
+ */
+#define AT_FP 0
+#define NUM_AT_IDS (MAX_BPF_FUNC_REG_ARGS + 1)
+
 struct bpf_insn_aux_data {
 	union {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
@@ -795,6 +804,12 @@ struct bpf_subprog_info {
 	struct bpf_subprog_arg_info args[MAX_BPF_FUNC_REG_ARGS];
 };
 
+struct subprog_arg_access {
+	u64 read[NUM_AT_IDS][2];   /* 4-byte slot bitmask: callee reads */
+	u64 write[NUM_AT_IDS][2];  /* 4-byte slot bitmask: callee writes */
+	u32 unknown_args;
+};
+
 struct bpf_verifier_env;
 
 struct backtrack_state {
@@ -920,6 +935,11 @@ struct bpf_verifier_env {
 	} cfg;
 	struct backtrack_state bt;
 	struct bpf_jmp_history_entry *cur_hist_ent;
+	/* Per-subprog arg access bitmasks computed by compute_subprog_arg_tracking().
+	 * For each arg (R1-R5), bit K set means the callee accesses arg + K*8.
+	 * U64_MAX means conservative fallback.
+	 */
+	struct subprog_arg_access *subprog_arg_access;
 	u32 pass_cnt; /* number of times do_check() was called */
 	u32 subprog_cnt;
 	/* number of instructions analyzed by the verifier */
@@ -1236,6 +1256,7 @@ s64 bpf_helper_stack_access_bytes(struct bpf_verifier_env *env,
 s64 bpf_kfunc_stack_access_bytes(struct bpf_verifier_env *env,
 				 struct bpf_insn *insn, int arg,
 				 int insn_idx);
+int compute_subprog_arg_access(struct bpf_verifier_env *env);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);

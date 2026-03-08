@@ -26251,6 +26251,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	if (ret < 0)
 		goto skip_full_check;
 
+	ret = compute_subprog_arg_access(env);
+	if (ret < 0)
+		goto skip_full_check;
+
 	ret = compute_live_registers(env);
 	if (ret < 0)
 		goto skip_full_check;
@@ -26266,6 +26270,10 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		ret = bpf_prog_offload_finalize(env);
 
 skip_full_check:
+	if (env->subprog_arg_access) {
+		kvfree(env->subprog_arg_access);
+		env->subprog_arg_access = NULL;
+	}
 	kvfree(env->explored_states);
 
 	/* might decrease stack depth, keep it before passes that
