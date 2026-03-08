@@ -646,6 +646,7 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	u64 live_stack_before[2];
 	/*
 	 * Bitmask of R0-R9 that hold known values at this instruction.
 	 * const_reg_mask: scalar constants that fit in 32 bits.
@@ -744,6 +745,14 @@ struct bpf_subprog_info {
 };
 
 struct bpf_verifier_env;
+
+struct bpf_callsite_nonlocal_live {
+	u64 (*live)[MAX_CALL_FRAMES][2];
+	u32 start;
+	u32 len;
+	/* Number of caller-relative ancestor slots captured in @live. */
+	u8 depth;
+};
 
 struct backtrack_state {
 	struct bpf_verifier_env *env;
@@ -870,6 +879,10 @@ struct bpf_verifier_env {
 	} cfg;
 	struct backtrack_state bt;
 	struct bpf_jmp_history_entry *cur_hist_ent;
+	/* Per-callsite backward liveness of ancestor stack slots inside callee. */
+	struct bpf_callsite_nonlocal_live **callsite_nonlocal_live;
+	/* Per-callsite copy of parent's converged at_stack_in for cross-frame fills. */
+	struct arg_track **callsite_at_stack;
 	u32 pass_cnt; /* number of times do_check() was called */
 	u32 subprog_cnt;
 	/* number of instructions analyzed by the verifier */
@@ -951,6 +964,17 @@ static inline bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 	return insn->code == (BPF_JMP | BPF_CALL) &&
 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
 }
+
+struct insn_live_regs {
+	u16 use;	/* registers read by instruction */
+	u16 def;	/* registers written by instruction */
+	u16 in;		/* registers that may be alive before instruction */
+	u16 out;	/* registers that may be alive after instruction */
+	u64 stack_use[2];
+	u64 stack_def[2];
+	u64 stack_in[2];
+	u64 stack_out[2];
+};
 
 __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
 				      const char *fmt, va_list args);
@@ -1184,6 +1208,7 @@ int bpf_compute_postorder(struct bpf_verifier_env *env);
 bool bpf_insn_is_cond_jump(u8 code);
 bool bpf_is_may_goto_insn(struct bpf_insn *insn);
 
+u32 bpf_frame_insn_idx(const struct bpf_verifier_state *st, u32 frame);
 void bpf_verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn);
 bool bpf_get_call_summary(struct bpf_verifier_env *env, struct bpf_insn *call,
 			  struct bpf_call_summary *cs);
@@ -1193,6 +1218,12 @@ s64 bpf_helper_stack_access_bytes(struct bpf_verifier_env *env,
 s64 bpf_kfunc_stack_access_bytes(struct bpf_verifier_env *env,
 				 struct bpf_insn *insn, int arg,
 				 int insn_idx);
+int compute_subprog_arg_access(struct bpf_verifier_env *env,
+			       struct insn_live_regs *state);
+void refined_caller_live_stack(struct bpf_verifier_env *env,
+			      struct bpf_verifier_state *st,
+			      int frame_idx,
+			      u64 live_stack_out[2]);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);

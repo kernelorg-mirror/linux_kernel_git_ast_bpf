@@ -1826,14 +1826,14 @@ static bool same_callsites(struct bpf_verifier_state *a, struct bpf_verifier_sta
 }
 
 /* Return IP for a given frame in a call stack */
-static u32 frame_insn_idx(struct bpf_verifier_state *st, u32 frame)
+u32 bpf_frame_insn_idx(const struct bpf_verifier_state *st, u32 frame)
 {
 	return frame == st->curframe
 	       ? st->insn_idx
 	       : st->frame[frame + 1]->callsite;
 }
 
-/* For state @st look for a topmost frame with frame_insn_idx() in some SCC,
+/* For state @st look for a topmost frame with bpf_frame_insn_idx() in some SCC,
  * if such frame exists form a corresponding @callchain as an array of
  * call sites leading to this frame and SCC id.
  * E.g.:
@@ -1854,7 +1854,7 @@ static bool compute_scc_callchain(struct bpf_verifier_env *env,
 
 	memset(callchain, 0, sizeof(*callchain));
 	for (i = 0; i <= st->curframe; i++) {
-		insn_idx = frame_insn_idx(st, i);
+		insn_idx = bpf_frame_insn_idx(st, i);
 		scc = env->insn_aux_data[insn_idx].scc;
 		if (scc) {
 			callchain->scc = scc;
@@ -17713,7 +17713,7 @@ static void collect_linked_regs(struct bpf_verifier_env *env,
 
 	id = id & ~BPF_ADD_CONST;
 	for (i = vstate->curframe; i >= 0; i--) {
-		live_regs = aux[frame_insn_idx(vstate, i)].live_regs_before;
+		live_regs = aux[bpf_frame_insn_idx(vstate, i)].live_regs_before;
 		func = vstate->frame[i];
 		for (j = 0; j < BPF_REG_FP; j++) {
 			if (!(live_regs & BIT(j)))
@@ -20004,11 +20004,10 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 	return check_ids(old_id, cur_id, idmap);
 }
 
-static void clean_func_state(struct bpf_verifier_env *env,
-			     struct bpf_func_state *st,
-			     u32 ip)
+static void __clean_func_state(struct bpf_verifier_env *env,
+			       struct bpf_func_state *st,
+			       u16 live_regs, const u64 live_stack[2], int frame)
 {
-	u16 live_regs = env->insn_aux_data[ip].live_regs_before;
 	int i, j;
 
 	for (i = 0; i < BPF_REG_FP; i++) {
@@ -20020,10 +20019,72 @@ static void clean_func_state(struct bpf_verifier_env *env,
 			__mark_reg_not_init(env, &st->regs[i]);
 	}
 
+	/*
+	 * Clean dead 4-byte halves within each SPI independently.
+	 * slot 2*i   → lower half: slot_type[0..3] (closer to FP)
+	 * slot 2*i+1 → upper half: slot_type[4..7] (farther from FP)
+	 */
 	for (i = 0; i < st->allocated_stack / BPF_REG_SIZE; i++) {
-		if (!bpf_stack_slot_alive(env, st->frameno, i)) {
-			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
-			for (j = 0; j < BPF_REG_SIZE; j++)
+		u32 slot = i * 2;
+		bool lo_live = live_stack[slot / 64] & BIT_ULL(slot % 64);
+		bool hi_live = live_stack[(slot + 1) / 64] & BIT_ULL((slot + 1) % 64);
+
+		if (env->cur_state->frame[frame] != st && (env->log.level & BPF_LOG_LEVEL2)) {
+			bool old = bpf_stack_slot_alive(env, st->frameno, i);
+			if (!old && (lo_live || hi_live))
+				verbose(env, "frame %d slot fp-%d is DEAD in old, new lo_live %d new hi_live %d\n",
+					st->frameno, (i + 1) * 8, lo_live, hi_live);
+			if (old && (!lo_live && !hi_live))
+				verbose(env, "frame %d slot fp-%d is LIVE in old, new lo_live %d new hi_live %d\n",
+					st->frameno, (i + 1) * 8, lo_live, hi_live);
+		}
+
+		if (!hi_live || !lo_live) {
+			int start = !lo_live ? 0 : BPF_REG_SIZE / 2;
+			int end = !hi_live ? BPF_REG_SIZE : BPF_REG_SIZE / 2;
+			u8 stype = st->stack[i].slot_type[7];
+
+			/*
+			 * Don't clearn special slots.
+			 * destroy_if_dynptr_stack_slot() needs STACK_DYNPTR to
+			 * detect overwrites and invalidate associated data slices.
+			 * is_iter_reg_valid_uninit() and is_irq_flag_reg_valid_uninit()
+			 * check for their respective slot types to detect double-create.
+			 */
+			if (stype == STACK_DYNPTR || stype == STACK_ITER ||
+			    stype == STACK_IRQ_FLAG)
+				continue;
+
+			/*
+			 * Only destroy spilled_ptr when hi half is dead.
+			 * If hi half is still live with STACK_SPILL, the
+			 * spilled_ptr metadata is needed for correct state
+			 * comparison in stacksafe().
+			 * is_spilled_reg() is using slot_type[7], but
+			 * is_spilled_scalar_after() check either slot_type[0] or [4]
+			 */
+			if (!hi_live) {
+				struct bpf_reg_state *spill = &st->stack[i].spilled_ptr;
+
+				if (lo_live && stype == STACK_SPILL) {
+					u8 val = STACK_MISC;
+
+					/*
+					 * 8 byte spill of scalar 0 where half slot is dead
+					 * should become STACK_ZERO in lo 4 bytes.
+					 */
+					if (register_is_null(spill))
+						val = STACK_ZERO;
+					for (j = 0; j < 4; j++) {
+						u8 *t = &st->stack[i].slot_type[j];
+
+						if (*t == STACK_SPILL)
+							*t = val;
+					}
+				}
+				__mark_reg_not_init(env, spill);
+			}
+			for (j = start; j < end; j++)
 				st->stack[i].slot_type[j] = STACK_INVALID;
 		}
 	}
@@ -20032,13 +20093,22 @@ static void clean_func_state(struct bpf_verifier_env *env,
 static void clean_verifier_state(struct bpf_verifier_env *env,
 				 struct bpf_verifier_state *st)
 {
-	int i, ip;
+	int i;
 
+	if (env->cur_state != st)
+		st->cleaned = true;
 	bpf_live_stack_query_init(env, st);
-	st->cleaned = true;
 	for (i = 0; i <= st->curframe; i++) {
-		ip = frame_insn_idx(st, i);
-		clean_func_state(env, st->frame[i], ip);
+		u32 ip = bpf_frame_insn_idx(st, i);
+		u16 live_regs = env->insn_aux_data[ip].live_regs_before;
+		u64 live_stack[2];
+
+		if (i < st->curframe)
+			refined_caller_live_stack(env, st, i, live_stack);
+		else
+			spis_copy(live_stack, env->insn_aux_data[ip].live_stack_before);
+
+		__clean_func_state(env, st->frame[i], live_regs, live_stack, i);
 	}
 }
 
@@ -20144,6 +20214,13 @@ static void clean_live_states(struct bpf_verifier_env *env, int insn,
 	struct bpf_verifier_state_list *sl;
 	struct list_head *pos, *head;
 
+	/* keep cleaning the current state as registers/stack become dead */
+	clean_verifier_state(env, cur);
+
+	/*
+	 * can simply return here, since cached states will also be clean,
+	 * but keep old logic for the sake of dynamic liveness.
+	 */
 	head = explored_state(env, insn);
 	list_for_each(pos, head) {
 		sl = container_of(pos, struct bpf_verifier_state_list, node);
@@ -20154,8 +20231,6 @@ static void clean_live_states(struct bpf_verifier_env *env, int insn,
 			continue;
 		if (sl->state.cleaned)
 			/* all regs in this state in all frames were already marked */
-			continue;
-		if (incomplete_read_marks(env, &sl->state))
 			continue;
 		clean_verifier_state(env, &sl->state);
 	}
@@ -20620,7 +20695,7 @@ static bool states_equal(struct bpf_verifier_env *env,
 	 * and all frame states need to be equivalent
 	 */
 	for (i = 0; i <= old->curframe; i++) {
-		insn_idx = frame_insn_idx(old, i);
+		insn_idx = bpf_frame_insn_idx(old, i);
 		if (old->frame[i]->callsite != cur->frame[i]->callsite)
 			return false;
 		if (!func_states_equal(env, old->frame[i], cur->frame[i], insn_idx, exact))
@@ -25987,14 +26062,6 @@ static int process_fd_array(struct bpf_verifier_env *env, union bpf_attr *attr, 
 	return 0;
 }
 
-/* Each field is a register bitmask */
-struct insn_live_regs {
-	u16 use;	/* registers read by instruction */
-	u16 def;	/* registers written by instruction */
-	u16 in;		/* registers that may be alive before instruction */
-	u16 out;	/* registers that may be alive after instruction */
-};
-
 /* Bitmask with 1s for all caller saved registers */
 #define ALL_CALLER_SAVED_REGS ((1u << CALLER_SAVED_REGS) - 1)
 
@@ -26150,6 +26217,7 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	int insn_cnt = env->prog->len;
 	int err = 0, i, j;
 	bool changed;
+	bool stacks;
 
 	/* Use the following algorithm:
 	 * - define the following:
@@ -26179,6 +26247,11 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 	for (i = 0; i < insn_cnt; ++i)
 		compute_insn_live_regs(env, &insns[i], &state[i]);
 
+	/* Forward pass: resolve stack access through FP-derived pointers */
+	err = compute_subprog_arg_access(env, state);
+	if (err)
+		goto out;
+
 	changed = true;
 	while (changed) {
 		changed = false;
@@ -26186,23 +26259,40 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 			int insn_idx = env->cfg.insn_postorder[i];
 			struct insn_live_regs *live = &state[insn_idx];
 			struct bpf_iarray *succ;
+			u64 new_stack_out[2] = {};
+			u64 new_stack_in[2] = {};
 			u16 new_out = 0;
 			u16 new_in = 0;
 
 			succ = bpf_insn_successors(env, insn_idx);
-			for (int s = 0; s < succ->cnt; ++s)
+			for (int s = 0; s < succ->cnt; ++s) {
 				new_out |= state[succ->items[s]].in;
+				spis_or(new_stack_out,
+					     state[succ->items[s]].stack_in);
+			}
 			new_in = (new_out & ~live->def) | live->use;
-			if (new_out != live->out || new_in != live->in) {
+			new_stack_in[0] = (new_stack_out[0] & ~live->stack_def[0]) |
+					  live->stack_use[0];
+			new_stack_in[1] = (new_stack_out[1] & ~live->stack_def[1]) |
+					  live->stack_use[1];
+			if (new_out != live->out || new_in != live->in ||
+			    memcmp(new_stack_out, live->stack_out, sizeof(new_stack_out)) ||
+			    memcmp(new_stack_in, live->stack_in, sizeof(new_stack_in))) {
 				live->in = new_in;
 				live->out = new_out;
+				spis_copy(live->stack_in, new_stack_in);
+				spis_copy(live->stack_out, new_stack_out);
 				changed = true;
 			}
 		}
 	}
 
-	for (i = 0; i < insn_cnt; ++i)
+	stacks = false;
+	for (i = 0; i < insn_cnt; ++i) {
 		insn_aux[i].live_regs_before = state[i].in;
+		spis_copy(insn_aux[i].live_stack_before, state[i].stack_in);
+		stacks |= !spis_is_zero(state[i].stack_in);
+	}
 
 	if (env->log.level & BPF_LOG_LEVEL2) {
 		verbose(env, "Live regs before insn:\n");
@@ -26218,7 +26308,25 @@ static int compute_live_registers(struct bpf_verifier_env *env)
 				else
 					verbose(env, ".");
 			verbose(env, " ");
+			if (stacks)
+				verbose(env, "%016llx:%016llx ",
+					insn_aux[i].live_stack_before[1],
+					insn_aux[i].live_stack_before[0]);
 			bpf_verbose_insn(env, &insns[i]);
+			if (!spis_is_zero(state[i].stack_use) ||
+			    !spis_is_zero(state[i].stack_def)) {
+				bpf_vlog_reset(&env->log, env->log.end_pos - 1);
+				verbose(env, " //");
+				if (!spis_is_zero(state[i].stack_use))
+					verbose(env, " stack_use=%llx:%llx",
+						state[i].stack_use[1],
+						state[i].stack_use[0]);
+				if (!spis_is_zero(state[i].stack_def))
+					verbose(env, " stack_def=%llx:%llx",
+						state[i].stack_def[1],
+						state[i].stack_def[0]);
+				verbose(env, "\n");
+			}
 			if (bpf_is_ldimm64(&insns[i]))
 				i++;
 		}
@@ -26578,6 +26686,15 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		ret = bpf_prog_offload_finalize(env);
 
 skip_full_check:
+	if (env->callsite_nonlocal_live) {
+		for (i = 0; i < env->prog->len; i++)
+			if (env->callsite_nonlocal_live[i]) {
+				kvfree(env->callsite_nonlocal_live[i]->live);
+				kvfree(env->callsite_nonlocal_live[i]);
+			}
+		kvfree(env->callsite_nonlocal_live);
+		env->callsite_nonlocal_live = NULL;
+	}
 	kvfree(env->explored_states);
 
 	/* might decrease stack depth, keep it before passes that
