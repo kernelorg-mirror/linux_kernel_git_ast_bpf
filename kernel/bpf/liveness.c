@@ -1233,6 +1233,62 @@ static void record_arg_mem_access(struct subprog_arg_access *access,
 	}
 }
 
+/*
+ * Fold callee's argument access masks into the caller's access summary.
+ *
+ * When caller passes (arg + byte_off) as callee_arg to a known callee,
+ * shift the callee's per-argument 4-byte slot masks by byte_off/4 and
+ * merge them into the caller's masks for 'arg'.
+ */
+static void fold_callee_arg_access(struct subprog_arg_access *access,
+				   u64 (*arg_use)[NUM_AT_IDS][2],
+				   int local_idx,
+				   struct subprog_arg_access *callee,
+				   struct arg_track *at_out)
+{
+	int r;
+
+	for (r = BPF_REG_1; r <= BPF_REG_5; r++) {
+		int callee_arg, shift, arg;
+		s32 byte_off;
+
+		if (at_out[r].arg < 1 || at_out[r].arg >= NUM_AT_IDS)
+			continue;
+		arg = at_out[r].arg;
+		if (at_out[r].off == OFF_IMPRECISE) {
+			spis_set_all(access->read[arg]);
+			spis_set_all(access->write[arg]);
+			spis_set_all(arg_use[local_idx][arg]);
+			continue;
+		}
+		callee_arg = r - BPF_REG_1 + 1;
+		byte_off = (s32)at_out[r].off;
+		if (spis_is_all(callee->read[callee_arg]) ||
+		    spis_is_all(callee->write[callee_arg]) ||
+		    byte_off < 0 || (byte_off & (STACK_SLOT_SZ - 1))) {
+			spis_set_all(access->read[arg]);
+			spis_set_all(access->write[arg]);
+			spis_set_all(arg_use[local_idx][arg]);
+			continue;
+		}
+		shift = byte_off / STACK_SLOT_SZ;
+		if (spis_shift_would_overflow(callee->read[callee_arg], shift)) {
+			spis_set_all(access->read[arg]);
+			spis_set_all(arg_use[local_idx][arg]);
+		} else {
+			spis_shift_or(access->read[arg],
+				      callee->read[callee_arg], shift);
+			spis_shift_or(arg_use[local_idx][arg],
+				      callee->read[callee_arg], shift);
+		}
+		if (spis_shift_would_overflow(callee->write[callee_arg], shift)) {
+			spis_set_all(access->write[arg]);
+		} else {
+			spis_shift_or(access->write[arg],
+				      callee->write[callee_arg], shift);
+		}
+	}
+}
 
 /*
  * Compute effective FP offset for a memory access through @reg + insn->off.
@@ -1460,7 +1516,6 @@ static void record_insn_mem_accesses(struct bpf_insn *insn,
 	}
 }
 
-
 /* Per-subprog intermediate state kept alive across analysis phases */
 struct subprog_at_info {
 	struct arg_track (*at_in)[MAX_BPF_REG];
@@ -1657,6 +1712,61 @@ err_free:
 	return err;
 }
 
+/*
+ * Phase 2: Fold callee access masks into callers.
+ * Iterates until no caller's access masks change.
+ * Converges in at most MAX_CALL_FRAMES iterations since fold only ORs bits.
+ */
+static void fold_subprog_callee_accesses(struct bpf_verifier_env *env,
+					 struct bpf_insn *insns,
+					 struct subprog_at_info *info)
+{
+	bool changed;
+
+	do {
+		changed = false;
+		for (int i = 1; i < env->subprog_cnt; i++) {
+			int start = env->subprog_info[i].start;
+			struct subprog_arg_access *access = &env->subprog_arg_access[i];
+			int len = info[i].len;
+			int j;
+
+			for (j = 0; j < len; j++) {
+				struct bpf_insn *insn = &insns[start + j];
+				int callee, target;
+				u64 old_read[NUM_AT_IDS][2], old_write[NUM_AT_IDS][2];
+				int a;
+
+				if (!bpf_pseudo_call(insn))
+					continue;
+
+				target = start + j + insn->imm + 1;
+				callee = find_subprog(env, target);
+				if (callee < 0)
+					continue;
+
+				/* Save current masks to detect changes */
+				for (a = 0; a < NUM_AT_IDS; a++) {
+					spis_copy(old_read[a], access->read[a]);
+					spis_copy(old_write[a], access->write[a]);
+				}
+
+				fold_callee_arg_access(access, info[i].arg_use,
+						       j,
+						       &env->subprog_arg_access[callee],
+						       info[i].at_in[j]);
+
+				for (a = 0; a < NUM_AT_IDS; a++) {
+					if (!spis_equal(old_read[a], access->read[a]) ||
+					    !spis_equal(old_write[a], access->write[a])) {
+						changed = true;
+						break;
+					}
+				}
+			}
+		}
+	} while (changed);
+}
 
 int compute_subprog_arg_access(struct bpf_verifier_env *env)
 {
@@ -1685,6 +1795,9 @@ int compute_subprog_arg_access(struct bpf_verifier_env *env)
 		if (err)
 			goto err_free;
 	}
+
+	/* Phase 2: fold callee access into callers (iterate until convergence) */
+	fold_subprog_callee_accesses(env, insns, info);
 
 err_free:
 	for (i = 1; i < env->subprog_cnt; i++) {
