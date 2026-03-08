@@ -1288,6 +1288,10 @@ s64 bpf_kfunc_stack_access_bytes(struct bpf_verifier_env *env,
 int compute_subprog_arg_access(struct bpf_verifier_env *env);
 int compute_stack_access(struct bpf_verifier_env *env, struct bpf_insn *insns,
 			    struct insn_live_regs *state, int insn_cnt);
+void refined_caller_live_stack(struct bpf_verifier_env *env,
+			      struct bpf_verifier_state *st,
+			      int frame_idx,
+			      u64 live_stack_out[2]);
 
 int bpf_stack_liveness_init(struct bpf_verifier_env *env);
 void bpf_stack_liveness_free(struct bpf_verifier_env *env);

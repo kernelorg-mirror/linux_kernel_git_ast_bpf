@@ -1352,9 +1352,9 @@ static bool is_spilled_scalar_reg(const struct bpf_stack_state *stack)
 	       stack->spilled_ptr.type == SCALAR_VALUE;
 }
 
-static bool is_spilled_scalar_reg64(const struct bpf_stack_state *stack)
+static bool is_spilled_scalar_after(const struct bpf_stack_state *stack, int im)
 {
-	return stack->slot_type[0] == STACK_SPILL &&
+	return stack->slot_type[im] == STACK_SPILL &&
 	       stack->spilled_ptr.type == SCALAR_VALUE;
 }
 
@@ -19766,11 +19766,10 @@ static bool check_scalar_ids(u32 old_id, u32 cur_id, struct bpf_idmap *idmap)
 	return check_ids(old_id, cur_id, idmap);
 }
 
-static void clean_func_state(struct bpf_verifier_env *env,
-			     struct bpf_func_state *st,
-			     u32 ip)
+static void __clean_func_state(struct bpf_verifier_env *env,
+			       struct bpf_func_state *st,
+			       u16 live_regs, const u64 live_stack[2])
 {
-	u16 live_regs = env->insn_aux_data[ip].live_regs_before;
 	int i, j;
 
 	for (i = 0; i < BPF_REG_FP; i++) {
@@ -19782,10 +19781,31 @@ static void clean_func_state(struct bpf_verifier_env *env,
 			__mark_reg_not_init(env, &st->regs[i]);
 	}
 
+	/*
+	 * Clean dead 4-byte halves within each SPI independently.
+	 * slot 2*i   → lower half: slot_type[0..3] (closer to FP)
+	 * slot 2*i+1 → upper half: slot_type[4..7] (farther from FP)
+	 */
 	for (i = 0; i < st->allocated_stack / BPF_REG_SIZE; i++) {
-		if (!bpf_stack_slot_alive(env, st->frameno, i)) {
-			__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
-			for (j = 0; j < BPF_REG_SIZE; j++)
+		u32 slot = i * 2;
+		bool lo_live = live_stack[slot / 64] & BIT_ULL(slot % 64);
+		bool hi_live = live_stack[(slot + 1) / 64] & BIT_ULL((slot + 1) % 64);
+
+		if (!hi_live || !lo_live) {
+			int start = !lo_live ? 0 : BPF_REG_SIZE / 2;
+			int end = !hi_live ? BPF_REG_SIZE : BPF_REG_SIZE / 2;
+
+			/*
+			 * Only destroy spilled_ptr when hi half is dead.
+			 * If hi half is still live with STACK_SPILL, the
+			 * spilled_ptr metadata is needed for correct state
+			 * comparison in stacksafe().
+			 * is_spilled_reg() is using slot_type[7], but
+			 * is_spilled_scalar_after() check either slot_type[0] or [4]
+			 */
+			if (!hi_live)
+				__mark_reg_not_init(env, &st->stack[i].spilled_ptr);
+			for (j = start; j < end; j++)
 				st->stack[i].slot_type[j] = STACK_INVALID;
 		}
 	}
@@ -19794,13 +19814,21 @@ static void clean_func_state(struct bpf_verifier_env *env,
 static void clean_verifier_state(struct bpf_verifier_env *env,
 				 struct bpf_verifier_state *st)
 {
-	int i, ip;
+	int i;
 
-	bpf_live_stack_query_init(env, st);
 	st->cleaned = true;
 	for (i = 0; i <= st->curframe; i++) {
-		ip = frame_insn_idx(st, i);
-		clean_func_state(env, st->frame[i], ip);
+		u32 ip = frame_insn_idx(st, i);
+		u16 live_regs = env->insn_aux_data[ip].live_regs_before;
+		u64 live_stack[2];
+
+		if (i < st->curframe)
+			refined_caller_live_stack(env, st, i, live_stack);
+		else
+			spis_copy(live_stack,
+				       env->insn_aux_data[ip].live_stack_before);
+
+		__clean_func_state(env, st->frame[i], live_regs, live_stack);
 	}
 }
 
@@ -19916,8 +19944,6 @@ static void clean_live_states(struct bpf_verifier_env *env, int insn,
 			continue;
 		if (sl->state.cleaned)
 			/* all regs in this state in all frames were already marked */
-			continue;
-		if (incomplete_read_marks(env, &sl->state))
 			continue;
 		clean_verifier_state(env, &sl->state);
 	}
@@ -20092,12 +20118,12 @@ static __init int unbound_reg_init(void)
 }
 late_initcall(unbound_reg_init);
 
-static bool is_stack_all_misc(struct bpf_verifier_env *env,
-			      struct bpf_stack_state *stack)
+static bool is_stack_misc_after(struct bpf_verifier_env *env,
+				struct bpf_stack_state *stack, int im)
 {
 	u32 i;
 
-	for (i = 0; i < ARRAY_SIZE(stack->slot_type); ++i) {
+	for (i = im; i < ARRAY_SIZE(stack->slot_type); ++i) {
 		if ((stack->slot_type[i] == STACK_MISC) ||
 		    (stack->slot_type[i] == STACK_INVALID && env->allow_uninit_stack))
 			continue;
@@ -20108,12 +20134,12 @@ static bool is_stack_all_misc(struct bpf_verifier_env *env,
 }
 
 static struct bpf_reg_state *scalar_reg_for_stack(struct bpf_verifier_env *env,
-						  struct bpf_stack_state *stack)
+						  struct bpf_stack_state *stack, int im)
 {
-	if (is_spilled_scalar_reg64(stack))
+	if (is_spilled_scalar_after(stack, im))
 		return &stack->spilled_ptr;
 
-	if (is_stack_all_misc(env, stack))
+	if (is_stack_misc_after(env, stack, im))
 		return &unbound_reg;
 
 	return NULL;
@@ -20131,6 +20157,7 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 	 */
 	for (i = 0; i < old->allocated_stack; i++) {
 		struct bpf_reg_state *old_reg, *cur_reg;
+		int im = i % BPF_REG_SIZE;
 
 		spi = i / BPF_REG_SIZE;
 
@@ -20158,13 +20185,15 @@ static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
 		 * Construct a fake register for such stack and call
 		 * regsafe() to ensure scalar ids are compared.
 		 */
-		old_reg = scalar_reg_for_stack(env, &old->stack[spi]);
-		cur_reg = scalar_reg_for_stack(env, &cur->stack[spi]);
-		if (old_reg && cur_reg) {
-			if (!regsafe(env, old_reg, cur_reg, idmap, exact))
-				return false;
-			i += BPF_REG_SIZE - 1;
-			continue;
+		if (im == 0 || im == 4) {
+			old_reg = scalar_reg_for_stack(env, &old->stack[spi], im);
+			cur_reg = scalar_reg_for_stack(env, &cur->stack[spi], im);
+			if (old_reg && cur_reg) {
+				if (!regsafe(env, old_reg, cur_reg, idmap, exact))
+					return false;
+				i += (im == 0 ? BPF_REG_SIZE - 1 : 3);
+				continue;
+			}
 		}
 
 		/* if old state was safe with misc data in the stack

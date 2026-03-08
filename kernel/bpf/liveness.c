@@ -1966,7 +1966,106 @@ static void apply_stack_access_bytes(struct insn_live_regs *st,
 	}
 }
 
+/*
+ * Compute frame IP for a call stack frame in verifier state.
+ * Top frame uses st->insn_idx, outer frames use child callsite.
+ */
+static u32 frame_insn_idx_from_state(const struct bpf_verifier_state *st, u32 frame)
+{
+	return frame == st->curframe
+	       ? st->insn_idx
+	       : st->frame[frame + 1]->callsite;
+}
 
+/*
+ * Compute refined caller stack liveness for frame @frame_idx
+ * at the current pruning point. Uses per-instruction argument
+ * liveness from analyze_subprog_arg_access() to strip caller
+ * stack slots that the callee has already consumed.
+ *
+ * Only the immediate child frame (frame_idx + 1) is consulted.
+ * This is sufficient for arbitrary call depth because
+ * analyze_subprog_arg_access() recursively folds inner callee
+ * reads into the outer callee's arg_use at each call instruction.
+ * The backward pass then propagates those transitive reads, so
+ * arg_live[i] for any subprog already reflects what all deeper
+ * callees still need from that subprog's arguments.
+ *
+ * Outputs live_stack_before[callsite] if refinement is not
+ * possible (no arg_live data, conservative fallback).
+ */
+void refined_caller_live_stack(struct bpf_verifier_env *env,
+			       struct bpf_verifier_state *st,
+			       int frame_idx,
+			       u64 live_stack_out[2])
+{
+	u32 callsite = st->frame[frame_idx + 1]->callsite;
+	u32 callee_ip = frame_insn_idx_from_state(st, frame_idx + 1);
+	u32 callee_subprog = st->frame[frame_idx + 1]->subprogno;
+	u64 *caller_live_after = env->insn_aux_data[callsite + 1].live_stack_before;
+	struct subprog_arg_access *sa;
+	u64 still_needed[2] = {};
+	u32 callee_offset;
+	int a;
+
+	if (callee_subprog == 0 ||
+	    callee_subprog >= env->subprog_cnt) {
+		spis_copy(live_stack_out,
+			       env->insn_aux_data[callsite].live_stack_before);
+		return;
+	}
+
+	/*
+	 * Refined liveness only applies to direct subprog calls where
+	 * call_arg_slot[] maps caller stack slots to callee arguments.
+	 * For helper/kfunc callbacks (e.g. bpf_loop), the callback
+	 * accesses the caller's stack through a ctx pointer, not
+	 * through direct stack pointer arguments, so call_arg_slot[]
+	 * is not meaningful.  Fall back to the conservative
+	 * live_stack_before at the callsite.
+	 */
+	if (!bpf_pseudo_call(&env->prog->insnsi[callsite])) {
+		spis_copy(live_stack_out,
+			       env->insn_aux_data[callsite].live_stack_before);
+		return;
+	}
+
+	sa = &env->subprog_arg_access[callee_subprog];
+	callee_offset = callee_ip - env->subprog_info[callee_subprog].start;
+
+	/*
+	 * When the child frame is mid-call, callee_ip is the call insn.
+	 * arg_live there includes transitive reads by the grandchild
+	 * chain, but those reads have already been initiated.  Advance
+	 * to callee_offset + 1 (the insn after the call) to get what
+	 * the child still needs from the caller AFTER its callee returns.
+	 * This is sound: state pruning only requires matching slots read
+	 * from the checkpoint forward, and the grandchild's pointer and
+	 * data were established before the checkpoint.
+	 */
+	if (frame_idx + 1 < st->curframe &&
+	    bpf_pseudo_call(&env->prog->insnsi[callee_ip]))
+		callee_offset++;
+
+	if (callee_offset >= sa->subprog_len) {
+		spis_copy(live_stack_out,
+			       env->insn_aux_data[callsite].live_stack_before);
+		return;
+	}
+
+	/* Translate per-instruction argument liveness to caller slots */
+	for (a = 1; a < NUM_AT_IDS; a++) {
+		s16 base_slot = env->insn_aux_data[callsite].call_arg_slot[a];
+
+		if (base_slot < 0)
+			continue;
+		arg_slots_to_spis(still_needed, base_slot,
+				  sa->arg_live[callee_offset][a]);
+	}
+
+	spis_copy(live_stack_out, caller_live_after);
+	spis_or(live_stack_out, still_needed);
+}
 
 /*
  * Per-instruction transfer function for FP-offset tracking.
