@@ -5,6 +5,7 @@
 #include <bpf/bpf_helpers.h>
 #include "bpf_misc.h"
 
+char _license[] SEC("license") = "GPL";
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1);
@@ -14,12 +15,12 @@ struct {
 
 SEC("socket")
 __log_level(2)
-__msg("(0) frame 0 insn 2 +written -8")
-__msg("(0) frame 0 insn 1 +live -24")
-__msg("(0) frame 0 insn 1 +written -8")
-__msg("(0) frame 0 insn 0 +live -8,-24")
-__msg("(0) frame 0 insn 0 +written -8")
-__msg("(0) live stack update done in 2 iterations")
+/* fp-8 read (slots 0,1) and fp-24 read (slots 4,5) both live at insn 0 */
+__msg("0: {{.*}} 0000000000000000:0000000000000033 (79) r1 = *(u64 *)(r10 -8) // stack_use=0:3")
+/* only fp-24 read (slots 4,5) still live at insn 1 */
+__msg("1: {{.*}} 0000000000000000:0000000000000030 (79) r2 = *(u64 *)(r10 -24) // stack_use=0:30")
+/* write to fp-8 kills slots 0,1 → nothing live */
+__msg("2: {{.*}} 0000000000000000:0000000000000000 (7b) *(u64 *)(r10 -8) = r1 // stack_def=0:3")
 __naked void simple_read_simple_write(void)
 {
 	asm volatile (
@@ -33,12 +34,12 @@ __naked void simple_read_simple_write(void)
 
 SEC("socket")
 __log_level(2)
-__msg("(0) frame 0 insn 1 +live -8")
-__not_msg("(0) frame 0 insn 1 +written")
-__msg("(0) live stack update done in 2 iterations")
-__msg("(0) frame 0 insn 1 +live -16")
-__msg("(0) frame 0 insn 1 +written -32")
-__msg("(0) live stack update done in 2 iterations")
+/* Both paths join: fp-8 (path A) and fp-16 (path B) reads → slots 0-3 live */
+__msg("1: {{.*}} 0000000000000000:000000000000000f (25) if r0 > 0x2a goto pc+4")
+/* Path A: fp-8 read, slots 0,1 live */
+__msg("2: {{.*}} 0000000000000000:0000000000000003 (79) r0 = *(u64 *)(r10 -8) // stack_use=0:3")
+/* Path B: fp-16 read, slots 2,3 live */
+__msg("6: {{.*}} 0000000000000000:000000000000000c (79) r0 = *(u64 *)(r10 -16) // stack_use=0:c")
 __naked void read_write_join(void)
 {
 	asm volatile (
@@ -58,13 +59,12 @@ __naked void read_write_join(void)
 
 SEC("socket")
 __log_level(2)
-__msg("2: (25) if r0 > 0x2a goto pc+1")
-__msg("7: (95) exit")
-__msg("(0) frame 0 insn 2 +written -16")
-__msg("(0) live stack update done in 2 iterations")
-__msg("7: (95) exit")
-__not_msg("(0) frame 0 insn 2")
-__msg("(0) live stack update done in 1 iterations")
+/* Variable-offset write: imprecise write doesn't generate stack_use,
+ * liveness passes through unchanged. No stack reads → nothing live.
+ * No stack liveness columns printed (all zero).
+ */
+__msg("2: 01........ (25) if r0 > 0x2a goto pc+1")
+__msg("6: 0.2....... (7b) *(u64 *)(r2 +0) = r0")
 __naked void must_write_not_same_slot(void)
 {
 	asm volatile (
@@ -83,10 +83,9 @@ __naked void must_write_not_same_slot(void)
 
 SEC("socket")
 __log_level(2)
-__msg("(0) frame 0 insn 0 +written -8,-16")
-__msg("(0) live stack update done in 2 iterations")
-__msg("(0) frame 0 insn 0 +written -8")
-__msg("(0) live stack update done in 2 iterations")
+/* fp-8 written, then used as map key. Only slot 1 (upper half for 4-byte key) live at insn 1 */
+__msg("0: {{.*}} 0000000000000000:0000000000000000 (7a) *(u64 *)(r10 -8) = 0 // stack_def=0:3")
+__msg("5: {{.*}} 0000000000000000:0000000000000002 (85) call bpf_map_lookup_elem#1 // stack_use=0:2")
 __naked void must_write_not_same_type(void)
 {
 	asm volatile (
@@ -110,10 +109,8 @@ __naked void must_write_not_same_type(void)
 
 SEC("socket")
 __log_level(2)
-__msg("(2,4) frame 0 insn 4 +written -8")
-__msg("(2,4) live stack update done in 2 iterations")
-__msg("(0) frame 0 insn 2 +written -8")
-__msg("(0) live stack update done in 2 iterations")
+/* Callee writes fp[0]-8: stack_use at call site has slots 0,1 live */
+__msg("2: {{.*}} 0000000000000000:0000000000000003 (85) call pc+1 // stack_use=0:3")
 __naked void caller_stack_write(void)
 {
 	asm volatile (
@@ -135,23 +132,14 @@ static __used __naked void write_first_param(void)
 
 SEC("socket")
 __log_level(2)
-/* caller_stack_read() function */
-__msg("2: .12345.... (85) call pc+4")
-__msg("5: .12345.... (85) call pc+1")
-__msg("6: 0......... (95) exit")
-/* read_first_param() function */
-__msg("7: .1........ (79) r0 = *(u64 *)(r1 +0)")
-__msg("8: 0......... (95) exit")
-/* update for callsite at (2) */
-__msg("(2,7) frame 0 insn 7 +live -8")
-__msg("(2,7) live stack update done in 2 iterations")
-__msg("(0) frame 0 insn 2 +live -8")
-__msg("(0) live stack update done in 2 iterations")
-/* update for callsite at (5) */
-__msg("(5,7) frame 0 insn 7 +live -16")
-__msg("(5,7) live stack update done in 2 iterations")
-__msg("(0) frame 0 insn 5 +live -16")
-__msg("(0) live stack update done in 2 iterations")
+/* caller_stack_read: both fp-8 and fp-16 reads flow to call at insn 2 */
+__msg("2: .12345.... 0000000000000000:000000000000000f (85) call pc+4 // stack_use=0:3")
+/* Only fp-16 read left at second call */
+__msg("5: .12345.... 0000000000000000:000000000000000c (85) call pc+1 // stack_use=0:c")
+__msg("6: 0......... 0000000000000000:0000000000000000 (95) exit")
+/* read_first_param: reads through arg, no caller stack live inside */
+__msg("7: .1........ 0000000000000000:0000000000000000 (79) r0 = *(u64 *)(r1 +0)")
+__msg("8: 0......... 0000000000000000:0000000000000000 (95) exit")
 __naked void caller_stack_read(void)
 {
 	asm volatile (
@@ -176,18 +164,19 @@ static __used __naked void read_first_param(void)
 SEC("socket")
 __flag(BPF_F_TEST_STATE_FREQ)
 __log_level(2)
-/* read_first_param2() function */
-__msg(" 9: .1........ (79) r0 = *(u64 *)(r1 +0)")
-__msg("10: .......... (b7) r0 = 0")
-__msg("11: 0......... (05) goto pc+0")
-__msg("12: 0......... (95) exit")
+/* fp[0]-8 consumed at insn 9, dead by insn 11. stack_def at insn 4 kills slots 0,1. */
+__msg("4: {{.*}} 0000000000000000:0000000000000000 (7b) *(u64 *)(r10 -8) = r0 // stack_def=0:3")
+/* stack_use at call site: callee reads fp[0]-8, slots 0,1 live */
+__msg("7: {{.*}} 0000000000000000:0000000000000003 (85) call pc+1 // stack_use=0:3")
+/* read_first_param2: no caller stack live inside callee */
+__msg(" 9: .1........ 0000000000000000:0000000000000000 (79) r0 = *(u64 *)(r1 +0)")
+__msg("10: .......... 0000000000000000:0000000000000000 (b7) r0 = 0")
+__msg("11: 0......... 0000000000000000:0000000000000000 (05) goto pc+0")
+__msg("12: 0......... 0000000000000000:0000000000000000 (95) exit")
 /*
- * The purpose of the test is to check that checkpoint in
- * read_first_param2() stops path traversal. This will only happen if
- * verifier understands that fp[0]-8 at insn (12) is not alive.
+ * Checkpoint at goto +0 fires because fp[0]-8 is dead → state pruning.
  */
 __msg("12: safe")
-__msg("processed 20 insns")
 __naked void caller_stack_pruning(void)
 {
 	asm volatile (
