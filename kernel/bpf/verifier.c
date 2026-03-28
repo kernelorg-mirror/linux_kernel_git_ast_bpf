@@ -8317,6 +8317,15 @@ static int check_stack_range_initialized(
 	 * read-only.
 	 */
 	bool clobber = false;
+	/*
+	 * Negative access_size signals global subprog/kfunc arg check where
+	 * STACK_POISON slots are acceptable. static stack liveness
+	 * might have determined that subprog doesn't read them,
+	 * but BTF based global subprog validation isn't accurate enough.
+	 */
+	bool allow_poison = access_size < 0;
+
+	access_size = abs(access_size);
 
 	if (access_size == 0 && !zero_size_allowed) {
 		verbose(env, "invalid zero-sized read\n");
@@ -8425,6 +8434,8 @@ static int check_stack_range_initialized(
 		}
 
 		if (*stype == STACK_POISON) {
+			if (allow_poison)
+				goto mark;
 			verbose(env, "reading from stack R%d off %d+%d size %d, slot poisoned by dead code elimination\n",
 				regno, min_off, i - min_off, access_size);
 		} else if (tnum_is_const(reg->var_off)) {
@@ -8620,8 +8631,10 @@ static int check_mem_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg
 		mark_ptr_not_null_reg(reg);
 	}
 
-	err = check_helper_mem_access(env, regno, mem_size, BPF_READ, true, NULL);
-	err = err ?: check_helper_mem_access(env, regno, mem_size, BPF_WRITE, true, NULL);
+	int size = base_type(reg->type) == PTR_TO_STACK ? -(int)mem_size : mem_size;
+
+	err = check_helper_mem_access(env, regno, size, BPF_READ, true, NULL);
+	err = err ?: check_helper_mem_access(env, regno, size, BPF_WRITE, true, NULL);
 
 	if (may_be_null)
 		*reg = saved_reg;
