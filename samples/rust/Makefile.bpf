@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Build Rust kernel modules for BPF target
+#
+# Usage: make -f Makefile.bpf
+#
+# This reuses generated files (bindings, uapi, proc-macros) from a prior
+# kernel build in bld_clang/.
+
+SRCTREE := $(realpath ../..)
+BLDDIR := $(SRCTREE)/bld_clang
+LLC := /w/llvm/llvm/bld/install/bin/llc
+TARGET := $(CURDIR)/bpfel-unknown-none-v4.json
+DEPDIR := $(CURDIR)/.bpf-deps
+RUST_SRC := /usr/lib/rustlib/src/rust/library
+
+# Proc-macro .so files
+LIBMACROS := $(DEPDIR)/libmacros.so
+LIBPIN_INIT_INTERNAL := $(DEPDIR)/libpin_init_internal.so
+
+# Generated files from bld_clang, filtered for BPF compatibility
+RUSTC_CFG_ORIG := $(BLDDIR)/include/generated/rustc_cfg
+RUSTC_CFG := $(DEPDIR)/rustc_cfg_bpf
+
+# Common rustc flags
+RUSTFLAGS_ENV := RUSTC_BOOTSTRAP=1 OBJTREE=$(BLDDIR)
+RUSTC := rustc
+RUSTC_COMMON := --target $(TARGET) -C opt-level=3 -C panic=abort -Z unstable-options
+RUSTC_BPF = $(RUSTFLAGS_ENV) $(RUSTC) --edition 2021 --crate-type rlib $(RUSTC_COMMON) \
+	--sysroot=/dev/null -L$(DEPDIR) -L$(BLDDIR)/rust \
+	-Zcrate-attr='feature(asm_experimental_arch)'
+
+PROGS := rust_minimal rust_print_main rust_debugfs
+
+all: $(addsuffix .o,$(PROGS))
+
+# --- Step 0: filtered config ---
+# Filter out configs that pull in x86-specific inline asm
+FILTER_CFGS := CONFIG_JUMP_LABEL CONFIG_BUG CONFIG_TRACEPOINTS
+$(RUSTC_CFG): $(RUSTC_CFG_ORIG)
+	@mkdir -p $(DEPDIR)
+	@grep -v $(foreach c,$(FILTER_CFGS),-e '$(c)') $< > $@
+
+# --- Step 0b: proc-macros from kernel build ---
+$(LIBMACROS): $(BLDDIR)/rust/libmacros.so
+	@mkdir -p $(DEPDIR)
+	cp $< $@
+
+$(LIBPIN_INIT_INTERNAL): $(BLDDIR)/rust/libpin_init_internal.so
+	@mkdir -p $(DEPDIR)
+	cp $< $@
+
+# --- Step 1: core ---
+$(DEPDIR)/libcore.rlib: $(RUST_SRC)/core/src/lib.rs
+	@mkdir -p $(DEPDIR)
+	$(RUSTFLAGS_ENV) $(RUSTC) --edition 2024 --crate-type rlib $(RUSTC_COMMON) \
+		--sysroot=/dev/null \
+		--cfg 'no_fp_fmt_parse' \
+		--crate-name core \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libcore.rmeta \
+		$<
+
+# --- Step 2: compiler_builtins ---
+$(DEPDIR)/libcompiler_builtins.rlib: $(SRCTREE)/rust/compiler_builtins.rs $(DEPDIR)/libcore.rlib
+	$(RUSTC_BPF) --crate-name compiler_builtins \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libcompiler_builtins.rmeta \
+		$<
+
+# --- Step 3: ffi ---
+$(DEPDIR)/libffi.rlib: $(SRCTREE)/rust/ffi.rs $(DEPDIR)/libcompiler_builtins.rlib
+	$(RUSTC_BPF) --crate-name ffi \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libffi.rmeta \
+		$<
+
+# --- Step 4: build_error ---
+$(DEPDIR)/libbuild_error.rlib: $(SRCTREE)/rust/build_error.rs $(DEPDIR)/libcompiler_builtins.rlib
+	$(RUSTC_BPF) --crate-name build_error \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libbuild_error.rmeta \
+		$<
+
+# --- Step 5: pin_init ---
+$(DEPDIR)/libpin_init.rlib: $(SRCTREE)/rust/pin-init/src/lib.rs $(DEPDIR)/libcompiler_builtins.rlib \
+    $(LIBPIN_INIT_INTERNAL) $(LIBMACROS)
+	$(RUSTC_BPF) --crate-name pin_init \
+		--extern pin_init_internal=$(LIBPIN_INIT_INTERNAL) \
+		--extern macros=$(LIBMACROS) \
+		--cfg 'kernel' \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libpin_init.rmeta \
+		$<
+
+# --- Step 6: bindings ---
+$(DEPDIR)/libbindings.rlib: $(SRCTREE)/rust/bindings/lib.rs $(DEPDIR)/libffi.rlib $(DEPDIR)/libpin_init.rlib
+	$(RUSTC_BPF) --crate-name bindings \
+		--extern ffi=$(DEPDIR)/libffi.rlib \
+		--extern pin_init=$(DEPDIR)/libpin_init.rlib \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libbindings.rmeta \
+		$<
+
+# --- Step 7: uapi ---
+$(DEPDIR)/libuapi.rlib: $(SRCTREE)/rust/uapi/lib.rs $(DEPDIR)/libffi.rlib $(DEPDIR)/libpin_init.rlib
+	$(RUSTC_BPF) --crate-name uapi \
+		--extern ffi=$(DEPDIR)/libffi.rlib \
+		--extern pin_init=$(DEPDIR)/libpin_init.rlib \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libuapi.rmeta \
+		$<
+
+# --- Step 8: kernel ---
+$(DEPDIR)/libkernel.rlib: $(SRCTREE)/rust/kernel/lib.rs $(RUSTC_CFG) \
+    $(DEPDIR)/libffi.rlib $(DEPDIR)/libpin_init.rlib $(DEPDIR)/libbuild_error.rlib \
+    $(DEPDIR)/libbindings.rlib $(DEPDIR)/libuapi.rlib
+	$(RUSTC_BPF) --crate-name kernel \
+		--extern ffi=$(DEPDIR)/libffi.rlib \
+		--extern pin_init=$(DEPDIR)/libpin_init.rlib \
+		--extern build_error=$(DEPDIR)/libbuild_error.rlib \
+		--extern macros=$(LIBMACROS) \
+		--extern bindings=$(DEPDIR)/libbindings.rlib \
+		--extern uapi=$(DEPDIR)/libuapi.rlib \
+		@$(RUSTC_CFG) \
+		--emit=link=$@ --emit=metadata=$(DEPDIR)/libkernel.rmeta \
+		$<
+
+# --- Step 9: Build BPF programs ---
+LLVM_LINK := /w/llvm/llvm/bld/install/bin/llvm-link
+LLVM_AS := /w/llvm/llvm/bld/install/bin/llvm-as
+
+%.bc: %.rs $(DEPDIR)/libkernel.rlib
+	RUST_MODFILE=$< $(RUSTC_BPF) --crate-name $(basename $<) \
+		-Zcrate-attr=no_std -Zcrate-attr='feature(used_with_arg)' --cfg MODULE \
+		--extern kernel=$(DEPDIR)/libkernel.rlib \
+		--extern ffi=$(DEPDIR)/libffi.rlib \
+		--extern pin_init=$(DEPDIR)/libpin_init.rlib \
+		--extern build_error=$(DEPDIR)/libbuild_error.rlib \
+		--extern macros=$(LIBMACROS) \
+		--extern bindings=$(DEPDIR)/libbindings.rlib \
+		--extern uapi=$(DEPDIR)/libuapi.rlib \
+		@$(RUSTC_CFG) \
+		--emit=llvm-bc -o $@ $<
+
+$(DEPDIR)/extracted: $(DEPDIR)/libcore.rlib $(DEPDIR)/libkernel.rlib \
+    $(DEPDIR)/libcompiler_builtins.rlib $(DEPDIR)/libffi.rlib $(DEPDIR)/libbuild_error.rlib \
+    $(DEPDIR)/libpin_init.rlib $(DEPDIR)/libbindings.rlib $(DEPDIR)/libuapi.rlib
+	@mkdir -p $(DEPDIR)/extracted
+	@for lib in $^; do \
+		name=$$(basename $$lib .rlib | sed 's/^lib//'); \
+		mkdir -p $(DEPDIR)/extracted/$$name; \
+		cd $(DEPDIR)/extracted/$$name && ar x $$lib; \
+	done
+	@touch $@
+
+%-linked.bc: %.bc $(DEPDIR)/extracted $(DEPDIR)/multi3.bc
+	@cp $< $@
+	@for i in 1 2 3 4 5; do \
+		$(LLVM_LINK) --only-needed $@ \
+			$$(find $(DEPDIR)/extracted -name '*.rcgu.o') \
+			-o $@.tmp && mv $@.tmp $@; \
+	done
+	@$(LLVM_LINK) $@ $(DEPDIR)/multi3.bc -o $@.tmp && mv $@.tmp $@
+
+%.o: %-linked.bc
+	$(LLC) -march=bpfel -mcpu=v4 -filetype=obj -o $@ $<
+
+clean:
+	rm -f *.bc *.o
+	rm -rf $(DEPDIR)
+
+# --- 128-bit multiply intrinsic for BPF ---
+$(DEPDIR)/multi3.bc: $(CURDIR)/multi3.ll
+	@mkdir -p $(DEPDIR)
+	$(LLVM_AS) $< -o $@
+
+.PRECIOUS: %.bc %-linked.bc
+
+.PHONY: all clean
