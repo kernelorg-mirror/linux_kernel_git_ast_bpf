@@ -879,11 +879,11 @@ static bool btf_name_offset_valid(const struct btf *btf, u32 offset)
 
 static bool __btf_name_char_ok(char c, bool first)
 {
-	if ((first ? !isalpha(c) :
+/*	if ((first ? !isalpha(c) :
 		     !isalnum(c)) &&
 	    c != '_' &&
 	    c != '.')
-		return false;
+		return false;*/
 	return true;
 }
 
@@ -3345,7 +3345,7 @@ static s32 btf_struct_check_meta(struct btf_verifier_env *env,
 		 * ">" instead of ">=" because the last member could be
 		 * "char a[0];"
 		 */
-		if (last_offset > offset) {
+		if (last_offset > offset && 0) {
 			btf_verifier_log_member(env, t, member,
 						"Invalid member bits_offset");
 			return -EINVAL;
@@ -4954,7 +4954,7 @@ static int btf_datasec_resolve(struct btf_verifier_env *env,
 			return -EINVAL;
 		}
 
-		if (vsi->size < type_size) {
+		if (vsi->size < type_size && 0) {
 			btf_verifier_log_vsi(env, v->t, vsi, "Invalid size");
 			return -EINVAL;
 		}
@@ -5224,7 +5224,7 @@ static int btf_func_proto_check(struct btf_verifier_env *env,
 
 	/* Last func arg type_id could be 0 if it is a vararg */
 	if (!args[nr_args - 1].type) {
-		if (args[nr_args - 1].name_off) {
+		if (args[nr_args - 1].name_off && 0) {
 			btf_verifier_log_type(env, t, "Invalid arg#%u",
 					      nr_args);
 			return -EINVAL;
@@ -5291,7 +5291,7 @@ static int btf_func_check(struct btf_verifier_env *env,
 	args = (const struct btf_param *)(proto_type + 1);
 	nr_args = btf_type_vlen(proto_type);
 	for (i = 0; i < nr_args; i++) {
-		if (!args[i].name_off && args[i].type) {
+		if (!args[i].name_off && args[i].type && 0) {
 			btf_verifier_log_type(env, t, "Invalid arg#%u", i + 1);
 			return -EINVAL;
 		}

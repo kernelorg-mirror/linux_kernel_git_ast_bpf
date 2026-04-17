@@ -1652,6 +1652,7 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
 	INSN_3(ALU64, MOD,  K),			\
 	/* Call instruction. */			\
 	INSN_2(JMP, CALL),			\
+	INSN_3(JMP, CALL, X),			\
 	/* Exit instruction. */			\
 	INSN_2(JMP, EXIT),			\
 	/* 32-bit Jump instructions. */		\
@@ -2060,6 +2061,7 @@ select_insn:
 		CONT;
 
 	/* CALL */
+	JMP_CALL_X:
 	JMP_CALL:
 		/* Function call scratches BPF_R1-BPF_R5 registers,
 		 * preserves BPF_R6-BPF_R9, and stores return value
