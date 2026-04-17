@@ -6578,6 +6578,28 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type type,
 			     bool allow_trust_mismatch);
 
+/* If a pointer register used by LDX/STX/ST is a bare SCALAR, assume it is
+ * a user VA pointing into the program's arena (there is only one arena per
+ * program, tracked in env->prog->aux->arena) and promote it to PTR_TO_ARENA.
+ * bpf_do_misc_fixups() will prepend a synthetic addr_space_cast so the JIT
+ * sees a proper arena access. This lets libbpf fold .bss/.data/.rodata into
+ * the arena for programs that weren't compiled with __arena_global — the
+ * BPF program doesn't need to emit the cast itself.
+ *
+ * Safety: arena accesses are bounds-checked at runtime (BPF_PROBE_MEM32), so
+ * a scalar that doesn't actually point into the arena faults at the JIT
+ * extable instead of reading arbitrary kernel memory.
+ */
+static void maybe_cast_arena_scalar(struct bpf_verifier_env *env,
+				    struct bpf_reg_state *reg)
+{
+	if (reg->type != SCALAR_VALUE || !env->prog->aux->arena)
+		return;
+	reg->type = PTR_TO_ARENA;
+	reg->subreg_def = env->insn_idx + 1;
+	env->insn_aux_data[env->insn_idx].needs_arena_cast = true;
+}
+
 static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			  bool strict_alignment_once, bool is_ldsx,
 			  bool allow_trust_mismatch, const char *ctx)
@@ -6596,6 +6618,7 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
+	maybe_cast_arena_scalar(env, &regs[insn->src_reg]);
 	src_reg_type = regs[insn->src_reg].type;
 
 	/* Check if (src_reg + off) is readable. The state of dst_reg will be
@@ -6628,6 +6651,7 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (err)
 		return err;
 
+	maybe_cast_arena_scalar(env, &regs[insn->dst_reg]);
 	dst_reg_type = regs[insn->dst_reg].type;
 
 	/* Check if (dst_reg + off) is writeable. */
@@ -17617,6 +17641,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 		if (err)
 			return err;
 
+		maybe_cast_arena_scalar(env, &cur_regs(env)[insn->dst_reg]);
 		dst_reg_type = cur_regs(env)[insn->dst_reg].type;
 
 		err = check_mem_access(env, env->insn_idx, insn->dst_reg,

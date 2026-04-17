@@ -617,6 +617,12 @@ struct bpf_insn_aux_data {
 	bool non_sleepable; /* helper/kfunc may be called from non-sleepable context */
 	bool is_iter_next; /* bpf_iter_<type>_next() kfunc call */
 	bool call_with_percpu_alloc_ptr; /* {this,per}_cpu_ptr() with prog percpu alloc */
+	/* ldx/stx/st whose pointer reg was SCALAR with an arena map_ptr (i.e.
+	 * came from an LDIMM64 to an ARENA map but was never addr_space_cast'ed).
+	 * bpf_do_misc_fixups() prepends a synthetic addr_space_cast so the JIT
+	 * sees a proper arena access.
+	 */
+	bool needs_arena_cast;
 	u8 alu_state; /* used in combination with alu_limit */
 	/* true if STX or LDX instruction is a part of a spill/fill
 	 * pattern for a bpf_fastcall call.
