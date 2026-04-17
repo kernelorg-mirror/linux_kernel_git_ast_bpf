@@ -1833,6 +1833,19 @@ static int analyze_subprog(struct bpf_verifier_env *env,
 			for (int r = BPF_REG_1; r <= BPF_REG_5; r++)
 				callee_args[r] = none;
 			callee_args[cb_callee_reg] = info[subprog].at_in[j][caller_reg];
+		} else if (BPF_SRC(insn->code) == BPF_X) {
+			/* callx: target subprog unknown statically.
+			 * If any arg carries an FP-derived pointer,
+			 * conservatively mark all stack as read.
+			 */
+			if (!has_fp_args(info[subprog].at_in[j]))
+				continue;
+			for (int f = 0; f <= depth; f++) {
+				err = mark_stack_read(instance, f, idx, SPIS_ALL);
+				if (err)
+					goto out_free;
+			}
+			continue;
 		} else {
 			continue;
 		}
@@ -2085,6 +2098,8 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		case BPF_CALL:
 			def = ALL_CALLER_SAVED_REGS;
 			use = def & ~BIT(BPF_REG_0);
+			if (BPF_SRC(insn->code) == BPF_X)
+				use |= dst; /* callx reads dst_reg as fn ptr */
 			if (bpf_get_call_summary(env, insn, &cs))
 				use = GENMASK(cs.num_params, 1);
 			break;
