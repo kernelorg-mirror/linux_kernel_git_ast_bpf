@@ -1393,6 +1393,32 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			/* Convert BPF_CLASS(insn->code) == BPF_ALU64 to 32-bit ALU */
 			insn->code = BPF_ALU | BPF_OP(insn->code) | BPF_SRC(insn->code);
 
+		/* ldx/stx/st whose pointer reg was a SCALAR referencing an arena
+		 * map (see maybe_cast_arena_scalar() in verifier.c). Prepend a
+		 * 32-bit self-mov which truncates the upper 32 bits of the reg,
+		 * the same effect the fixup above produces from an explicit
+		 * addr_space_cast(..., 0, 1). After this the JIT sees a proper
+		 * arena offset and emits a BPF_PROBE_MEM32 access.
+		 */
+		if (env->insn_aux_data[i + delta].needs_arena_cast) {
+			u32 class = BPF_CLASS(insn->code);
+			u8 ptr_reg = (class == BPF_LDX) ? insn->src_reg : insn->dst_reg;
+			struct bpf_insn *patch = insn_buf;
+
+			*patch++ = BPF_MOV32_REG(ptr_reg, ptr_reg);
+			*patch++ = *insn;
+			cnt = patch - insn_buf;
+
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta    += cnt - 1;
+			env->prog = prog = new_prog;
+			insn      = new_prog->insnsi + i + delta;
+			goto next_insn;
+		}
+
 		/* Make sdiv/smod divide-by-minus-one exceptions impossible. */
 		if ((insn->code == (BPF_ALU64 | BPF_MOD | BPF_K) ||
 		     insn->code == (BPF_ALU64 | BPF_DIV | BPF_K) ||
