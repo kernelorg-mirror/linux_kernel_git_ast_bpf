@@ -909,12 +909,49 @@ __bpf_kfunc int bpf_arena_reserve_pages(void *p__map, void *ptr__ign, u32 page_c
 
 	return arena_reserve_pages(arena, (long)ptr__ign, page_cnt);
 }
+
+/*
+ * bpf_arena_memcmp / bpf_arena_memcpy — memcmp/memcpy over arena memory.
+ *
+ * Both pointers are arena user VAs. The JIT sets %r12 to arena_vm_start at
+ * prog prologue and the x86 ABI marks %r12 as callee-saved, so at the first
+ * instruction of this kfunc %r12 still holds that base. Read it via inline
+ * asm before the compiler has a chance to reuse the register, rebase the
+ * user-VA low-32 into the kernel VMA range, then call the regular
+ * memcmp()/memcpy(). No per-prog context lookup needed.
+ */
+static __always_inline unsigned long arena_kern_base(void)
+{
+	unsigned long base;
+
+	asm volatile("movq %%r12, %0" : "=r"(base));
+	return base;
+}
+
+__bpf_kfunc int bpf_arena_memcmp(const void *a__ign, const void *b__ign, u32 n)
+{
+	unsigned long base = arena_kern_base();
+
+	return memcmp((const void *)(base + (u32)(unsigned long)a__ign),
+		      (const void *)(base + (u32)(unsigned long)b__ign), n);
+}
+
+__bpf_kfunc void *bpf_arena_memcpy(void *dst__ign, const void *src__ign, u32 n)
+{
+	unsigned long base = arena_kern_base();
+
+	memcpy((void *)(base + (u32)(unsigned long)dst__ign),
+	       (const void *)(base + (u32)(unsigned long)src__ign), n);
+	return dst__ign;
+}
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(arena_kfuncs)
 BTF_ID_FLAGS(func, bpf_arena_alloc_pages, KF_ARENA_RET | KF_ARENA_ARG2)
 BTF_ID_FLAGS(func, bpf_arena_free_pages, KF_ARENA_ARG2)
 BTF_ID_FLAGS(func, bpf_arena_reserve_pages, KF_ARENA_ARG2)
+BTF_ID_FLAGS(func, bpf_arena_memcmp, KF_ARENA_ARG1 | KF_ARENA_ARG2)
+BTF_ID_FLAGS(func, bpf_arena_memcpy, KF_ARENA_RET | KF_ARENA_ARG1 | KF_ARENA_ARG2)
 BTF_KFUNCS_END(arena_kfuncs)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {
