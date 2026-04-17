@@ -594,6 +594,12 @@ struct bpf_map {
 	bool autoattach;
 	__u64 map_extra;
 	struct bpf_program *excl_prog;
+	/* When obj->data_into_arena is true and this is an internal .bss/.data/.rodata
+	 * map, this is the offset inside the arena map where this section's content
+	 * lives. Relocations against variables in this section are rewritten to
+	 * reference the arena map at (arena_off + sym->st_value).
+	 */
+	size_t arena_off;
 };
 
 enum extern_type {
@@ -759,6 +765,11 @@ struct bpf_object {
 	void *arena_data;
 	size_t arena_data_sz;
 	size_t arena_data_off;
+	/* If true, libbpf auto-created an ARENA map and moved .bss/.data/.rodata
+	 * contents into it at load time. All LDIMM64 references to those sections
+	 * were rewritten to point at the arena (just like __arena_global vars).
+	 */
+	bool data_into_arena;
 
 	void *jumptables_data;
 	size_t jumptables_data_sz;
@@ -3015,6 +3026,146 @@ static int init_arena_map_data(struct bpf_object *obj, struct bpf_map *map,
 	return 0;
 }
 
+/* Create a synthetic arena map when the user didn't declare one but the object
+ * has global data (.bss/.data/.rodata) that we want to fold into arena memory.
+ * The resulting map behaves as if the user wrote:
+ *	struct {
+ *		__uint(type, BPF_MAP_TYPE_ARENA);
+ *		__uint(max_entries, <computed>);
+ *	} arena SEC(".maps");
+ */
+static int bpf_object__auto_arena_map(struct bpf_object *obj, unsigned int max_pages)
+{
+	struct bpf_map *map;
+	char name[BPF_OBJ_NAME_LEN];
+	int pfx_len;
+
+	map = bpf_object__add_map(obj);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	pfx_len = min((size_t)BPF_OBJ_NAME_LEN - strlen(".arena") - 1,
+		      strlen(obj->name));
+	snprintf(name, sizeof(name), "%.*s.arena", pfx_len, obj->name);
+
+	map->real_name = strdup(".arena");
+	map->name = strdup(name);
+	if (!map->real_name || !map->name)
+		return -ENOMEM;
+
+	map->sec_idx = -1;
+	map->def.type = BPF_MAP_TYPE_ARENA;
+	map->def.key_size = 0;
+	map->def.value_size = 0;
+	map->def.max_entries = max_pages;
+	map->def.map_flags = BPF_F_MMAPABLE;
+	map->map_extra = 0;
+
+	obj->arena_map_idx = obj->nr_maps - 1;
+	return 0;
+}
+
+/* If the object carries global data sections and the user didn't declare an
+ * ARENA map, auto-create one and lay out .bss/.data/.rodata (and .addr_space.1,
+ * if present) inside it. From the verifier's and JIT's point of view every
+ * global variable then looks exactly like an __arena_global variable.
+ */
+static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
+{
+	const size_t page_sz = sysconf(_SC_PAGE_SIZE);
+	struct bpf_map *arena_map;
+	size_t total_bytes = 0;
+	size_t off;
+	bool have_data = false;
+	int i, err;
+
+	/* Full-range LDIMM64 offsets are required so any variable can sit
+	 * anywhere within the arena.
+	 */
+	if (!kernel_supports(obj, FEAT_LDIMM64_FULL_RANGE_OFF))
+		return 0;
+
+	/* Only take over when we can own the arena layout. If the user
+	 * declared an arena map explicitly, leave things alone.
+	 */
+	if (obj->arena_map_idx >= 0)
+		return 0;
+
+	for (i = 0; i < obj->nr_maps; i++) {
+		struct bpf_map *m = &obj->maps[i];
+
+		switch (m->libbpf_type) {
+		case LIBBPF_MAP_DATA:
+		case LIBBPF_MAP_BSS:
+		case LIBBPF_MAP_RODATA:
+			have_data = true;
+			total_bytes += roundup(m->def.value_size, 8);
+			break;
+		default:
+			break;
+		}
+	}
+	if (obj->efile.arena_data && obj->efile.arena_data->d_size) {
+		have_data = true;
+		total_bytes += roundup(obj->efile.arena_data->d_size, 8);
+	}
+	if (!have_data)
+		return 0;
+
+	/* Round to page size and add a small amount of slack so that BPF
+	 * programs can still call bpf_arena_alloc_pages() for runtime use.
+	 */
+	total_bytes = roundup(total_bytes, page_sz) + 16 * page_sz;
+
+	err = bpf_object__auto_arena_map(obj, total_bytes / page_sz);
+	if (err)
+		return err;
+	arena_map = &obj->maps[obj->arena_map_idx];
+
+	/* Lay out internal data maps back-to-back starting at offset 0.
+	 * Each variable ends up at arena_off + sym->st_value inside the arena.
+	 */
+	off = 0;
+	for (i = 0; i < obj->nr_maps; i++) {
+		struct bpf_map *m = &obj->maps[i];
+
+		switch (m->libbpf_type) {
+		case LIBBPF_MAP_DATA:
+		case LIBBPF_MAP_BSS:
+		case LIBBPF_MAP_RODATA:
+			m->arena_off = off;
+			off += roundup(m->def.value_size, 8);
+			/* The internal map is not materialized in the kernel —
+			 * its only job was to be a placeholder for relocations,
+			 * which we now redirect to the arena. Its mmap'd buffer
+			 * is kept for a moment so create_maps() can memcpy the
+			 * initial contents into the arena.
+			 */
+			m->autocreate = false;
+			break;
+		default:
+			break;
+		}
+	}
+
+	/* Existing __arena_global data, if any, follows the redirected sections. */
+	if (obj->efile.arena_data && obj->efile.arena_data->d_size) {
+		obj->arena_data = malloc(obj->efile.arena_data->d_size);
+		if (!obj->arena_data)
+			return -ENOMEM;
+		memcpy(obj->arena_data, obj->efile.arena_data->d_buf,
+		       obj->efile.arena_data->d_size);
+		obj->arena_data_sz = obj->efile.arena_data->d_size;
+		obj->arena_data_off = off;
+		arena_map->mmaped = obj->arena_data;
+	}
+
+	obj->data_into_arena = true;
+	pr_debug("auto-arena: created map '%s' with %u pages, folded data size %zu\n",
+		 arena_map->name, arena_map->def.max_entries, total_bytes);
+	return 0;
+}
+
 static int bpf_object__init_user_btf_maps(struct bpf_object *obj, bool strict,
 					  const char *pin_root_path)
 {
@@ -3085,11 +3236,9 @@ static int bpf_object__init_user_btf_maps(struct bpf_object *obj, bool strict,
 				return err;
 		}
 	}
-	if (obj->efile.arena_data && obj->arena_map_idx < 0) {
-		pr_warn("elf: sec '%s': to use global __arena variables the ARENA map should be explicitly declared in SEC(\".maps\")\n",
-			ARENA_SEC);
-		return -ENOENT;
-	}
+	/* If .addr_space.1 exists but the user didn't declare an ARENA map,
+	 * bpf_object__fold_data_into_arena() will auto-create one.
+	 */
 
 	return 0;
 }
@@ -3108,6 +3257,7 @@ static int bpf_object__init_maps(struct bpf_object *obj,
 	err = err ?: bpf_object__init_global_data_maps(obj);
 	err = err ?: bpf_object__init_kconfig_map(obj);
 	err = err ?: bpf_object_init_struct_ops(obj);
+	err = err ?: bpf_object__fold_data_into_arena(obj);
 
 	return err;
 }
@@ -4713,6 +4863,11 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 		reloc_desc->insn_idx = insn_idx;
 		reloc_desc->map_idx = obj->arena_map_idx;
 		reloc_desc->sym_off = sym->st_value;
+		/* In folded mode, bake the per-section arena offset into sym_off
+		 * here so relocate_data() doesn't need to add arena_data_off.
+		 */
+		if (obj->data_into_arena)
+			reloc_desc->sym_off += obj->arena_data_off;
 
 		map = &obj->maps[obj->arena_map_idx];
 		pr_debug("prog '%s': found arena map %d (%s, sec %d, off %zu) for insn %u\n",
@@ -4784,8 +4939,17 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 
 	reloc_desc->type = RELO_DATA;
 	reloc_desc->insn_idx = insn_idx;
-	reloc_desc->map_idx = map_idx;
-	reloc_desc->sym_off = sym->st_value;
+	/* When .bss/.data/.rodata have been folded into the arena, redirect the
+	 * relocation to the arena map and add the per-section offset so that the
+	 * final insn[1].imm resolves to <arena user_vm_start> + <var offset in arena>.
+	 */
+	if (obj->data_into_arena) {
+		reloc_desc->map_idx = obj->arena_map_idx;
+		reloc_desc->sym_off = sym->st_value + obj->maps[map_idx].arena_off;
+	} else {
+		reloc_desc->map_idx = map_idx;
+		reloc_desc->sym_off = sym->st_value;
+	}
 	return 0;
 }
 
@@ -5685,6 +5849,33 @@ retry:
 						obj->arena_data_sz);
 					zfree(&obj->arena_data);
 				}
+				/* Copy the initial contents of every folded
+				 * .bss/.data/.rodata section into the arena at
+				 * its assigned offset. The source buffers are
+				 * the anonymous mmaps created by
+				 * bpf_object__init_internal_map(); once copied,
+				 * release them — the arena now owns the data.
+				 */
+				if (obj->data_into_arena) {
+					for (j = 0; j < obj->nr_maps; j++) {
+						struct bpf_map *src = &obj->maps[j];
+
+						if (src == map || !src->mmaped)
+							continue;
+						switch (src->libbpf_type) {
+						case LIBBPF_MAP_DATA:
+						case LIBBPF_MAP_BSS:
+						case LIBBPF_MAP_RODATA:
+							memcpy((char *)map->mmaped + src->arena_off,
+							       src->mmaped, src->def.value_size);
+							munmap(src->mmaped, bpf_map_mmap_sz(src));
+							src->mmaped = NULL;
+							break;
+						default:
+							break;
+						}
+					}
+				}
 			}
 			if (map->init_slots_sz && map->def.type != BPF_MAP_TYPE_PROG_ARRAY) {
 				err = init_map_in_map_slots(obj, map);
@@ -6435,7 +6626,10 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 			map = &obj->maps[relo->map_idx];
 			insn[1].imm = insn[0].imm + relo->sym_off;
 
-			if (relo->map_idx == obj->arena_map_idx)
+			/* In folded mode record_reloc() already added the in-arena
+			 * offset to sym_off, so don't add it a second time.
+			 */
+			if (relo->map_idx == obj->arena_map_idx && !obj->data_into_arena)
 				insn[1].imm += obj->arena_data_off;
 
 			if (obj->gen_loader) {
@@ -7439,8 +7633,12 @@ static int bpf_object__relocate(struct bpf_object *obj, const char *targ_btf_pat
 		bpf_object__sort_relos(obj);
 	}
 
-	/* place globals at the end of the arena (if supported) */
-	if (obj->arena_map_idx >= 0 && kernel_supports(obj, FEAT_LDIMM64_FULL_RANGE_OFF)) {
+	/* place globals at the end of the arena (if supported). Skip in
+	 * folded mode — arena_data_off was already chosen by
+	 * bpf_object__fold_data_into_arena().
+	 */
+	if (obj->arena_map_idx >= 0 && !obj->data_into_arena &&
+	    kernel_supports(obj, FEAT_LDIMM64_FULL_RANGE_OFF)) {
 		struct bpf_map *arena_map = &obj->maps[obj->arena_map_idx];
 
 		obj->arena_data_off = bpf_map_mmap_sz(arena_map) -
