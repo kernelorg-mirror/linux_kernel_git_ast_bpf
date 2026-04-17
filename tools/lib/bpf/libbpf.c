@@ -3097,11 +3097,15 @@ static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
 		switch (m->libbpf_type) {
 		case LIBBPF_MAP_DATA:
 		case LIBBPF_MAP_BSS:
-		case LIBBPF_MAP_RODATA:
 			have_data = true;
 			total_bytes += roundup(m->def.value_size, 8);
 			break;
 		default:
+			/* Leave LIBBPF_MAP_RODATA in its own read-only internal
+			 * map so the verifier can const-propagate values from it.
+			 * Arena memory is treated as runtime-mutable, which
+			 * defeats const tracking for format strings, vtables, etc.
+			 */
 			break;
 		}
 	}
@@ -3132,15 +3136,8 @@ static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
 		switch (m->libbpf_type) {
 		case LIBBPF_MAP_DATA:
 		case LIBBPF_MAP_BSS:
-		case LIBBPF_MAP_RODATA:
 			m->arena_off = off;
 			off += roundup(m->def.value_size, 8);
-			/* The internal map is not materialized in the kernel —
-			 * its only job was to be a placeholder for relocations,
-			 * which we now redirect to the arena. Its mmap'd buffer
-			 * is kept for a moment so create_maps() can memcpy the
-			 * initial contents into the arena.
-			 */
 			m->autocreate = false;
 			break;
 		default:
@@ -4939,11 +4936,13 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 
 	reloc_desc->type = RELO_DATA;
 	reloc_desc->insn_idx = insn_idx;
-	/* When .bss/.data/.rodata have been folded into the arena, redirect the
-	 * relocation to the arena map and add the per-section offset so that the
-	 * final insn[1].imm resolves to <arena user_vm_start> + <var offset in arena>.
+	/* When .bss/.data have been folded into the arena, redirect the
+	 * relocation to the arena map and add the per-section offset so that
+	 * the final insn[1].imm resolves to <arena user_vm_start> + <var
+	 * offset in arena>. Leave .rodata in its own read-only internal map
+	 * so the verifier can const-propagate from it.
 	 */
-	if (obj->data_into_arena) {
+	if (obj->data_into_arena && type != LIBBPF_MAP_RODATA) {
 		reloc_desc->map_idx = obj->arena_map_idx;
 		reloc_desc->sym_off = sym->st_value + obj->maps[map_idx].arena_off;
 	} else {
@@ -5865,7 +5864,6 @@ retry:
 						switch (src->libbpf_type) {
 						case LIBBPF_MAP_DATA:
 						case LIBBPF_MAP_BSS:
-						case LIBBPF_MAP_RODATA:
 							memcpy((char *)map->mmaped + src->arena_off,
 							       src->mmaped, src->def.value_size);
 							munmap(src->mmaped, bpf_map_mmap_sz(src));
