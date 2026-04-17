@@ -13969,10 +13969,20 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 	case BPF_AND:
 	case BPF_OR:
 	case BPF_XOR:
-		/* bitwise ops on pointers are troublesome, prohibit. */
-		verbose(env, "R%d bitwise operator %s on pointer prohibited\n",
-			dst, bpf_alu_string[opcode >> 4]);
-		return -EACCES;
+		/*
+		 * Bitwise ops on pointers are generally troublesome, but AND
+		 * with a constant is safe and useful: Rust's core::fmt packs
+		 * flags into the low bits of a pointer via transmute + AND.
+		 * Convert the result to a scalar — the pointer identity is
+		 * intentionally destroyed.
+		 */
+		if (!env->allow_ptr_leaks) {
+			verbose(env, "R%d bitwise operator %s on pointer prohibited\n",
+				dst, bpf_alu_string[opcode >> 4]);
+			return -EACCES;
+		}
+		mark_reg_unknown(env, regs, dst);
+		return 0;
 	default:
 		/* other operators (e.g. MUL,LSH) produce non-pointer results */
 		verbose(env, "R%d pointer arithmetic with %s operator prohibited\n",
