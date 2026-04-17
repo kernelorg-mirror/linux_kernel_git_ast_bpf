@@ -9491,18 +9491,11 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
 	return 0;
 }
 
-static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			   int *insn_idx)
+static int do_check_func_call(struct bpf_verifier_env *env, int subprog, int *insn_idx)
 {
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_func_state *caller;
-	int err, subprog, target_insn;
-
-	target_insn = *insn_idx + insn->imm + 1;
-	subprog = bpf_find_subprog(env, target_insn);
-	if (verifier_bug_if(subprog < 0, env, "target of func call at insn %d is not a program",
-			    target_insn))
-		return -EFAULT;
+	int err;
 
 	caller = state->frame[state->curframe];
 	err = btf_check_subprog_call(env, subprog, caller->regs);
@@ -9568,6 +9561,44 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	return 0;
+}
+
+static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			   int *insn_idx)
+{
+	int subprog, target_insn;
+
+	target_insn = *insn_idx + insn->imm + 1;
+	subprog = bpf_find_subprog(env, target_insn);
+	if (verifier_bug_if(subprog < 0, env, "target of func call at insn %d is not a program",
+			    target_insn))
+		return -EFAULT;
+
+	return do_check_func_call(env, subprog, insn_idx);
+}
+
+/* callx *dst_reg: indirect call through a register that holds a function
+ * pointer previously loaded via ldimm64 BPF_PSEUDO_FUNC. The target subprog
+ * is identified by reg->subprogno, so once that has been verified the call
+ * is processed identically to a direct BPF_PSEUDO_CALL to the same subprog.
+ */
+static int check_func_callx(struct bpf_verifier_env *env, struct bpf_insn *insn,
+			    int *insn_idx)
+{
+	struct bpf_reg_state *dst_reg = reg_state(env, insn->dst_reg);
+	int err;
+
+	err = check_reg_arg(env, insn->dst_reg, SRC_OP);
+	if (err)
+		return err;
+
+	if (dst_reg->type != PTR_TO_FUNC) {
+		verbose(env, "R%d has type %s, expected PTR_TO_FUNC\n",
+			insn->dst_reg, reg_type_str(env, dst_reg->type));
+		return -EINVAL;
+	}
+
+	return do_check_func_call(env, dst_reg->subprogno, insn_idx);
 }
 
 int map_set_for_each_callback_args(struct bpf_verifier_env *env,
@@ -17598,7 +17629,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 		env->jmps_processed++;
 		if (opcode == BPF_CALL) {
-			if (env->cur_state->active_locks) {
+			if (env->cur_state->active_locks && BPF_SRC(insn->code) == BPF_K) {
 				if ((insn->src_reg == BPF_REG_0 &&
 				     insn->imm != BPF_FUNC_spin_unlock &&
 				     insn->imm != BPF_FUNC_kptr_xchg) ||
@@ -17610,6 +17641,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				}
 			}
 			mark_reg_scratched(env, BPF_REG_0);
+			if (BPF_SRC(insn->code) == BPF_X)
+				return check_func_callx(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_CALL)
 				return check_func_call(env, insn, &env->insn_idx);
 			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
@@ -18292,11 +18325,22 @@ static int check_jmp_fields(struct bpf_verifier_env *env, struct bpf_insn *insn)
 
 	switch (opcode) {
 	case BPF_CALL:
-		if (BPF_SRC(insn->code) != BPF_K ||
-		    (insn->src_reg != BPF_PSEUDO_KFUNC_CALL && insn->off != 0) ||
+		if (class == BPF_JMP32) {
+			verbose(env, "BPF_CALL uses reserved fields\n");
+			return -EINVAL;
+		}
+		if (BPF_SRC(insn->code) == BPF_X) {
+			/* callx *dst_reg */
+			if (insn->src_reg != BPF_REG_0 || insn->imm != 0 || insn->off != 0) {
+				verbose(env, "BPF_CALL uses reserved fields\n");
+				return -EINVAL;
+			}
+			return 0;
+		}
+		if ((insn->src_reg != BPF_PSEUDO_KFUNC_CALL && insn->off != 0) ||
 		    (insn->src_reg != BPF_REG_0 && insn->src_reg != BPF_PSEUDO_CALL &&
 		     insn->src_reg != BPF_PSEUDO_KFUNC_CALL) ||
-		    insn->dst_reg != BPF_REG_0 || class == BPF_JMP32) {
+		    insn->dst_reg != BPF_REG_0) {
 			verbose(env, "BPF_CALL uses reserved fields\n");
 			return -EINVAL;
 		}

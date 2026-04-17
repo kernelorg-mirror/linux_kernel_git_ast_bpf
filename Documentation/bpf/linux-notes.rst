@@ -15,10 +15,13 @@ Byte swap instructions
 Jump instructions
 =================
 
-``BPF_CALL | BPF_X | BPF_JMP`` (0x8d), where the helper function
-integer would be read from a specified register, is not currently supported
-by the verifier.  Any programs with this instruction will fail to load
-until such support is added.
+``BPF_CALL | BPF_X | BPF_JMP`` (0x8d) performs an indirect call (callx) to a
+BPF subprogram whose address is held in ``dst_reg``.  The register must have
+been loaded with the subprogram address via ``BPF_LD_IMM64`` with
+``src_reg = BPF_PSEUDO_FUNC`` earlier in the program, so that the verifier
+can statically resolve the call target.  The ``src_reg``, ``imm`` and
+``off`` fields are reserved and must be zero.  Calls to helper or kernel
+functions through a register are not supported.
 
 Maps
 ====
