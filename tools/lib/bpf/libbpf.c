@@ -781,6 +781,18 @@ struct bpf_object {
 	} *jumptable_maps;
 	size_t jumptable_map_cnt;
 
+	/* Saved .text relocations inside data sections (.data.rel.ro etc.).
+	 * Collected during ELF parse (before elf_finish frees ELF data),
+	 * applied after relocate_calls() when per-program subprog offsets
+	 * are final.
+	 */
+	struct data_text_relo {
+		int data_sec_idx;  /* ELF section index of the data section */
+		size_t offset;     /* byte offset within the section */
+		size_t sym_value;  /* .text symbol value (sec-relative byte offset) */
+	} *data_text_relos;
+	size_t data_text_relo_cnt;
+
 	struct kern_feature_cache *feat_cache;
 	char *token_path;
 	int token_fd;
@@ -840,6 +852,8 @@ static bool is_call_insn(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP | BPF_CALL);
 }
+
+static bool bpf_object__shndx_is_data(const struct bpf_object *obj, int shndx);
 
 static bool insn_is_pseudo_func(struct bpf_insn *insn)
 {
@@ -3096,14 +3110,6 @@ static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
 
 		switch (m->libbpf_type) {
 		case LIBBPF_MAP_DATA:
-			/* .data.rel.ro holds vtables and resolved pointers —
-			 * effectively read-only after relocation. Keep it in
-			 * its own internal map like .rodata so the verifier
-			 * can track its contents as map_value.
-			 */
-			if (m->real_name && strstr(m->real_name, ".rel.ro"))
-				break;
-			fallthrough;
 		case LIBBPF_MAP_BSS:
 			have_data = true;
 			total_bytes += roundup(m->def.value_size, 8);
@@ -3138,9 +3144,6 @@ static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
 
 		switch (m->libbpf_type) {
 		case LIBBPF_MAP_DATA:
-			if (m->real_name && strstr(m->real_name, ".rel.ro"))
-				break;
-			fallthrough;
 		case LIBBPF_MAP_BSS:
 			m->arena_off = off;
 			off += roundup(m->def.value_size, 8);
@@ -4156,7 +4159,14 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 					return err;
 			} else if (strcmp(name, DATA_SEC) == 0 ||
 				   str_has_pfx(name, DATA_SEC ".")) {
-				sec_desc->sec_type = SEC_DATA;
+				/* .data.rel.ro is read-only after relocation;
+				 * classify as RODATA so it gets BPF_F_RDONLY_PROG
+				 * and the verifier can const-propagate from it.
+				 */
+				if (strstr(name, ".rel.ro"))
+					sec_desc->sec_type = SEC_RODATA;
+				else
+					sec_desc->sec_type = SEC_DATA;
 				sec_desc->shdr = sh;
 				sec_desc->data = data;
 			} else if (strcmp(name, RODATA_SEC) == 0 ||
@@ -4193,8 +4203,12 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 			    targ_sec_idx >= obj->efile.sec_cnt)
 				return -LIBBPF_ERRNO__FORMAT;
 
-			/* Only do relo for section with exec instructions */
+			/* Only do relo for section with exec instructions,
+			 * struct_ops, maps, and data sections (for .text
+			 * relocations inside .data.rel.ro vtables etc.)
+			 */
 			if (!section_have_execinstr(obj, targ_sec_idx) &&
+			    !bpf_object__shndx_is_data(obj, targ_sec_idx) &&
 			    strcmp(name, ".rel" STRUCT_OPS_SEC) &&
 			    strcmp(name, ".rel" STRUCT_OPS_LINK_SEC) &&
 			    strcmp(name, ".rel?" STRUCT_OPS_SEC) &&
@@ -4948,9 +4962,7 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	 * offset in arena>. Leave .rodata in its own read-only internal map
 	 * so the verifier can const-propagate from it.
 	 */
-	if (obj->data_into_arena && type != LIBBPF_MAP_RODATA &&
-	    !(obj->maps[map_idx].real_name &&
-	      strstr(obj->maps[map_idx].real_name, ".rel.ro"))) {
+	if (obj->data_into_arena && type != LIBBPF_MAP_RODATA) {
 		reloc_desc->map_idx = obj->arena_map_idx;
 		reloc_desc->sym_off = sym->st_value + obj->maps[map_idx].arena_off;
 	} else {
@@ -5871,10 +5883,6 @@ retry:
 							continue;
 						switch (src->libbpf_type) {
 						case LIBBPF_MAP_DATA:
-							if (src->real_name &&
-							    strstr(src->real_name, ".rel.ro"))
-								break;
-							fallthrough;
 						case LIBBPF_MAP_BSS:
 							memcpy((char *)map->mmaped + src->arena_off,
 							       src->mmaped, src->def.value_size);
@@ -6602,6 +6610,117 @@ err_close:
 	return err;
 }
 
+/* Create a per-program clone of a data map with .text relocations
+ * (vtable function pointers) resolved to the current program's subprog
+ * offsets. Returns the clone's fd, or the original map fd if no .text
+ * relos exist for this map.
+ */
+/* Per-program clone cache: map sec_idx → clone fd.
+ * Reset between programs via clone_cache_fd = -1.
+ */
+static int clone_cache_sec_idx = -1;
+static int clone_cache_fd = -1;
+
+static int clone_data_map_for_prog(struct bpf_object *obj,
+				   struct bpf_program *prog,
+				   struct bpf_map *map)
+{
+	size_t i;
+	int map_fd, err;
+	int zero = 0;
+	void *buf;
+	bool has_text_relo = false;
+
+	/* Check if this map has any .text relos */
+	for (i = 0; i < obj->data_text_relo_cnt; i++) {
+		if (obj->data_text_relos[i].data_sec_idx == map->sec_idx) {
+			has_text_relo = true;
+			break;
+		}
+	}
+	if (!has_text_relo)
+		return map->fd;
+
+	/* Return cached clone for this program + map */
+	if (clone_cache_sec_idx == map->sec_idx && clone_cache_fd >= 0)
+		return clone_cache_fd;
+
+	buf = malloc(map->def.value_size);
+	if (!buf)
+		return -ENOMEM;
+	memcpy(buf, map->mmaped, map->def.value_size);
+
+	/* Patch .text relocations with this program's subprog offsets */
+	for (i = 0; i < obj->data_text_relo_cnt; i++) {
+		struct data_text_relo *r = &obj->data_text_relos[i];
+		__u64 in_place_val;
+		size_t sec_insn_off, sub_insn_off = 0;
+		bool found = false;
+		int j;
+
+		if (r->data_sec_idx != map->sec_idx)
+			continue;
+		if (r->offset + sizeof(__u64) > map->def.value_size)
+			continue;
+
+		in_place_val = *(__u64 *)((char *)buf + r->offset);
+		sec_insn_off = (r->sym_value + in_place_val) / BPF_INSN_SZ;
+
+		if (prog->subprogs) {
+			for (j = 0; j < prog->subprog_cnt; j++) {
+				if (prog->subprogs[j].sec_insn_off == sec_insn_off) {
+					sub_insn_off = prog->subprogs[j].sub_insn_off;
+					found = true;
+					break;
+				}
+			}
+		}
+		if (!found && prog->sec_insn_off == sec_insn_off) {
+			sub_insn_off = 0;
+			found = true;
+		}
+		if (!found) {
+			pr_debug("clone_data_map: prog '%s' can't find subprog at .text insn %zu\n",
+				 prog->name, sec_insn_off);
+			continue;
+		}
+
+		*(__u64 *)((char *)buf + r->offset) = sub_insn_off * BPF_INSN_SZ;
+		pr_debug("clone_data_map: prog '%s' off %zu: insn %zu -> %zu\n",
+			 prog->name, r->offset, sec_insn_off, sub_insn_off);
+	}
+
+	{
+		LIBBPF_OPTS(bpf_map_create_opts, opts,
+			.map_flags = BPF_F_RDONLY_PROG,
+		);
+		map_fd = bpf_map_create(BPF_MAP_TYPE_ARRAY, map->name,
+					sizeof(int), map->def.value_size, 1, &opts);
+	}
+	if (map_fd < 0) {
+		err = -errno;
+		free(buf);
+		return err;
+	}
+
+	err = bpf_map_update_elem(map_fd, &zero, buf, 0);
+	free(buf);
+	if (err) {
+		close(map_fd);
+		return -errno;
+	}
+
+	err = bpf_map_freeze(map_fd);
+	if (err) {
+		close(map_fd);
+		return -errno;
+	}
+
+	clone_cache_sec_idx = map->sec_idx;
+	clone_cache_fd = map_fd;
+	return map_fd;
+}
+
 /* Relocate data references within program code:
  *  - map references;
  *  - global variable references;
@@ -6611,6 +6730,10 @@ static int
 bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 {
 	int i;
+
+	/* Reset per-program clone cache */
+	clone_cache_sec_idx = -1;
+	clone_cache_fd = -1;
 
 	for (i = 0; i < prog->nr_reloc; i++) {
 		struct reloc_desc *relo = &prog->reloc_desc[i];
@@ -6632,7 +6755,9 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 						   relo->map_idx, map);
 			}
 			break;
-		case RELO_DATA:
+		case RELO_DATA: {
+			int use_fd;
+
 			map = &obj->maps[relo->map_idx];
 			insn[1].imm = insn[0].imm + relo->sym_off;
 
@@ -6642,17 +6767,28 @@ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
 			if (relo->map_idx == obj->arena_map_idx && !obj->data_into_arena)
 				insn[1].imm += obj->arena_data_off;
 
+			/* For data maps with .text relos (vtables), create a
+			 * per-program clone with resolved subprog offsets.
+			 */
+			use_fd = obj->data_text_relo_cnt > 0
+				? clone_data_map_for_prog(obj, prog,
+							  &obj->maps[relo->map_idx])
+				: map->fd;
+			if (use_fd < 0)
+				return use_fd;
+
 			if (obj->gen_loader) {
 				insn[0].src_reg = BPF_PSEUDO_MAP_IDX_VALUE;
 				insn[0].imm = relo->map_idx;
 			} else if (map->autocreate) {
 				insn[0].src_reg = BPF_PSEUDO_MAP_VALUE;
-				insn[0].imm = map->fd;
+				insn[0].imm = use_fd;
 			} else {
 				poison_map_ldimm64(prog, i, relo->insn_idx, insn,
 						   relo->map_idx, map);
 			}
 			break;
+		}
 		case RELO_EXTERN_LD64:
 			ext = &obj->externs[relo->ext_idx];
 			if (ext->type == EXT_KCFG) {
@@ -7698,6 +7834,43 @@ static int bpf_object__relocate(struct bpf_object *obj, const char *targ_btf_pat
 			return err;
 		}
 
+		/* Append subprogs referenced from vtable function pointers.
+		 * Must be after relocate_calls() (which resets sub_insn_off).
+		 */
+		for (j = 0; j < obj->data_text_relo_cnt; j++) {
+			struct data_text_relo *r = &obj->data_text_relos[j];
+			struct bpf_program *subprog;
+			struct bpf_map *map = NULL;
+			__u64 in_place_val;
+			size_t sec_off;
+			int k;
+
+			for (k = 0; k < obj->nr_maps; k++) {
+				if (obj->maps[k].sec_idx == r->data_sec_idx &&
+				    bpf_map__is_internal(&obj->maps[k])) {
+					map = &obj->maps[k];
+					break;
+				}
+			}
+			if (!map || !map->mmaped ||
+			    r->offset + sizeof(__u64) > map->def.value_size)
+				continue;
+			in_place_val = *(__u64 *)((char *)map->mmaped + r->offset);
+			sec_off = (r->sym_value + in_place_val) / BPF_INSN_SZ;
+
+			subprog = find_prog_by_sec_insn(obj, obj->efile.text_shndx, sec_off);
+			if (!subprog || !prog_is_subprog(obj, subprog))
+				continue;
+			if (subprog->sub_insn_off != 0)
+				continue;
+			err = bpf_object__append_subprog_code(obj, prog, subprog);
+			if (err)
+				return err;
+			err = bpf_object__reloc_code(obj, prog, subprog);
+			if (err)
+				return err;
+		}
+
 		err = bpf_prog_assign_exc_cb(obj, prog);
 		if (err)
 			return err;
@@ -7720,6 +7893,10 @@ static int bpf_object__relocate(struct bpf_object *obj, const char *targ_btf_pat
 			}
 		}
 	}
+	/* Data-section .text relos resolved per-program in relocate_data
+	 * via clone maps (like jump tables).
+	 */
+
 	for (i = 0; i < obj->nr_programs; i++) {
 		prog = &obj->programs[i];
 		if (prog_is_subprog(obj, prog))
@@ -7887,6 +8064,48 @@ static int bpf_object__collect_map_relos(struct bpf_object *obj,
 	return 0;
 }
 
+/* Save R_BPF_64_ABS64 relocations inside data sections that target .text.
+ * These are vtable function pointers, resolved after relocate_calls().
+ */
+static int bpf_object__collect_data_relos(struct bpf_object *obj, int data_sec_idx,
+					  Elf64_Shdr *shdr, Elf_Data *data)
+{
+	int nrels = shdr->sh_size / shdr->sh_entsize;
+	int i;
+
+	for (i = 0; i < nrels; i++) {
+		Elf64_Rel *rel = elf_rel_by_idx(data, i);
+		Elf64_Sym *sym;
+		void *tmp;
+
+		if (!rel)
+			return -LIBBPF_ERRNO__FORMAT;
+
+		sym = elf_sym_by_idx(obj, ELF64_R_SYM(rel->r_info));
+		if (!sym)
+			return -LIBBPF_ERRNO__FORMAT;
+
+		/* Only save .text-targeting relocations (function pointers) */
+		if (sym->st_shndx != obj->efile.text_shndx)
+			continue;
+
+		tmp = libbpf_reallocarray(obj->data_text_relos,
+					  obj->data_text_relo_cnt + 1,
+					  sizeof(*obj->data_text_relos));
+		if (!tmp)
+			return -ENOMEM;
+		obj->data_text_relos = tmp;
+		obj->data_text_relos[obj->data_text_relo_cnt++] = (struct data_text_relo){
+			.data_sec_idx = data_sec_idx,
+			.offset = rel->r_offset,
+			.sym_value = sym->st_value,
+		};
+		pr_debug("data relo: sec %d off %zu -> .text+%zu\n",
+			 data_sec_idx, (size_t)rel->r_offset, (size_t)sym->st_value);
+	}
+	return 0;
+}
+
 static int bpf_object__collect_relos(struct bpf_object *obj)
 {
 	int i, err;
@@ -7913,6 +8132,8 @@ static int bpf_object__collect_relos(struct bpf_object *obj)
 			err = bpf_object__collect_st_ops_relos(obj, shdr, data);
 		else if (idx == obj->efile.btf_maps_shndx)
 			err = bpf_object__collect_map_relos(obj, shdr, data);
+		else if (bpf_object__shndx_is_data(obj, idx))
+			err = bpf_object__collect_data_relos(obj, idx, shdr, data);
 		else
 			err = bpf_object__collect_prog_relos(obj, shdr, data);
 		if (err)
