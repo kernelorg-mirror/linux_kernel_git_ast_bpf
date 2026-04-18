@@ -374,8 +374,13 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 		if (class == BPF_STX)
 			bt_set_reg(bt, sreg);
 	} else if (class == BPF_JMP || class == BPF_JMP32) {
-		if (bpf_pseudo_call(insn)) {
+		if (bpf_pseudo_call(insn) ||
+		    insn->code == (BPF_JMP | BPF_CALL | BPF_X)) {
 			int subprog_insn_idx, subprog;
+
+			/* callx is the same as subprog call */
+			if (insn->code == (BPF_JMP | BPF_CALL | BPF_X))
+				goto static_subprog_call;
 
 			subprog_insn_idx = idx + insn->imm + 1;
 			subprog = bpf_find_subprog(env, subprog_insn_idx);
@@ -404,6 +409,7 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 				bt_clear_reg(bt, BPF_REG_0);
 				return 0;
 			} else {
+static_subprog_call:
 				/* static subprog call instruction, which
 				 * means that we are exiting current subprog,
 				 * so only r1-r5 could be still requested as

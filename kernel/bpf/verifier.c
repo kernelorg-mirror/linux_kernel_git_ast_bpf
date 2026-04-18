@@ -9600,6 +9600,11 @@ static int do_check_func_call(struct bpf_verifier_env *env, int subprog, int *in
 	/* and go analyze first insn of the callee */
 	*insn_idx = env->subprog_info[subprog].start - 1;
 
+	/* For callx: mark callee entry as jmp_point so the backtracking
+	 * jmp_history records the jump from caller to callee.
+	 */
+	mark_jmp_point(env, env->subprog_info[subprog].start);
+
 	if (env->log.level & BPF_LOG_LEVEL) {
 		verbose(env, "caller:\n");
 		print_verifier_state(env, state, caller->frameno, true);
@@ -9624,7 +9629,8 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	return do_check_func_call(env, subprog, insn_idx);
 }
 
-/* callx *dst_reg: indirect call through a register that holds a function
+/*
+ * callx *dst_reg: indirect call through a register that holds a function
  * pointer previously loaded via ldimm64 BPF_PSEUDO_FUNC. The target subprog
  * is identified by reg->subprogno, so once that has been verified the call
  * is processed identically to a direct BPF_PSEUDO_CALL to the same subprog.

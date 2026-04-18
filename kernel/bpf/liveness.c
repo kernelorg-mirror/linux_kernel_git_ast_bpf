@@ -2098,6 +2098,8 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 		case BPF_CALL:
 			def = ALL_CALLER_SAVED_REGS;
 			use = def & ~BIT(BPF_REG_0);
+			if (BPF_SRC(insn->code) == BPF_X)
+				use |= dst; /* callx reads dst_reg as fn ptr */
 			if (bpf_get_call_summary(env, insn, &cs))
 				use = GENMASK(cs.num_params, 1);
 			break;
