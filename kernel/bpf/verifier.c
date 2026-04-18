@@ -2664,7 +2664,7 @@ int bpf_find_subprog(struct bpf_verifier_env *env, int off)
 	return p - env->subprog_info;
 }
 
-static int add_subprog(struct bpf_verifier_env *env, int off)
+int add_subprog(struct bpf_verifier_env *env, int off)
 {
 	int insn_cnt = env->prog->len;
 	int ret;
@@ -6382,8 +6382,27 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 				if (err)
 					return err;
 
+				/* Check if the constant value is a known
+				 * subprog insn address (e.g. a vtable function
+				 * pointer in .data.rel.ro). If so, produce
+				 * PTR_TO_FUNC so callx can use it.
+				 */
+				if (size == 8 && val > 0) {
+					u32 insn_off = val / sizeof(struct bpf_insn);
+					int k;
+
+					for (k = 0; k < env->subprog_cnt; k++) {
+						if (env->subprog_info[k].start == insn_off) {
+							mark_reg_unknown(env, regs, value_regno);
+							regs[value_regno].type = PTR_TO_FUNC;
+							regs[value_regno].subprogno = k;
+							goto done_map_read;
+						}
+					}
+				}
 				regs[value_regno].type = SCALAR_VALUE;
 				__mark_reg_known(&regs[value_regno], val);
+done_map_read:
 			} else if (map->map_type == BPF_MAP_TYPE_INSN_ARRAY) {
 				if (bpf_size != BPF_DW) {
 					verbose(env, "Invalid read of %d bytes from insn_array\n",

@@ -1478,6 +1478,7 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len);
 void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog);
 bool bpf_allow_tail_call_in_subprogs(struct bpf_verifier_env *env);
 bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm);
+int add_subprog(struct bpf_verifier_env *env, int off);
 int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset);
 int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			 struct bpf_insn *insn_buf, int insn_idx, int *cnt);

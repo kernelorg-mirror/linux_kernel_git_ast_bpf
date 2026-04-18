@@ -150,6 +150,29 @@ static int check_btf_func(struct bpf_verifier_env *env,
 			return -EINVAL;
 		return 0;
 	}
+	if (nfuncs > env->subprog_cnt) {
+		/* func_info may list subprogs that weren't discovered by
+		 * add_subprog_and_kfunc() because they're only reachable via
+		 * callx (e.g. vtable function pointers). Register them now
+		 * by reading insn_off from user-provided func_info records.
+		 */
+		u32 rec_size = attr->func_info_rec_size;
+		bpfptr_t urec = make_bpfptr(attr->func_info, uattr.is_kernel);
+		int k;
+
+		for (k = 0; k < nfuncs; k++) {
+			u32 insn_off;
+			int ret2;
+
+			if (copy_from_bpfptr(&insn_off, urec, sizeof(insn_off)))
+				return -EFAULT;
+			ret2 = add_subprog(env, insn_off);
+			verbose(env, "func_info[%d]: insn_off=%u add_subprog=%d subprog_cnt=%d\n",
+				k, insn_off, ret2, env->subprog_cnt);
+			bpfptr_add(&urec, rec_size);
+		}
+		env->subprog_info[env->subprog_cnt].start = env->prog->len;
+	}
 	if (nfuncs != env->subprog_cnt) {
 		verbose(env, "number of funcs in func_info doesn't match number of subprogs\n");
 		return -EINVAL;

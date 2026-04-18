@@ -608,6 +608,22 @@ walk_cfg:
 		goto walk_cfg;
 	}
 
+	/* Walk subprogs that weren't reached by the main DFS — these are
+	 * only reachable via callx (indirect call through vtable function
+	 * pointers). Their code is valid but the CFG can't follow the
+	 * dynamic call target.
+	 */
+	for (i = 1; i < env->subprog_cnt; i++) {
+		int entry = env->subprog_info[i].start;
+
+		if (insn_state[entry] != EXPLORED) {
+			insn_state[entry] = DISCOVERED;
+			insn_stack[0] = entry;
+			env->cfg.cur_stack = 1;
+			goto walk_cfg;
+		}
+	}
+
 	for (i = 0; i < insn_cnt; i++) {
 		struct bpf_insn *insn = &env->prog->insnsi[i];
 
