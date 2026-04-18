@@ -3096,16 +3096,19 @@ static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
 
 		switch (m->libbpf_type) {
 		case LIBBPF_MAP_DATA:
+			/* .data.rel.ro holds vtables and resolved pointers —
+			 * effectively read-only after relocation. Keep it in
+			 * its own internal map like .rodata so the verifier
+			 * can track its contents as map_value.
+			 */
+			if (m->real_name && strstr(m->real_name, ".rel.ro"))
+				break;
+			fallthrough;
 		case LIBBPF_MAP_BSS:
 			have_data = true;
 			total_bytes += roundup(m->def.value_size, 8);
 			break;
 		default:
-			/* Leave LIBBPF_MAP_RODATA in its own read-only internal
-			 * map so the verifier can const-propagate values from it.
-			 * Arena memory is treated as runtime-mutable, which
-			 * defeats const tracking for format strings, vtables, etc.
-			 */
 			break;
 		}
 	}
@@ -3135,6 +3138,9 @@ static int bpf_object__fold_data_into_arena(struct bpf_object *obj)
 
 		switch (m->libbpf_type) {
 		case LIBBPF_MAP_DATA:
+			if (m->real_name && strstr(m->real_name, ".rel.ro"))
+				break;
+			fallthrough;
 		case LIBBPF_MAP_BSS:
 			m->arena_off = off;
 			off += roundup(m->def.value_size, 8);
@@ -4942,7 +4948,9 @@ static int bpf_program__record_reloc(struct bpf_program *prog,
 	 * offset in arena>. Leave .rodata in its own read-only internal map
 	 * so the verifier can const-propagate from it.
 	 */
-	if (obj->data_into_arena && type != LIBBPF_MAP_RODATA) {
+	if (obj->data_into_arena && type != LIBBPF_MAP_RODATA &&
+	    !(obj->maps[map_idx].real_name &&
+	      strstr(obj->maps[map_idx].real_name, ".rel.ro"))) {
 		reloc_desc->map_idx = obj->arena_map_idx;
 		reloc_desc->sym_off = sym->st_value + obj->maps[map_idx].arena_off;
 	} else {
@@ -5863,6 +5871,10 @@ retry:
 							continue;
 						switch (src->libbpf_type) {
 						case LIBBPF_MAP_DATA:
+							if (src->real_name &&
+							    strstr(src->real_name, ".rel.ro"))
+								break;
+							fallthrough;
 						case LIBBPF_MAP_BSS:
 							memcpy((char *)map->mmaped + src->arena_off,
 							       src->mmaped, src->def.value_size);
