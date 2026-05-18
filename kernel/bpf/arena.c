@@ -10,7 +10,9 @@
 #include <linux/btf_ids.h>
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
+#include <linux/slab.h>
 #include <asm/tlbflush.h>
+#include "../../mm/slab.h"
 #include "range_tree.h"
 
 /*
@@ -48,6 +50,14 @@
 
 static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable);
 
+/*
+ * Per-arena slab buckets. Mirrors the kmalloc size classes (powers of 2)
+ * up to one page.
+ */
+#define ARENA_KMALLOC_MIN_SHIFT		KMALLOC_SHIFT_LOW
+#define ARENA_KMALLOC_MAX_SHIFT		PAGE_SHIFT
+#define ARENA_KMALLOC_NUM_BUCKETS	(ARENA_KMALLOC_MAX_SHIFT + 1)
+
 struct bpf_arena {
 	struct bpf_map map;
 	u64 user_vm_start;
@@ -63,10 +73,27 @@ struct bpf_arena {
 	struct irq_work     free_irq;
 	struct work_struct  free_work;
 	struct llist_head   free_spans;
+
+	/*
+	 * SLAB_BPF_ARENA support. slub uses direct-map VAs throughout. Two
+	 * O(1) lookups are needed at the kfunc boundary:
+	 *   - bpf_arena_alloc: kva -> arena offset. Recovered from
+	 *     slab->stride (arena_alloc_slab_page stashes uaddr32 there;
+	 *     allocate_slab() skips alloc_slab_obj_exts_early() for
+	 *     SLAB_BPF_ARENA so the value survives).
+	 *   - bpf_arena_free: arena offset -> direct-map kva. Recovered via
+	 *     @slab_pages[pgoff] (forward array, no hash, no walk).
+	 * slab_pages is sized to map->max_entries.
+	 */
+	struct kmem_cache_bpf_arena slab_hook;
+	struct page **slab_pages;
+	struct kmem_cache *kmalloc_caches[ARENA_KMALLOC_NUM_BUCKETS];
 };
 
 static void arena_free_worker(struct work_struct *work);
 static void arena_free_irq(struct irq_work *iw);
+static int arena_init_slab_caches(struct bpf_arena *arena);
+static void arena_destroy_slab_caches(struct bpf_arena *arena);
 
 struct arena_free_span {
 	struct llist_node node;
@@ -143,6 +170,7 @@ static long compute_pgoff(struct bpf_arena *arena, long uaddr)
 struct apply_range_data {
 	struct page **pages;
 	int i;
+	bool set_page_slab;
 };
 
 struct clear_range_data {
@@ -166,6 +194,16 @@ static int apply_range_set_cb(pte_t *pte, unsigned long addr, void *data)
 	if (WARN_ON_ONCE(!pfn_valid(page_to_pfn(page))))
 		return -EINVAL;
 
+	/*
+	 * Tag SLAB_BPF_ARENA slab pages while still holding arena->spinlock so
+	 * the PTE only becomes visible after PageSlab is set. apply_range_clear_cb
+	 * takes the same spinlock and skips PageSlab pages, closing the window
+	 * where a concurrent bpf_arena_free_pages() could __free_page() the
+	 * slab page out from under slub.
+	 */
+	if (d->set_page_slab)
+		__SetPageSlab(page);
+
 	set_pte_at(&init_mm, addr, pte, mk_pte(page, PAGE_KERNEL));
 	d->i++;
 	return 0;
@@ -179,8 +217,29 @@ static void flush_vmap_cache(unsigned long start, unsigned long size)
 static int apply_range_clear_cb(pte_t *pte, unsigned long addr, void *data)
 {
 	struct clear_range_data *d = data;
-	pte_t old_pte;
+	pte_t old_pte, cur;
 	struct page *page;
+
+	/*
+	 * Skip pages owned by slub (SLAB_BPF_ARENA caches). BPF must use
+	 * bpf_arena_free() for per-object slab frees; calling
+	 * bpf_arena_free_pages() on a slab-backed page would __free_page()
+	 * out from under slub. The PTE stays installed; slub will tear it
+	 * down via arena_free_slab_page() when the slab is released
+	 * (__ClearPageSlab() runs before that, so the normal path here
+	 * proceeds as usual).
+	 *
+	 * The non-atomic ptep_get() is safe: ptep_try_set() in the scratch
+	 * installer only fires on pte_none, and a present PTE held by slub
+	 * can only be cleared by arena_free_slab_page() — which can't
+	 * concurrently target the same offset because we hold the range as
+	 * allocated in range_tree for the duration of this walk.
+	 */
+	cur = ptep_get(pte);
+	if (pte_none(cur) || !pte_present(cur))
+		return 0;
+	if (PageSlab(pte_page(cur)))
+		return 0;
 
 	/*
 	 * Pairs with ptep_try_set() in the kernel-fault scratch installer.
@@ -290,12 +349,25 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		goto err_free_scratch;
 	mutex_init(&arena->lock);
 	raw_res_spin_lock_init(&arena->spinlock);
+	arena->slab_pages = bpf_map_area_alloc(attr->max_entries *
+					       sizeof(arena->slab_pages[0]),
+					       numa_node);
+	if (!arena->slab_pages) {
+		err = -ENOMEM;
+		goto err_destroy_rt;
+	}
 	err = populate_pgtable_except_pte(arena);
 	if (err)
-		goto err_destroy_rt;
+		goto err_free_slab_pages;
+
+	err = arena_init_slab_caches(arena);
+	if (err)
+		goto err_free_slab_pages;
 
 	return &arena->map;
 
+err_free_slab_pages:
+	bpf_map_area_free(arena->slab_pages);
 err_destroy_rt:
 	range_tree_destroy(&arena->rt);
 err_free_scratch:
@@ -347,6 +419,9 @@ static void arena_map_free(struct bpf_map *map)
 	if (WARN_ON_ONCE(!list_empty(&arena->vma_list)))
 		return;
 
+	/* Tear down slab caches first so all slab-backed pages return to arena. */
+	arena_destroy_slab_caches(arena);
+
 	/* Ensure no pending deferred frees */
 	irq_work_sync(&arena->free_irq);
 	flush_work(&arena->free_work);
@@ -359,6 +434,7 @@ static void arena_map_free(struct bpf_map *map)
 	 */
 	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
 				     SZ_4G + GUARD_SZ / 2, existing_page_cb, arena);
+	bpf_map_area_free(arena->slab_pages);
 	free_vm_area(arena->kern_vm);
 	range_tree_destroy(&arena->rt);
 	__free_page(arena->scratch_page);
@@ -625,7 +701,8 @@ static u64 clear_lo32(u64 val)
  * Later the pages will be mmaped into user space vma.
  */
 static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt, int node_id,
-			      bool sleepable)
+			      bool sleepable, bool set_page_slab,
+			      struct page **out_page)
 {
 	/* user_vm_end/start are fixed before bpf prog runs */
 	long page_cnt_max = (arena->user_vm_end - arena->user_vm_start) >> PAGE_SHIFT;
@@ -647,6 +724,15 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	if (page_cnt > page_cnt_max)
 		return 0;
 
+	/*
+	 * set_page_slab tagging happens batch-by-batch in apply_range_set_cb;
+	 * the out-path rollback (arena_free_pages on already-mapped pages) cannot
+	 * undo PageSlab on prior batches and would leak them. Only single-page
+	 * arena_alloc_slab_page() uses this flag.
+	 */
+	if (WARN_ON_ONCE(set_page_slab && page_cnt > 1))
+		return 0;
+
 	if (uaddr) {
 		if (uaddr & ~PAGE_MASK)
 			return 0;
@@ -665,6 +751,7 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 		return 0;
 	}
 	data.pages = pages;
+	data.set_page_slab = set_page_slab;
 
 	if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
 		goto out_free_pages;
@@ -720,6 +807,8 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	}
 	flush_vmap_cache(kern_vm_start + uaddr32, mapped << PAGE_SHIFT);
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+	if (out_page)
+		*out_page = pages[0];
 	kfree_nolock(pages);
 	bpf_map_memcg_exit(old_memcg, new_memcg);
 	return clear_lo32(arena->user_vm_start) + uaddr32;
@@ -952,6 +1041,142 @@ static void arena_free_irq(struct irq_work *iw)
 	schedule_work(&arena->free_work);
 }
 
+/*
+ * SLAB_BPF_ARENA support: each arena owns a set of kmem_cache buckets that
+ * back kmalloc-style alloc/free for BPF programs. Slab pages are drawn from
+ * the arena's page pool, but slub treats them as ordinary direct-map kernel
+ * memory (slab_address/virt_to_slab/freepointers all use direct-map VAs).
+ * The arena's vmalloc mapping is what BPF programs see; bpf_arena_alloc/free
+ * translate between direct-map and arena offset in O(1) by reading the slab
+ * page's arena uaddr32 stashed in slab->stride.
+ */
+
+static struct slab *arena_alloc_slab_page(void *arena_p, gfp_t flags, int node,
+					  unsigned int order, bool allow_spin)
+{
+	struct bpf_arena *arena = arena_p;
+	long ret_user_va;
+	struct page *page;
+	struct slab *slab;
+	u32 uaddr32;
+
+	if (order)
+		return NULL;
+
+	/*
+	 * Propagate allow_spin to the arena page allocator; non-sleeping
+	 * contexts (BPF NMI/irq-off) take the best-effort path. set_page_slab
+	 * = true makes apply_range_set_cb() tag the page under arena->spinlock
+	 * so concurrent bpf_arena_free_pages() can't free it before slub takes
+	 * ownership.
+	 */
+	ret_user_va = arena_alloc_pages(arena, 0, 1, node, allow_spin, true, &page);
+	if (!ret_user_va)
+		return NULL;
+
+	uaddr32 = (u32)ret_user_va;
+	/* PageSlab was set in apply_range_set_cb() under arena->spinlock. */
+	slab = page_slab(page);
+	/*
+	 * Stash this slab page's arena offset in slab->stride. allocate_slab()
+	 * skips alloc_slab_obj_exts_early() for SLAB_BPF_ARENA, so this value
+	 * survives until __free_slab().
+	 */
+	slab_set_stride(slab, uaddr32);
+	WRITE_ONCE(arena->slab_pages[uaddr32 >> PAGE_SHIFT], page);
+
+	return slab;
+}
+
+static u32 arena_slab_uaddr32(const struct slab *slab)
+{
+	return slab_get_stride((struct slab *)slab);
+}
+
+static void arena_free_slab_page(void *arena_p, struct slab *slab,
+				 unsigned int order)
+{
+	struct bpf_arena *arena = arena_p;
+	u32 uaddr32 = arena_slab_uaddr32(slab);
+
+	WRITE_ONCE(arena->slab_pages[uaddr32 >> PAGE_SHIFT], NULL);
+	arena_free_pages(arena, uaddr32, 1, false);
+}
+
+static int arena_init_slab_caches(struct bpf_arena *arena)
+{
+	char name[KSYM_NAME_LEN];
+	unsigned int i;
+
+	arena->slab_hook = (struct kmem_cache_bpf_arena){
+		.arena		 = arena,
+		.alloc_slab_page = arena_alloc_slab_page,
+		.free_slab_page	 = arena_free_slab_page,
+	};
+
+	for (i = ARENA_KMALLOC_MIN_SHIFT; i < ARENA_KMALLOC_NUM_BUCKETS; i++) {
+		struct kmem_cache *c;
+		struct kmem_cache_args args = {
+			.align		= sizeof(void *),
+			.bpf_arena	= &arena->slab_hook,
+		};
+
+		snprintf(name, sizeof(name), "arena-%lx-%u",
+			 (unsigned long)arena, 1U << i);
+		c = kmem_cache_create(name, 1U << i, &args, SLAB_BPF_ARENA);
+		if (!c)
+			goto err;
+		arena->kmalloc_caches[i] = c;
+	}
+	return 0;
+err:
+	arena_destroy_slab_caches(arena);
+	return -ENOMEM;
+}
+
+static void arena_destroy_slab_caches(struct bpf_arena *arena)
+{
+	long max = arena->map.max_entries;
+	unsigned int i;
+	long pgoff;
+
+	/*
+	 * Force-discard every slab page we ever handed to slub. slab_pages[]
+	 * is the authoritative tracker of arena slab pages, including:
+	 *   - orphans not on any partial list (spin_trylock failures in
+	 *     __slab_free() left them off the list while still counted in
+	 *     n->nr_slabs),
+	 *   - slabs with live objects (BPF program leaked allocations).
+	 * Without this pass kmem_cache_destroy() would walk only n->partial,
+	 * miss those slabs, see n->nr_slabs > 0, return error, WARN, and leak
+	 * the kmem_cache descriptor.
+	 *
+	 * kmem_cache_force_discard_slab() removes the slab from n->partial
+	 * if it's there and then discard_slab()s it. discard_slab() routes
+	 * through __free_slab() -> arena_free_slab_page() -> arena_free_pages()
+	 */
+	for (pgoff = 0; pgoff < max; pgoff++) {
+		struct page *page = arena->slab_pages[pgoff];
+		struct slab *slab;
+
+		if (!page)
+			continue;
+		slab = page_slab(page);
+		kmem_cache_force_discard_slab(slab->slab_cache, slab);
+	}
+
+	/* Let deferred page frees from the discard pass run before teardown. */
+	irq_work_sync(&arena->free_irq);
+	flush_work(&arena->free_work);
+
+	for (i = 0; i < ARENA_KMALLOC_NUM_BUCKETS; i++) {
+		if (!arena->kmalloc_caches[i])
+			continue;
+		kmem_cache_destroy(arena->kmalloc_caches[i]);
+		arena->kmalloc_caches[i] = NULL;
+	}
+}
+
 __bpf_kfunc_start_defs();
 
 __bpf_kfunc void *bpf_arena_alloc_pages(void *p__map, void *addr__ign, u32 page_cnt,
@@ -963,7 +1188,8 @@ __bpf_kfunc void *bpf_arena_alloc_pages(void *p__map, void *addr__ign, u32 page_
 	if (map->map_type != BPF_MAP_TYPE_ARENA || flags || !page_cnt)
 		return NULL;
 
-	return (void *)arena_alloc_pages(arena, (long)addr__ign, page_cnt, node_id, true);
+	return (void *)arena_alloc_pages(arena, (long)addr__ign, page_cnt, node_id,
+					 true, false, NULL);
 }
 
 void *bpf_arena_alloc_pages_non_sleepable(void *p__map, void *addr__ign, u32 page_cnt,
@@ -975,7 +1201,8 @@ void *bpf_arena_alloc_pages_non_sleepable(void *p__map, void *addr__ign, u32 pag
 	if (map->map_type != BPF_MAP_TYPE_ARENA || flags || !page_cnt)
 		return NULL;
 
-	return (void *)arena_alloc_pages(arena, (long)addr__ign, page_cnt, node_id, false);
+	return (void *)arena_alloc_pages(arena, (long)addr__ign, page_cnt, node_id,
+					 false, false, NULL);
 }
 
 void *bpf_arena_alloc_pages_sleepable(void *p__map, void *addr__ign, u32 page_cnt,
@@ -987,7 +1214,8 @@ void *bpf_arena_alloc_pages_sleepable(void *p__map, void *addr__ign, u32 page_cn
 	if (map->map_type != BPF_MAP_TYPE_ARENA || flags || !page_cnt)
 		return NULL;
 
-	return (void *)arena_alloc_pages(arena, (long)addr__ign, page_cnt, node_id, true);
+	return (void *)arena_alloc_pages(arena, (long)addr__ign, page_cnt, node_id,
+					 true, false, NULL);
 }
 
 __bpf_kfunc void bpf_arena_free_pages(void *p__map, void *ptr__ign, u32 page_cnt)
@@ -1023,12 +1251,98 @@ __bpf_kfunc int bpf_arena_reserve_pages(void *p__map, void *ptr__ign, u32 page_c
 
 	return arena_reserve_pages(arena, (long)ptr__ign, page_cnt);
 }
+
+/*
+ * bpf_arena_alloc: allocate one object of @size bytes from the arena's
+ * slab buckets. Returns a value whose low 32 bits are the arena offset;
+ * BPF programs use it as a void __arena *. Slub gives us a direct-map kva;
+ * its slab page carries the arena uaddr32 in slab->stride.
+ */
+__bpf_kfunc void *bpf_arena_alloc(void *p__map, u32 size)
+{
+	struct bpf_map *map = p__map;
+	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+	struct kmem_cache *c;
+	struct slab *slab;
+	unsigned int idx;
+	void *kva;
+	u32 uaddr32;
+
+	if (map->map_type != BPF_MAP_TYPE_ARENA || !size)
+		return NULL;
+	if (size > (1U << ARENA_KMALLOC_MAX_SHIFT))
+		return NULL;
+
+	idx = max_t(unsigned int, fls(size - 1), ARENA_KMALLOC_MIN_SHIFT);
+	if (idx >= ARENA_KMALLOC_NUM_BUCKETS)
+		return NULL;
+	c = arena->kmalloc_caches[idx];
+	if (!c)
+		return NULL;
+
+	/*
+	 * Use the nolock variant so this kfunc is safe from any BPF context
+	 * (incl. NMI/irq-off), mirroring kmalloc_nolock(). Skip __GFP_ACCOUNT
+	 * because memcg charging already happens at the arena page level
+	 * (bpf_map_memcg_enter in arena_alloc_pages).
+	 */
+	kva = kmem_cache_alloc_nolock(c, 0, NUMA_NO_NODE);
+	if (!kva)
+		return NULL;
+
+	slab = virt_to_slab(kva);
+	if (!slab || slab->slab_cache != c) {
+		bpf_prog_report_arena_violation(true, (long)kva, _RET_IP_);
+		return NULL;
+	}
+	uaddr32 = arena_slab_uaddr32(slab) |
+		  ((u32)(unsigned long)kva & ~PAGE_MASK);
+	return (void *)(clear_lo32(arena->user_vm_start) + uaddr32);
+}
+
+/*
+ * bpf_arena_free: free an object previously returned by bpf_arena_alloc.
+ * The arena offset's high bits identify the slab page; slab->slab_cache's
+ * bpf_arena hook confirms it belongs to this arena. The kva handed to
+ * kfree_nolock is direct-map, so its virt_to_slab works normally.
+ */
+__bpf_kfunc void bpf_arena_free(void *p__map, void *ptr__ign)
+{
+	struct bpf_map *map = p__map;
+	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+	struct page *page;
+	struct slab *slab;
+	u32 arena_off, pgoff;
+	void *kva;
+
+	if (map->map_type != BPF_MAP_TYPE_ARENA || !ptr__ign)
+		return;
+
+	arena_off = (u32)(unsigned long)ptr__ign;
+	pgoff = arena_off >> PAGE_SHIFT;
+	if (pgoff >= arena->map.max_entries)
+		goto violation;
+	page = READ_ONCE(arena->slab_pages[pgoff]);
+	if (!page)
+		goto violation;
+	slab = page_slab(page);
+	if (slab->slab_cache->bpf_arena != &arena->slab_hook)
+		goto violation;
+	kva = page_to_virt(page) + (arena_off & ~PAGE_MASK);
+	/* nolock free mirrors the nolock alloc — safe from any context. */
+	kfree_nolock(kva);
+	return;
+violation:
+	bpf_prog_report_arena_violation(true, arena_off, _RET_IP_);
+}
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(arena_kfuncs)
 BTF_ID_FLAGS(func, bpf_arena_alloc_pages, KF_ARENA_RET | KF_ARENA_ARG2)
 BTF_ID_FLAGS(func, bpf_arena_free_pages, KF_ARENA_ARG2)
 BTF_ID_FLAGS(func, bpf_arena_reserve_pages, KF_ARENA_ARG2)
+BTF_ID_FLAGS(func, bpf_arena_alloc, KF_ARENA_RET)
+BTF_ID_FLAGS(func, bpf_arena_free, KF_ARENA_ARG2)
 BTF_KFUNCS_END(arena_kfuncs)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {

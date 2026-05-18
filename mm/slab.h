@@ -193,6 +193,20 @@ struct kmem_cache_per_node_ptrs {
 };
 
 /*
+ * Hook bundle for SLAB_BPF_ARENA caches. Slub keeps using direct-map VAs
+ * internally; the hook only routes slab page alloc/free into the arena so
+ * the slab's backing pages live in the arena's vmalloc window (and are thus
+ * also visible to BPF programs via the arena's 32-bit addressing).
+ */
+struct kmem_cache_bpf_arena {
+	void *arena;
+	struct slab *(*alloc_slab_page)(void *arena, gfp_t flags, int node,
+					unsigned int order, bool allow_spin);
+	void (*free_slab_page)(void *arena, struct slab *slab,
+			       unsigned int order);
+};
+
+/*
  * Slab cache management.
  */
 struct kmem_cache {
@@ -247,6 +261,9 @@ struct kmem_cache {
 #ifdef CONFIG_SLUB_STATS
 	struct kmem_cache_stats __percpu *cpu_stats;
 #endif
+
+	/* NULL unless SLAB_BPF_ARENA */
+	const struct kmem_cache_bpf_arena *bpf_arena;
 
 	struct kmem_cache_per_node_ptrs per_node[MAX_NUMNODES];
 };
@@ -414,7 +431,8 @@ void flush_rcu_sheaves_on_cache(struct kmem_cache *s);
 			 SLAB_TYPESAFE_BY_RCU | SLAB_DEBUG_OBJECTS | \
 			 SLAB_NOLEAKTRACE | SLAB_RECLAIM_ACCOUNT | \
 			 SLAB_TEMPORARY | SLAB_ACCOUNT | \
-			 SLAB_NO_USER_FLAGS | SLAB_KMALLOC | SLAB_NO_MERGE)
+			 SLAB_NO_USER_FLAGS | SLAB_KMALLOC | SLAB_NO_MERGE | \
+			 SLAB_BPF_ARENA)
 
 #define SLAB_DEBUG_FLAGS (SLAB_RED_ZONE | SLAB_POISON | SLAB_STORE_USER | \
 			  SLAB_TRACE | SLAB_CONSISTENCY_CHECKS)
