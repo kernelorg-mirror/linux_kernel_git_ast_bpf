@@ -668,6 +668,12 @@ struct bpf_func_state {
 #define BPF_ID_MAP_SIZE ((MAX_BPF_REG + MAX_BPF_STACK_SLOTS + MAX_STACK_ARG_SLOTS) * \
 			 MAX_CALL_FRAMES)
 
+/* see 'unwound' of struct bpf_verifier_state */
+enum {
+	BPF_UNWOUND = 1,
+	BPF_UNWOUND_CB,
+};
+
 struct bpf_verifier_state {
 	/* call stack tracking */
 	struct bpf_func_state *frame[MAX_CALL_FRAMES];
@@ -689,8 +695,10 @@ struct bpf_verifier_state {
 	/*
 	 * The callee left with unwind_exit. Next insn is unwind_goto, or the verifier adds it
 	 * before that insn, see check_unwound_arrival().
+	 * BPF_UNWOUND_CB: the callee is a callback. Next insn is the call of the helper or the kfunc
+	 * that called it, once more, see prepare_func_exit().
 	 */
-	bool unwound;
+	u8 unwound;
 	/*
 	 * A function that is verified on its own changed packet data. Its callers
 	 * and their packet pointers are not in the state, see bpf_flow_return().
