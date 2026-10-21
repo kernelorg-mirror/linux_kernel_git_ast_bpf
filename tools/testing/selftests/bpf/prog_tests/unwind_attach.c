@@ -54,6 +54,10 @@ static void attach(int tgt_fd, const char *func, const char *name, const char *m
 		goto out;
 
 	link = bpf_program__attach(prog);
+	if (retval < 0) {
+		ASSERT_ERR_PTR(link, "attach");
+		goto out;
+	}
 	if (!ASSERT_OK_PTR(link, "attach"))
 		goto out;
 	ASSERT_EQ(run(tgt_fd), retval, "retval");
@@ -152,6 +156,9 @@ void test_unwind_attach(void)
 				   &throws_fd, sizeof(throws_fd), 0);
 	if (ASSERT_OK(err, "prog_array"))
 		ASSERT_EQ(run(tail_fd), 7, "retval");
+
+	/* A helper with a pad is notrace: nothing may put a return address of its own in its frame */
+	attach(0, "bpf_loop", "fexit_unwind", NULL, -1 /* cannot be attached */);
 out:
 	verifier_unwind__destroy(tgt);
 }
