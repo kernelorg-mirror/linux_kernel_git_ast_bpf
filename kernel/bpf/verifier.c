@@ -3332,8 +3332,12 @@ static int check_subprogs(struct bpf_verifier_env *env)
 
 		if (BPF_CLASS(code) != BPF_JMP && BPF_CLASS(code) != BPF_JMP32)
 			goto next;
-		if (BPF_OP(code) == BPF_CALL)
+		if (BPF_OP(code) == BPF_CALL) {
+			/* it leaves the subprog like an exit */
+			if (bpf_is_throw_kfunc(&insn[i]) && subprog[cur_subprog].exit_idx == U32_MAX)
+				subprog[cur_subprog].exit_idx = i;
 			goto next;
+		}
 		if (BPF_OP(code) == BPF_EXIT) {
 			subprog[cur_subprog].exit_idx = i;
 			goto next;

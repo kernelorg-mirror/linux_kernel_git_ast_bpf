@@ -129,6 +129,7 @@ __noinline static int subprog_lock(struct __sk_buff *ctx)
 	bpf_spin_lock(&lock);
 	if (ctx->len)
 		bpf_throw(0);
+	bpf_spin_unlock(&lock);
 	return ret;
 }
 
