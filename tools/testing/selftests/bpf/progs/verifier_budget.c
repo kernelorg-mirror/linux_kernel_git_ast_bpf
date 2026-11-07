@@ -65,6 +65,7 @@ extern struct file *bpf_get_task_exe_file(struct task_struct *task) __ksym;
 extern void bpf_put_file(struct file *file) __ksym;
 extern int bpf_dynptr_from_file(struct file *file, __u32 flags, struct bpf_dynptr *ptr) __ksym;
 extern int bpf_dynptr_file_discard(struct bpf_dynptr *ptr) __ksym;
+extern void bpf_throw(__u64 cookie) __ksym;
 
 extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
 extern int *bpf_iter_num_next(struct bpf_iter_num *it) __ksym;
@@ -151,6 +152,19 @@ __naked void loop_in_main_retval(void)
 		: __imm_addr(zero)
 		: __clobber_all
 	);
+}
+
+/* The prog has no exit insn. Out of budget it is unwound all the same. */
+SEC("tc")
+__description("budget: a loop that is left only through bpf_throw()")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+int loop_left_through_throw(struct __sk_buff *skb)
+{
+	for (;;)
+		if (!*(volatile unsigned long *)&one)
+			bpf_throw(3);
 }
 
 /* 0 lets the operation go on */
