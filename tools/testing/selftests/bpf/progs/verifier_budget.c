@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 #include "../../../include/linux/filter.h"
 #include "bpf_misc.h"
 
@@ -39,6 +40,31 @@ struct bpf_res_spin_lock {
 extern int bpf_res_spin_lock_irqsave(struct bpf_res_spin_lock *lock, unsigned long *flags) __ksym;
 extern void bpf_res_spin_unlock_irqrestore(struct bpf_res_spin_lock *lock,
 					   unsigned long *flags) __ksym;
+
+struct task_struct {};
+extern struct task_struct *bpf_task_from_pid(int pid) __ksym;
+extern struct task_struct *bpf_task_acquire(struct task_struct *p) __ksym;
+extern void bpf_task_release(struct task_struct *p) __ksym;
+struct cgroup {};
+extern void bpf_cgroup_release(struct cgroup *cgrp) __ksym;
+extern void *bpf_obj_new_impl(__u64 local_type_id, void *meta) __ksym;
+extern void bpf_obj_drop_impl(void *kptr, void *meta) __ksym;
+extern int bpf_list_push_front_impl(struct bpf_list_head *head, struct bpf_list_node *node,
+				    void *meta, __u64 off) __ksym;
+extern struct bpf_list_node *bpf_list_pop_front(struct bpf_list_head *head) __ksym;
+struct bpf_iter_task {
+	__u64 opaque[3];
+};
+
+extern int bpf_iter_task_new(struct bpf_iter_task *it, struct task_struct *task,
+			     unsigned int flags) __ksym;
+extern void bpf_iter_task_destroy(struct bpf_iter_task *it) __ksym;
+extern int bpf_dynptr_clone(const struct bpf_dynptr *ptr, struct bpf_dynptr *clone) __ksym;
+struct file {};
+extern struct file *bpf_get_task_exe_file(struct task_struct *task) __ksym;
+extern void bpf_put_file(struct file *file) __ksym;
+extern int bpf_dynptr_from_file(struct file *file, __u32 flags, struct bpf_dynptr *ptr) __ksym;
+extern int bpf_dynptr_file_discard(struct bpf_dynptr *ptr) __ksym;
 
 extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
 extern int *bpf_iter_num_next(struct bpf_iter_num *it) __ksym;
@@ -396,6 +422,636 @@ __naked void far_from_the_pad(void)
 		: __imm_addr(zero),
 		  __imm(bpf_rcu_read_lock),
 		  __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096);
+} ringbuf SEC(".maps");
+
+/* @reg = a task, which has to be released */
+#define ACQUIRE_TASK(reg)				\
+		"r1 = 1;"				\
+		"call %[bpf_task_from_pid];"		\
+		"if r0 != 0 goto +1;"			\
+		"exit;"					\
+		#reg " = r0;"
+
+#define SPIN						\
+		"r2 = %[one] ll;"			\
+	"1:"						\
+		"r1 = *(u64 *)(r2 + 0);"		\
+		"if r1 != 0 goto 1b;"
+
+/*
+ * r1: a lock. r9 and r6, which is dead at the jump, point 8 bytes behind it. r2: where its irq flags
+ * go, in the stack of the caller. A stack slot points into the record.
+ */
+__naked __noinline __used
+static unsigned long spins_with_resources(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = r2;"
+		"r9 = r1;"
+		"r9 += 8;"
+		"r1 = %[ringbuf] ll;"
+		"r2 = 16;"
+		"r3 = 0;"
+		"call %[bpf_ringbuf_reserve];"
+		"if r0 != 0 goto +1;"
+		"exit;"
+		"r0 += 8;"
+		"*(u64 *)(r10 - 8) = r0;"
+		"call %[bpf_rcu_read_lock];"
+	IRQ_FLAGS(-16, %[bpf_local_irq_save])
+		"r1 = r6;"
+		"r2 = r7;"
+		"call %[bpf_res_spin_lock_irqsave];"
+		"if r0 != 0 goto 2f;"
+		"r2 = %[one] ll;"
+	"1:"
+		"r6 = r9;"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r1 = r9;"
+		"r1 += -8;"
+		"r2 = r7;"
+		"call %[bpf_res_spin_unlock_irqrestore];"
+	"2:"
+	IRQ_FLAGS(-16, %[bpf_local_irq_restore])
+		"call %[bpf_rcu_read_unlock];"
+		"r1 = *(u64 *)(r10 - 8);"
+		"r1 += -8;"
+		"r2 = 0;"
+		"call %[bpf_ringbuf_discard];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(ringbuf), __imm_addr(one),
+		  __imm(bpf_ringbuf_reserve), __imm(bpf_ringbuf_discard),
+		  __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock),
+		  __imm(bpf_local_irq_save), __imm(bpf_local_irq_restore),
+		  __imm(bpf_res_spin_lock_irqsave), __imm(bpf_res_spin_unlock_irqrestore)
+		: __clobber_all
+	);
+}
+
+/* Each frame releases its own: locks and irq flags, youngest first, sections, pointers if not NULL */
+SEC("tc")
+__description("budget: the subprog with the loop and its caller hold resources")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("unwind_goto pc+")
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("r1 = r9")
+__xlated("r1 += -8")
+__xlated("r2 = r7")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("call kernel-function")
+__xlated("call kernel-function")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("r1 += -8")
+__xlated("r2 = 0")
+__xlated("call unknown")
+__xlated("r0 = 0")
+__xlated("unwind_exit")
+__naked void resources_in_two_frames(void)
+{
+	asm volatile (
+	LOOKUP(res_locked)
+		"r7 = r6;"
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"r6 = r0;"
+		"call %[bpf_preempt_disable];"
+		"r1 = r7;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call spins_with_resources;"
+		"call %[bpf_preempt_enable];"
+		"if r6 == 0 goto +2;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(res_locked), __imm(bpf_map_lookup_elem),
+		  __imm(bpf_task_from_pid), __imm(bpf_task_release),
+		  __imm(bpf_preempt_disable), __imm(bpf_preempt_enable)
+		: __clobber_all
+	);
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct { struct task_struct __kptr *task; });
+} tasks SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct { struct cgroup __kptr *cgrp; });
+} cgroups SEC(".maps");
+
+/* One insn takes a task or a cgroup out of a map. A landing pad has one call for what it finds. */
+SEC("tc")
+__description("budget: a task or a cgroup from one insn in the same register")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: a resource is held on some paths only")
+int two_releases_for_one_place(void *ctx)
+{
+	unsigned long is_task = zero;
+	int key = 0;
+	void *p;
+
+	p = bpf_map_lookup_elem(is_task ? (void *)&tasks : (void *)&cgroups, &key);
+	if (!p)
+		return 0;
+	p = bpf_kptr_xchg(p, NULL);
+	if (!p)
+		return 0;
+	while (*(volatile unsigned long *)&one)
+		;
+	if (is_task)
+		bpf_task_release(p);
+	else
+		bpf_cgroup_release(p);
+	return 7;
+}
+
+/*
+ * The caller has the irq flags of the lock. The only pointer to them is in r1, where the lock has
+ * to go. The frame has irq flags of its own too.
+ */
+__naked __noinline __used
+static unsigned long locks_and_spins_with_flags_in_r1(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r7 = r2;"
+	IRQ_FLAGS(-8, %[bpf_local_irq_save])
+		"r1 = r6;"
+		"r2 = r7;"
+		"call %[bpf_res_spin_lock_irqsave];"
+		"if r0 != 0 goto 2f;"
+		"r1 = r7;"
+		"r2 = %[one] ll;"
+	"1:"
+		"r3 = *(u64 *)(r2 + 0);"
+		"if r3 != 0 goto 1b;"
+		"r2 = r1;"
+		"r1 = r6;"
+		"call %[bpf_res_spin_unlock_irqrestore];"
+	"2:"
+	IRQ_FLAGS(-8, %[bpf_local_irq_restore])
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one),
+		  __imm(bpf_local_irq_save),
+		  __imm(bpf_local_irq_restore),
+		  __imm(bpf_res_spin_lock_irqsave),
+		  __imm(bpf_res_spin_unlock_irqrestore)
+		: __clobber_all
+	);
+}
+
+SEC("tc")
+__description("budget: the second argument of a release is in r1 only")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: a handle is in R0-R5 only")
+__naked void second_argument_in_r1(void)
+{
+	asm volatile (
+	LOOKUP(res_locked)
+		"r1 = r6;"
+		"r2 = r10;"
+		"r2 += -16;"
+		"call locks_and_spins_with_flags_in_r1;"
+		"exit;"
+		:
+		: __imm_addr(res_locked),
+		  __imm(bpf_map_lookup_elem)
+		: __clobber_all
+	);
+}
+
+SEC("socket")
+__description("budget: a task is held, the type of the prog has no bpf_task_release()")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the program can call nothing that releases a resource")
+int task_without_release(void *ctx)
+{
+	unsigned long x = bpf_get_prandom_u32() & 1;
+	int key = 0;
+	void *p;
+
+	p = bpf_map_lookup_elem(&tasks, &key);
+	if (!p)
+		return 0;
+	p = bpf_kptr_xchg(p, NULL);
+	if (!p)
+		return 0;
+	while (x < 2)
+		asm volatile ("" : "+r"(x));
+	return (long)p;
+}
+
+struct with_lock_and_more {
+	struct bpf_spin_lock lock;
+	long a, b;
+};
+
+struct with_lock {
+	struct bpf_spin_lock lock;
+	long a;
+};
+
+#define SPIN_WITH_OBJECT(type) ({					\
+	type *o = bpf_obj_new_impl(bpf_core_type_id_local(type), NULL);	\
+	if (!o)								\
+		return 1;						\
+	while (*(volatile unsigned long *)&one)				\
+		bpf_get_prandom_u32();					\
+	bpf_obj_drop_impl(o, NULL);					\
+})
+
+/* Two pads. They differ in the type only, which the verifier adds as the second argument. */
+SEC("tc")
+__description("budget: objects of two types in the same register")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("r0 = 0{{$}}")
+__xlated("exit")
+__xlated("r1 = r{{[6-9]}}")
+__xlated("r2 = 0x{{[0-9a-f]*[1-9a-f][0-9a-f]*}}")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+int objects_of_two_types(void *ctx)
+{
+	if (*(volatile unsigned long *)&zero)
+		SPIN_WITH_OBJECT(struct with_lock_and_more);
+	else
+		SPIN_WITH_OBJECT(struct with_lock);
+	return 7;
+}
+
+struct with_task {
+	struct task_struct __kptr *task;
+};
+
+/* bpf_obj_drop() of this type is refused to a tracing prog, so no landing pad calls it */
+SEC("raw_tp")
+__description("budget: a tracing prog holds an object with a field that is not NMI safe")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the program can call nothing that releases a resource")
+int object_of_tracing_prog(void *ctx)
+{
+	struct with_task *o = bpf_obj_new_impl(bpf_core_type_id_local(struct with_task), NULL);
+	unsigned long x = bpf_get_prandom_u32() & 1;
+
+	if (!o)
+		return 0;
+	while (x < 2)
+		asm volatile ("" : "+r"(x));
+	return (long)o;
+}
+
+struct in_list {
+	struct bpf_list_node node;
+	long a;
+} *in_list __hidden; /* brings the type to BTF */
+
+struct bpf_spin_lock list_lock SEC(".data.list") __hidden;
+struct bpf_list_head list_head SEC(".data.list") __hidden
+	__attribute__((btf_decl_tag("contains:in_list:node")));
+
+struct list_in_list {
+	struct bpf_list_node node;
+	struct bpf_spin_lock lock;
+	struct bpf_list_head head __attribute__((btf_decl_tag("contains:in_list:node")));
+};
+
+struct bpf_spin_lock outer_lock SEC(".data.outer") __hidden;
+struct bpf_list_head outer_head SEC(".data.outer") __hidden
+	__attribute__((btf_decl_tag("contains:list_in_list:node")));
+
+static __noinline int pops_a_list_and_spins(void)
+{
+	struct bpf_list_node *n = bpf_list_pop_front(&outer_head);
+
+	if (!n)
+		return 1;
+	while (*(volatile unsigned long *)&one)
+		asm volatile ("" ::: "r0", "r1", "r2", "r3", "r4", "r5");
+	bpf_list_push_front_impl(&outer_head, n, NULL, 0);
+	return 7;
+}
+
+/*
+ * To free this object takes the lock in it, and all bpf_spin_locks of a cpu keep the irq flags in
+ * one word: no landing pad does that under the lock of the caller.
+ */
+SEC("tc")
+__description("budget: an object with a list is held under the lock of the caller")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the program can call nothing that releases a resource")
+int list_under_lock_of_caller(void *ctx)
+{
+	struct list_in_list *o;
+	int ret;
+
+	o = bpf_obj_new_impl(bpf_core_type_id_local(struct list_in_list), NULL);
+	if (!o)
+		return 1;
+	bpf_spin_lock(&outer_lock);
+	bpf_list_push_front_impl(&outer_head, &o->node, NULL, 0);
+	ret = pops_a_list_and_spins();
+	bpf_spin_unlock(&outer_lock);
+	return ret;
+}
+
+/* It owns the node that the caller points to */
+static __noinline __used int pops_and_spins(void)
+{
+	struct bpf_list_node *n = bpf_list_pop_front(&list_head);
+
+	if (!n)
+		return 1;
+	while (*(volatile unsigned long *)&one)
+		asm volatile ("" ::: "r0", "r1", "r2", "r3", "r4", "r5");
+	bpf_list_push_front_impl(&list_head, n, NULL, 0);
+	return 7;
+}
+
+/* The landing pad of the prog runs after that of the subprog, which frees the node */
+SEC("tc")
+__description("budget: the landing pad frees a node under the lock of the caller, who points to it")
+__arch_x86_64
+__arch_arm64
+__failure __msg("R6 invalid mem access 'scalar'")
+__naked void node_of_caller_under_lock(void)
+{
+	asm volatile (
+		"r1 = %[list_lock] ll;"
+		"call %[bpf_spin_lock];"
+		"r1 = %[list_head] ll;"
+		"call %[bpf_list_pop_front];"
+		"r6 = r0;"
+		"if r6 == 0 goto 1f;"
+		"r1 = %[list_head] ll;"
+		"r2 = r6;"
+		"r3 = 0;"
+		"r4 = 0;"
+		"call %[bpf_list_push_front_impl];"
+		"call pops_and_spins;"
+		unwind_goto(5)
+	"1:"
+		"r1 = %[list_lock] ll;"
+		"call %[bpf_spin_unlock];"
+		"r0 = 0;"
+		"exit;"
+		"r7 = *(u64 *)(r6 + 24);"
+		"goto 1b;"
+		:
+		: __imm_addr(list_lock), __imm_addr(list_head),
+		  __imm(bpf_spin_lock), __imm(bpf_spin_unlock),
+		  __imm(bpf_list_pop_front), __imm(bpf_list_push_front_impl),
+		  __imm_unwind_goto(5)
+		: __clobber_all
+	);
+}
+
+/* In its RCU section it gives a task out of the map to the caller */
+static __noinline __used int enters_section_and_spins(struct task_struct * volatile *p)
+{
+	struct with_task *v;
+	int key = 0;
+
+	v = bpf_map_lookup_elem(&tasks, &key);
+	if (!v)
+		return 0;
+	bpf_rcu_read_lock();
+	*p = v->task;
+	while (*(volatile unsigned long *)&one)
+		;
+	*p = NULL;
+	bpf_rcu_read_unlock();
+	return 7;
+}
+
+/* The landing pad of the prog runs after that of the subprog, which leaves the section */
+SEC("syscall")
+__description("budget: the landing pad leaves the section, the caller has an RCU pointer")
+__arch_x86_64
+__arch_arm64
+__failure __msg("R1 must be a rcu pointer")
+__naked void pointer_of_caller_under_rcu(void)
+{
+	asm volatile (
+		"r1 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"r1 = r10;"
+		"r1 += -8;"
+		"call enters_section_and_spins;"
+		unwind_goto(2)
+		"r0 = 0;"
+		"exit;"
+		"r1 = *(u64 *)(r10 - 8);"
+		"if r1 == 0 goto +1;"
+		"call %[bpf_task_acquire];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm(bpf_task_acquire),
+		  __imm_unwind_goto(2)
+		: __clobber_all
+	);
+}
+
+/*
+ * The iterator is destroyed first: the irq flags, which are younger, would do to protect it. The
+ * record is discarded after the RCU section.
+ */
+SEC("tc")
+__description("budget: an iterator in an RCU section, irq flags and a dynptr are held")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("r1 = r10")
+__xlated("r1 += -56")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -64")
+__xlated("call kernel-function")
+__xlated("call kernel-function")
+__xlated("r1 = r10")
+__xlated("r1 += -16")
+__xlated("r2 = 0")
+__xlated("call unknown")
+__xlated("r0 = 0")
+__xlated("exit")
+__naked void objects_in_the_stack(void)
+{
+	asm volatile (
+		"r1 = %[ringbuf] ll;"
+		"r2 = 8;"
+		"r3 = 0;"
+		"r4 = r10;"
+		"r4 += -16;"
+		"call %[bpf_ringbuf_reserve_dynptr];"
+		"call %[bpf_rcu_read_lock];"
+		"r1 = r10;"
+		"r1 += -56;"
+		"r2 = 0;"
+		"r3 = 0;"
+		"call %[bpf_iter_task_new];"
+	IRQ_FLAGS(-64, %[bpf_local_irq_save])
+	SPIN
+	IRQ_FLAGS(-64, %[bpf_local_irq_restore])
+		"r1 = r10;"
+		"r1 += -56;"
+		"call %[bpf_iter_task_destroy];"
+		"call %[bpf_rcu_read_unlock];"
+		"r1 = r10;"
+		"r1 += -16;"
+		"r2 = 0;"
+		"call %[bpf_ringbuf_discard_dynptr];"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(ringbuf), __imm_addr(one),
+		  __imm(bpf_ringbuf_reserve_dynptr), __imm(bpf_ringbuf_discard_dynptr),
+		  __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock),
+		  __imm(bpf_local_irq_save), __imm(bpf_local_irq_restore),
+		  __imm(bpf_iter_task_new), __imm(bpf_iter_task_destroy)
+		: __clobber_all
+	);
+}
+
+/* Nothing can destroy it any more, no landing pad either. The main pass finds no other way out. */
+SEC("syscall")
+__description("budget: an iterator is held, its RCU section is over")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: no place has the handle on all paths")
+int iterator_out_of_rcu_section(void *ctx)
+{
+	unsigned long x = bpf_get_prandom_u32() & 1;
+	struct bpf_iter_task it;
+
+	bpf_rcu_read_lock();
+	bpf_iter_task_new(&it, NULL, 0);
+	bpf_rcu_read_unlock();
+	while (x < 2)
+		asm volatile ("" : "+r"(x));
+	return 0;
+}
+
+/*
+ * The dynptr is made from the file that is held and has to be discarded first, or it is older than
+ * that file. The landing pad has one order.
+ */
+SEC("lsm.s/file_open")
+__description("budget: a dynptr is made from the file that is held on some paths")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the order of the releases differs")
+int dynptr_and_file_in_two_orders(__u64 *ctx)
+{
+	struct file *f, *opened = (struct file *)ctx[0];
+	struct bpf_dynptr d;
+
+	if (*(volatile unsigned long *)&zero) {
+		f = bpf_get_task_exe_file(bpf_get_current_task_btf());
+		if (!f)
+			return 0;
+		bpf_dynptr_from_file(f, 0, &d);
+	} else {
+		bpf_dynptr_from_file(opened, 0, &d);
+		f = bpf_get_task_exe_file(bpf_get_current_task_btf());
+		if (!f)
+			goto out;
+	}
+	while (*(volatile unsigned long *)&one)
+		;
+	bpf_dynptr_file_discard(&d);
+	bpf_put_file(f);
+	return 0;
+out:
+	bpf_dynptr_file_discard(&d);
+	return 0;
+}
+
+/*
+ * The main pass does not get to the fill after the loop, so nothing but a landing pad would read
+ * fp-8 of the longer pattern, and its store would go.
+ */
+SEC("syscall")
+__description("budget: a reference is in the slot of a bpf_fastcall spill only")
+__arch_x86_64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: no place has the handle on all paths")
+__naked void reference_in_fastcall_spill(void)
+{
+	asm volatile (
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"if r0 == 0 goto 2f;"
+		"r1 = r0;"
+		"r2 = 0;"
+		"*(u64 *)(r10 - 8) = r1;"
+		"*(u64 *)(r10 - 16) = r2;"
+		"call %[bpf_get_smp_processor_id];"
+		"r2 = *(u64 *)(r10 - 16);"
+		"r1 = *(u64 *)(r10 - 8);"
+		"*(u64 *)(r10 - 16) = r2;"
+		"call %[bpf_get_smp_processor_id];"
+		"r2 = *(u64 *)(r10 - 16);"
+		"r2 = %[one] ll;"
+	"1:"
+		"r3 = *(u64 *)(r2 + 0);"
+		"r3 |= 1;"
+		"if r3 != 0 goto 1b;"
+		"r1 = *(u64 *)(r10 - 8);"
+		"call %[bpf_task_release];"
+	"2:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one), __imm(bpf_task_from_pid), __imm(bpf_task_release),
+		  __imm(bpf_get_smp_processor_id)
 		: __clobber_all
 	);
 }
@@ -1679,6 +2335,14 @@ void __kfunc_btf_root(void)
 	bpf_local_irq_restore(0);
 	bpf_res_spin_lock_irqsave(0, 0);
 	bpf_res_spin_unlock_irqrestore(0, 0);
+	bpf_task_from_pid(0);
+	bpf_task_acquire(0);
+	bpf_task_release(0);
+	bpf_cgroup_release(0);
+	bpf_list_pop_front(0);
+	bpf_iter_task_new(0, 0, 0);
+	bpf_iter_task_destroy(0);
+	bpf_dynptr_clone(0, 0);
 	bpf_iter_num_new(0, 0, 0);
 	bpf_iter_num_next(0);
 	bpf_iter_num_destroy(0);
