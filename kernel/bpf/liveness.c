@@ -2919,6 +2919,7 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 		u32 in = state[i].in;
 
 		insn_aux[i].live_regs_before = mask_lo(in) | mask_hi(in);
+		insn_aux[i].live_hi32_before = mask_hi(in);
 		/*
 		 * On architectures where 32-bit operations do not reset upper halves
 		 * of the registers, the verifier needs to zero extend a destination
