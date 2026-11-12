@@ -3161,15 +3161,38 @@ static int flow_apply_exit(struct bpf_verifier_env *env, struct flow_state *w,
 	return 0;
 }
 
-/* What came out for the set of @from goes to the calls that wait for the set of @to */
+/* @x is within something that came out for the set of @entry */
+static bool flow_exit_is_known(struct bpf_verifier_env *env, struct flow_entry *entry,
+			       struct flow_exit *x)
+{
+	struct flow_exit *o;
+
+	list_for_each_entry(o, &entry->exits, node)
+		if (bpf_state_subsumes(env, &o->st, &x->st))
+			return true;
+	return false;
+}
+
+/*
+ * What came out for the set of @from goes to the calls that wait for the set of @to, unless it is
+ * within something that came out for @to. The calls of @to have seen that, the calls of @from and
+ * those that come later are going to. As in bpf_flow_exit() an exit that is within one that is
+ * already there is dropped.
+ */
 static int flow_apply_exits(struct bpf_verifier_env *env, struct flow_entry *from,
 			    struct flow_entry *to)
 {
 	struct flow_state *w, *wn;
-	struct flow_exit *x;
+	struct flow_exit *x, *xn;
 	int err;
 
-	list_for_each_entry(x, &from->exits, node) {
+	list_for_each_entry_safe(x, xn, &from->exits, node) {
+		if (flow_exit_is_known(env, to, x)) {
+			list_del(&x->node);
+			bpf_free_verifier_state(&x->st, false);
+			kfree(x);
+			continue;
+		}
 		list_for_each_entry_safe(w, wn, &to->calls, node) {
 			err = flow_apply_exit(env, w, x);
 			if (err)
