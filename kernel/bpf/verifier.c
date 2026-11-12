@@ -1791,6 +1791,7 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 	dst_state->in_sleepable = src->in_sleepable;
 	dst_state->unwound = src->unwound;
 	dst_state->changed_pkt_data = src->changed_pkt_data;
+	dst_state->invalidated_non_owning = src->invalidated_non_owning;
 	dst_state->flow_entry = src->flow_entry;
 	dst_state->insn_idx = src->insn_idx;
 	dst_state->curframe = src->curframe;
@@ -11256,6 +11257,9 @@ static void invalidate_non_owning_refs(struct bpf_verifier_env *env)
 			mark_reg_invalid(env, reg);
 		}
 	}));
+	/* the lock that is still held may be that of a caller, who is not here */
+	if (env->cur_state->flow_entry && env->cur_state->active_locks)
+		env->cur_state->invalidated_non_owning = true;
 }
 
 static void invalidate_rcu_protected_refs(struct bpf_verifier_env *env)
@@ -11908,8 +11912,12 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		kept++;
 	}
 	kfree(held);
-	/* What it means for the caller is found out in the context of the caller. */
-	if (kept != nheld || callee->entry_rcu_locks < caller_rcu ||
+	/*
+	 * What it means for the caller is found out in the context of the caller. It has
+	 * non-owning references only under a lock, which is one of @held.
+	 */
+	if (kept != nheld || (exit->invalidated_non_owning && nheld) ||
+	    callee->entry_rcu_locks < caller_rcu ||
 	    callee->entry_preempt_locks < caller_preempt) {
 		if (env->log.level & BPF_LOG_LEVEL2)
 			verbose(env, "func#%d releases what its caller holds at insn %d\n",
@@ -21862,14 +21870,16 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *st = env->cur_state;
 	struct bpf_func_state *frame = cur_func(env);
-	u32 locks = st->active_locks;
+	u32 refs = st->acquired_refs;
 	struct bpf_reference_state *ref;
 	int id, err;
 
 	while (st->acquired_refs > frame->entry_refs) {
 		ref = &st->refs[st->acquired_refs - 1];
 		id = ref->id;
-		if (ref->type == REF_TYPE_IRQ)
+		if (ref->type == REF_TYPE_PTR)
+			err = release_reference(env, ref->id);
+		else if (ref->type == REF_TYPE_IRQ)
 			err = release_irq_state(env, ref->id);
 		else
 			err = release_lock_state(env, ref->type, ref->id, ref->ptr);
@@ -21877,7 +21887,8 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 			return -EFAULT;
 		unmark_stack_obj(env, id);
 	}
-	if (st->active_locks != locks)
+	/* a lock went, or an object was freed under the lock of a caller, who may point to it */
+	if (st->acquired_refs != refs)
 		invalidate_non_owning_refs(env);
 	st->active_rcu_locks = frame->entry_rcu_locks;
 	st->active_preempt_locks = frame->entry_preempt_locks;
@@ -22444,6 +22455,17 @@ static bool is_tracing_prog_type(enum bpf_prog_type type)
 	default:
 		return false;
 	}
+}
+
+/* Such a program must not free what has NMI unsafe fields, see check_kfunc_call() */
+bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env)
+{
+	enum bpf_prog_type prog_type = resolve_prog_type(env->prog);
+
+	return is_tracing_prog_type(prog_type) ||
+	       /* is_tracing_prog_type() for now doesn't cover non-iterator tracing progs. */
+	       (prog_type == BPF_PROG_TYPE_TRACING &&
+		env->prog->expected_attach_type != BPF_TRACE_ITER && !env->prog->sleepable);
 }
 
 static bool bpf_map_is_cgroup_storage(struct bpf_map *map)

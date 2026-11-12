@@ -700,7 +700,7 @@ static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new
 			if (plan->kind == BPF_SITE_RECURSION || !site_is_used(env, i, plan))
 				continue;
 			n = emit_pad(env, s, plan, new, new_aux);
-			for (pad = 1; pad < cnt; pad += len) {
+			for (pad = bpf_pad_can_be_shared(plan) ? 1 : cnt; pad < cnt; pad += len) {
 				for (len = 1; buf[pad + len - 1].code != (BPF_JMP | BPF_EXIT);
 				     len++)
 					;

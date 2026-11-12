@@ -24,8 +24,9 @@
  *
  * The work is split in layers:
  *
- *   who         A frame releases what it acquired since its entry. A landing pad that a caller
- *               has in the program is code like any other.
+ *   who         A frame releases what it acquired since its entry, and what a subprog that it
+ *               called returned with. A landing pad that a caller has in the program is code
+ *               like any other.
  *   plan        bpf_pad_visit(). One per site: what the pad has to release. A state that leaves
  *               its frame at a site VISITS the plan. The plan has to serve all states that visit
  *               it. If it cannot that is a CONFLICT.
@@ -40,7 +41,10 @@
  * The main pass does not see the insns of a pad. They are trusted, like all that the verifier
  * emits. So a plan has to be right for every state that gets to its site. All that the code of a pad
  * fixes is compared on each visit: the calls and their constant arguments, the places, the order,
- * the number of sections.
+ * the number of sections. A call that the type of the program cannot make is a conflict, see
+ * get_release(). The pad of a callee does release pointers under the lock of a caller, where the
+ * program could not make that call. What takes a bpf_spin_lock there is a conflict, see
+ * can_free_obj().
  *
  * A state that is pruned or joined on the way does not get to the site. The state that it was found
  * within, or was joined with, visits for both. The pad is right for it too, because a plan is made
@@ -91,11 +95,28 @@
  *							   exit
  *
  * A state may have the handle in several places, the CANDIDATES. Those that all visits have in
- * common stay, one of them is emitted. If a caller has the irq flags, a pointer to them is a place.
+ * common stay, one of them is emitted. The calls of a pad clobber R0-R5: they are places for the
+ * first argument of the first call only, see settle_ent().
+ *
+ * A pointer that a helper or a kfunc returned and that has to be released is its own handle. A copy
+ * of it, a pointer to a node in the object, a socket that a helper has cast are places of one
+ * entry. What releases it follows from its type, see ref_release(). If a caller has
+ * irq flags, a pointer to them is a place.
  * The release and the place tell the entries of a plan apart, see visit_refs().
  *
+ *	t = bpf_task_from_pid(pid);			   call bpf_task_from_pid
+ *	...						   r6 = r0
+ *	v = wait();					   ...
+ *	bpf_task_release(t);				   call wait
+ *							   unwind_goto pad
+ *							   ...
+ *						      pad: r1 = r6
+ *							   call bpf_task_release
+ *							   r0 = 0
+ *							   exit
+ *
  * Only the program counter tells a pad what is held: every visit has to hold every entry.
- * A pad has one order, see release_ents(), among equals that of refs[], the youngest first. Locks
+ * A pad has one order, see enum pad_turn, among equals that of refs[], the youngest first. Locks
  * and irq flags have to be released that way. If states acquired them in different orders there is
  * a conflict.
  */
@@ -114,17 +135,130 @@ BTF_ID(func, bpf_local_irq_restore)
 BTF_ID(func, bpf_res_spin_unlock)
 BTF_ID(func, bpf_res_spin_unlock_irqrestore)
 
+/* They free an object of the program, and one per cpu */
+BTF_ID_LIST(pad_obj_drop)
+BTF_ID(func, bpf_obj_drop)
+BTF_ID(func, bpf_percpu_obj_drop)
+
 static struct bpf_insn helper_call(enum bpf_func_id func_id)
 {
 	return BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, func_id);
 }
 
-/* The insn of a pad that releases one resource of @class */
+/* The insn of a pad that releases one resource of @class. A pointer: see ref_release(). */
 static struct bpf_insn release_call(enum bpf_pad_class class)
 {
 	if (class == BPF_PAD_SPIN_LOCK)
 		return helper_call(BPF_FUNC_spin_unlock);
 	return BPF_CALL_KFUNC(0, pad_kfuncs[class]);
+}
+
+static bool is_obj_drop(const struct bpf_insn *insn)
+{
+	return bpf_pseudo_kfunc_call(insn) && !insn->off &&
+	       (insn->imm == pad_obj_drop[0] || insn->imm == pad_obj_drop[1]);
+}
+
+/* The second argument of the helper that @insn calls is flags */
+static bool takes_flags(const struct bpf_insn *insn)
+{
+	if (!bpf_helper_call(insn))
+		return false;
+	switch (insn->imm) {
+	case BPF_FUNC_ringbuf_discard:
+	case BPF_FUNC_ringbuf_discard_dynptr:
+		return true;
+	}
+	return false;
+}
+
+/* bpf_iter_<type>_destroy() if @insn calls bpf_iter_<type>_new(), see btf_check_iter_kfuncs() */
+static s32 iter_destroy_kfunc(struct bpf_verifier_env *env, const struct bpf_insn *insn)
+{
+	struct bpf_call_arg_meta meta;
+	char name[128];
+
+	if (!insn->imm || bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta) ||
+	    !(meta.kfunc_flags & KF_ITER_NEW))
+		return -ENOENT;
+	snprintf(name, sizeof(name), "%.*sdestroy", (int)strlen(meta.func_name) - 3, meta.func_name);
+	return btf_find_by_name_kind(meta.btf, name, BTF_KIND_FUNC);
+}
+
+/*
+ * The call that releases the pointer in @reg. Its type tells: that is all that the verifier asks of
+ * the argument of a release, whichever insn acquired the pointer. An object of the program is freed.
+ * A kernel object: see btf_find_release_kfunc(). If a kfunc of a module returned the pointer @off is
+ * the index of its BTF in fd_array, and that BTF comes first: nf_conn is a type of vmlinux, and the
+ * kfuncs for it may be in a module.
+ */
+static int type_release(struct bpf_verifier_env *env, const struct bpf_reg_state *reg, s16 off,
+			struct bpf_insn *release)
+{
+	const struct btf *btf = reg->btf;
+	s32 id = -ENOENT;
+
+	if (base_type(reg->type) != PTR_TO_BTF_ID)
+		return -ENOENT;
+	if (!btf_is_kernel(btf)) {
+		*release = BPF_CALL_KFUNC(0, pad_obj_drop[!!(reg->type & MEM_PERCPU)]);
+		return 0;
+	}
+	if (btf_is_module(btf)) {
+		id = btf_find_release_kfunc(btf, reg->btf_id, env->prog);
+		/* the module releases it itself, and nothing says where its BTF is in fd_array */
+		if (id >= 0 && !off)
+			return -ENOENT;
+		if (id < 0) {
+			btf = btf_base_btf(btf);
+			off = 0;
+		}
+	}
+	if (id < 0)
+		id = btf_find_release_kfunc(btf, reg->btf_id, env->prog);
+	*release = BPF_CALL_KFUNC(off, id);
+	return min(id, 0);
+}
+
+/*
+ * The call that releases the pointer @ref, which is in @reg. What a helper acquired goes by the
+ * helper: a socket is cast to other types. All else goes by the type.
+ * If @ref is an object in the stack @reg is its first slot.
+ */
+static int ref_release(struct bpf_verifier_env *env, const struct bpf_reference_state *ref,
+		       const struct bpf_reg_state *reg, struct bpf_insn *release)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[ref->insn_idx];
+	s32 id;
+
+	if (bpf_pseudo_kfunc_call(insn)) {
+		id = iter_destroy_kfunc(env, insn);
+		if (id >= 0)
+			*release = BPF_CALL_KFUNC(insn->off, id);
+		else
+			return type_release(env, reg, insn->off, release);
+		return 0;
+	}
+	/* no insn acquired a __ref argument of struct_ops */
+	if (!bpf_helper_call(insn))
+		return type_release(env, reg, 0, release);
+	switch (insn->imm) {
+	case BPF_FUNC_sk_lookup_tcp:
+	case BPF_FUNC_sk_lookup_udp:
+	case BPF_FUNC_skc_lookup_tcp:
+	case BPF_FUNC_map_lookup_elem:
+		*release = helper_call(BPF_FUNC_sk_release);
+		return 0;
+	case BPF_FUNC_ringbuf_reserve:
+		*release = helper_call(BPF_FUNC_ringbuf_discard);
+		return 0;
+	case BPF_FUNC_ringbuf_reserve_dynptr:
+		*release = helper_call(BPF_FUNC_ringbuf_discard_dynptr);
+		return 0;
+	case BPF_FUNC_kptr_xchg:
+		return type_release(env, reg, 0, release);
+	}
+	return -ENOENT;
 }
 
 /*
@@ -228,6 +362,8 @@ static u32 frame_sections(const struct bpf_verifier_state *st, enum bpf_pad_clas
 static int ref_class(const struct bpf_reference_state *ref)
 {
 	switch (ref->type) {
+	case REF_TYPE_PTR:
+		return BPF_PAD_REF;
 	case REF_TYPE_IRQ:
 		return BPF_PAD_IRQ;
 	case REF_TYPE_LOCK:
@@ -280,6 +416,28 @@ static void add_lock_cand(struct bpf_pad_place *cand, int *nr, const struct bpf_
 }
 
 /*
+ * If @reg, which is at (@loc, @at), is the pointer @ref plus a constant, that is a candidate:
+ * a copy, a pointer to a node in an object, what a helper made of a socket. But not the
+ * result of bpf_skc_to_mptcp_sock(): it has the id of the socket and is another socket.
+ */
+static void add_ref_cand(struct bpf_pad_place *cand, int *nr, const struct bpf_reg_state *reg,
+			 const struct bpf_reference_state *ref, enum bpf_place_loc loc, int at)
+{
+	s64 delta = reg->var_off.value;
+
+	if (*nr == BPF_PAD_MAX_CANDS || reg->id != ref->id || reg->type == SCALAR_VALUE ||
+	    reg->type == NOT_INIT || !tnum_is_const(reg->var_off) ||
+	    delta < -S32_MAX || delta > S32_MAX)
+		return;
+#ifdef CONFIG_NET
+	if (base_type(reg->type) == PTR_TO_BTF_ID && btf_is_vmlinux(reg->btf) &&
+	    reg->btf_id == btf_sock_ids[BTF_SOCK_TYPE_MPTCP])
+		return;
+#endif
+	cand[(*nr)++] = (struct bpf_pad_place){ .loc = loc, .at = at, .delta = delta };
+}
+
+/*
  * If @reg, which is at (@loc, @at), points to the stack of the same frame as @obj, at a constant
  * offset, that is a candidate.
  */
@@ -300,13 +458,16 @@ static void add_cand(struct bpf_pad_place *cand, int *nr, const struct bpf_reg_s
 {
 	if (obj)
 		add_obj_cand(cand, nr, reg, obj, loc, at);
+	else if (ref->type == REF_TYPE_PTR)
+		add_ref_cand(cand, nr, reg, ref, loc, at);
 	else
 		add_lock_cand(cand, nr, reg, ref, loc, at);
 }
 
 /*
- * The places of the current frame of @st that have the address of the lock @ref at @insn_idx: R6-R9
- * and stack slots. If @ref is an object in the stack of a caller @obj is its address.
+ * The places of the current frame of @st that have the handle of @ref, a lock or a pointer, at
+ * @insn_idx: R6-R9 and stack slots, then R0-R5, which are dead after a call. If @ref is an object
+ * in the stack of a caller @obj is its address.
  * A register or a stack slot that is not live there is no place: the passes that follow use
  * such a register, remove the store to such a slot, and states that differ in it are the same to
  * the main pass. Nor is a slot of the spills around bpf_fastcall calls: they are removed unless the
@@ -332,6 +493,9 @@ static int find_cands(struct bpf_verifier_env *env, const struct bpf_verifier_st
 		    off >= fastcall_off)
 			add_cand(cand, &nr, &slot->spilled_ptr, ref, obj, BPF_PLACE_SPILL, off);
 	}
+	for (i = BPF_REG_0; i < BPF_REG_6; i++)
+		if (aux->live_regs_before & BIT(i))
+			add_cand(cand, &nr, &frame->regs[i], ref, obj, BPF_PLACE_REG, i);
 	return nr;
 }
 
@@ -355,6 +519,28 @@ static int find_lock_cands(struct bpf_verifier_env *env, const struct bpf_verifi
 						     .delta = -off };
 	}
 	return ref->id ? find_cands(env, st, insn_idx, ref, NULL, cand) : nr;
+}
+
+/*
+ * A register of the current frame of @st, spilled or not, live or not, that has the pointer @ref:
+ * it tells the type. R0-R5 come last. NULL if there is none.
+ */
+static const struct bpf_reg_state *ref_reg(const struct bpf_verifier_state *st,
+					   const struct bpf_reference_state *ref)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	const struct bpf_stack_state *slot;
+	int i;
+
+	for (i = 0; i < bpf_stack_nr_slots(frame); i++) {
+		slot = bpf_stack_slot(frame, i);
+		if (bpf_is_spilled_reg(slot) && slot->spilled_ptr.id == ref->id)
+			return &slot->spilled_ptr;
+	}
+	for (i = BPF_REG_9; i >= BPF_REG_0; i--)
+		if (frame->regs[i].type != NOT_INIT && frame->regs[i].id == ref->id)
+			return &frame->regs[i];
+	return NULL;
 }
 
 /* Is slot @spi of @frame the irq flags @ref? */
@@ -427,6 +613,89 @@ static int common_cands(const struct bpf_pad_ent *ent, const struct bpf_pad_ent 
 }
 
 /*
+ * Is a bpf_spin_lock taken when an object of type (@btf, @btf_id) is freed? The destructors of a
+ * list head and of an rb root take the one in the object. A kptr to an object of the program frees
+ * that object, which may have them.
+ */
+bool bpf_obj_free_takes_lock(const struct btf *btf, u32 btf_id)
+{
+	const struct btf_struct_meta *meta = btf_find_struct_meta(btf, btf_id);
+	const struct btf_field *field;
+	int i;
+
+	for (i = 0; meta && i < meta->record->cnt; i++) {
+		field = &meta->record->fields[i];
+		if ((field->type & BPF_GRAPH_ROOT) ||
+		    ((field->type & (BPF_KPTR_REF | BPF_KPTR_PERCPU)) &&
+		     !btf_is_kernel(field->kptr.btf)))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Can a pad of the current frame of @st free an object of type @btf_id of the program? That runs
+ * the destructors of its fields.
+ * A tracing program must not do that to fields that are not NMI safe, see check_kfunc_call().
+ * All bpf_spin_locks of a cpu keep the irq flags in one word, so none is taken under the lock of a
+ * caller. The pad has released the locks of its own frame by then.
+ */
+static bool can_free_obj(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			 u32 btf_id)
+{
+	const struct btf *btf = env->prog->aux->btf;
+	const struct btf_struct_meta *meta = btf_find_struct_meta(btf, btf_id);
+	int i;
+
+	if (meta && bpf_prog_may_run_in_nmi(env) && btf_record_has_nmi_unsafe_fields(meta->record))
+		return false;
+	for (i = 0; i < st->frame[st->curframe]->entry_refs; i++)
+		if (st->refs[i].type == REF_TYPE_LOCK && bpf_obj_free_takes_lock(btf, btf_id))
+			return false;
+	return true;
+}
+
+/*
+ * What the release of @ent needs beside the handle, which is in @reg. Flags, the second argument:
+ * they are 0. The type of an object of the program: that is no argument. It is in the aux data of
+ * the call that frees the object, see bpf_insn_aux_data::kptr_struct_meta, so a call of a pad frees
+ * one type. Its id in the BTF of the program names it.
+ */
+static int ent_imm(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
+		   const struct bpf_verifier_state *st, const struct bpf_reg_state *reg)
+{
+	if (is_obj_drop(&ent->release)) {
+		if (reg->btf != env->prog->aux->btf)
+			return BPF_CONFLICT_NO_PLACE;
+		if (!can_free_obj(env, st, reg->btf_id))
+			return BPF_CONFLICT_NO_RELEASE;
+		ent->obj_type = reg->btf_id;
+	}
+	if (takes_flags(&ent->release))
+		ent->cand[1][ent->nr_cands[1]++] = (struct bpf_pad_place){ .loc = BPF_PLACE_IMM };
+	return 0;
+}
+
+/* See ref_ent(). @ref is a pointer. */
+static int ptr_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
+		   const struct bpf_verifier_state *st, int insn_idx,
+		   const struct bpf_reference_state *ref)
+{
+	const struct bpf_reg_state *regs = st->frame[st->curframe]->regs, *reg = ref_reg(st, ref);
+
+	if (!reg)
+		return BPF_CONFLICT_NO_PLACE;
+	if (type_may_be_null(reg->type))
+		return BPF_CONFLICT_NOT_ALWAYS_HELD;
+	if (ref_release(env, ref, reg, &ent->release))
+		return BPF_CONFLICT_NO_RELEASE;
+	ent->nr_cands[0] = find_cands(env, st, insn_idx, ref, NULL, ent->cand[0]);
+	if (!ent->nr_cands[0] && reg >= &regs[BPF_REG_0] && reg <= &regs[BPF_REG_5])
+		return BPF_CONFLICT_CALLER_SAVED;
+	return ent_imm(env, ent, st, reg);
+}
+
+/*
  * Make @ent what @ref, one of refs[] of @st, is to a landing pad at @insn_idx: the call that
  * releases it, and the places of the current frame that have the arguments.
  * Returns the reason of a conflict.
@@ -436,18 +705,21 @@ static int ref_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 		   const struct bpf_reference_state *ref)
 {
 	const struct bpf_stack_state *obj = NULL;
-	int class = ref_class(ref);
+	int class = ref_class(ref), err = 0;
 
 	if (verifier_bug_if(class < 0, env, "no landing pad releases reference type %d", ref->type))
 		return -EFAULT;
 	memset(ent, 0, sizeof(*ent));
 	ent->origin = ref->origin;
 	ent->class = class;
-	ent->release = release_call(class);
-	if (class == BPF_PAD_IRQ)
+	if (class != BPF_PAD_REF)
+		ent->release = release_call(class);
+	if (class == BPF_PAD_REF || class == BPF_PAD_IRQ)
 		ent->nr_cands[0] = find_obj_cands(env, st, insn_idx, ref, ent->cand[0], &obj);
 	else
 		ent->nr_cands[0] = find_lock_cands(env, st, insn_idx, ref, ent->cand[0]);
+	if (class == BPF_PAD_REF)
+		err = ptr_ent(env, ent, st, insn_idx, ref);
 	if (class == BPF_PAD_RES_LOCK_IRQ) {
 		/* The same insn saved irq flags, the next of refs[]: the second argument. */
 		if (verifier_bug_if(ref + 1 == st->refs + st->acquired_refs ||
@@ -458,7 +730,9 @@ static int ref_ent(struct bpf_verifier_env *env, struct bpf_pad_ent *ent,
 		if (!ent->nr_cands[1])
 			return BPF_CONFLICT_NO_PLACE;
 	}
-	return ent->nr_cands[0] ? 0 : BPF_CONFLICT_NO_PLACE;
+	if (!err && !ent->nr_cands[0])
+		return BPF_CONFLICT_NO_PLACE;
+	return err;
 }
 
 /* The entry of @plan that refs[@ref] is on this visit */
@@ -486,7 +760,8 @@ static struct bpf_pad_ent *match_ent(const struct bpf_pad_plan *plan, const stru
 	for (i = 0; i < plan->nr_ents; i++) {
 		ent = &plan->ents[i];
 		if (ent->ref >= 0 || (origin && ent->origin != new->origin) ||
-		    memcmp(&ent->release, &new->release, sizeof(ent->release)))
+		    memcmp(&ent->release, &new->release, sizeof(ent->release)) ||
+		    ent->obj_type != new->obj_type)
 			continue;
 		for (arg = 0; arg < BPF_PAD_MAX_ARGS; arg++)
 			if (new->nr_cands[arg] && !common_cands(ent, new, arg, cand))
@@ -556,7 +831,7 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	}
 	for (i = st->frame[st->curframe]->entry_refs, pos = 0; i < st->acquired_refs; i++) {
 		ent = held_ent(plan, i);
-		if (!ent)
+		if (!ent || ent->class >= BPF_PAD_REF)
 			continue;
 		if (ent - plan->ents < pos)
 			return BPF_CONFLICT_ORDER_DIFFERS;
@@ -634,23 +909,45 @@ static int load_handle(struct bpf_verifier_env *env, struct bpf_insn *buf,
 					(u32)addr);
 		buf[n++] = BPF_RAW_INSN(0, 0, 0, 0, addr >> 32);
 		return n;
+	case BPF_PLACE_IMM:
+		buf[n++] = BPF_MOV64_IMM(reg, place->delta);
+		return n;
 	}
 	if (place->delta)
 		buf[n++] = BPF_ALU64_IMM(BPF_ADD, reg, -place->delta);
 	return n;
 }
 
-/* The insns that release the entries of @plan, the youngest first */
+/*
+ * The turns of a pad. Few functions can be called under a lock, and a release may sleep: locks and
+ * irq flags go first, then the pad leaves the sections, pointers go last.
+ */
+enum pad_turn {
+	PAD_TURN_LOCKS,
+	PAD_TURN_POINTERS,
+};
+
+static enum pad_turn release_turn(const struct bpf_pad_ent *ent)
+{
+	return ent->class < BPF_PAD_REF ? PAD_TURN_LOCKS : PAD_TURN_POINTERS;
+}
+
+/* The insns that release the entries of @plan whose turn it is, the youngest first */
 static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
-			struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
+			enum pad_turn turn, struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
 	const struct bpf_pad_ent *ent;
 	int i, arg, n = 0;
 
 	for (i = plan->nr_ents - 1; i >= 0; i--) {
 		ent = &plan->ents[i];
+		if (release_turn(ent) != turn)
+			continue;
 		for (arg = 0; arg < BPF_PAD_MAX_ARGS && ent->nr_cands[arg]; arg++)
 			n += load_handle(env, &buf[n], &aux[n], BPF_REG_1 + arg, &ent->cand[arg][0]);
+		if (is_obj_drop(&ent->release))
+			aux[n].kptr_struct_meta = btf_find_struct_meta(env->prog->aux->btf,
+								       ent->obj_type);
 		buf[n++] = ent->release;
 	}
 	return n;
@@ -667,14 +964,54 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 {
 	int class, i, n;
 
-	n = release_ents(env, plan, buf, aux);
+	n = release_ents(env, plan, PAD_TURN_LOCKS, buf, aux);
 	for (class = 0; class < BPF_PAD_NR_SECTIONS; class++)
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
+	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
 	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env, subprog));
 	if (bpf_ret_reg_pair(env, subprog))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	return n;
+}
+
+/* Is the first call of the pad of @plan the release of @ent? See bpf_pad_insns(). */
+static bool released_first(const struct bpf_pad_plan *plan, const struct bpf_pad_ent *ent)
+{
+	const struct bpf_pad_ent *other;
+	int i;
+
+	for (i = 0; i < plan->nr_ents; i++) {
+		other = &plan->ents[i];
+		if (release_turn(other) < release_turn(ent) ||
+		    (release_turn(other) == release_turn(ent) && other > ent))
+			return false;
+	}
+	return release_turn(ent) != PAD_TURN_POINTERS ||
+	       (!plan->sections[BPF_PAD_RCU] && !plan->sections[BPF_PAD_PREEMPT]);
+}
+
+/* The calls of a pad clobber it */
+static bool place_is_caller_saved(const struct bpf_pad_place *place)
+{
+	return place->loc == BPF_PLACE_REG && place->at < BPF_REG_6;
+}
+
+/*
+ * The first candidate of @ent is emitted. Can the pad of @plan use it?
+ * Returns the reason of a conflict.
+ */
+static int settle_ent(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+		      struct bpf_pad_ent *ent)
+{
+	struct bpf_pad_place *cand = ent->cand[0];
+
+	if (place_is_caller_saved(&cand[0]) && !released_first(plan, ent))
+		return BPF_CONFLICT_CALLER_SAVED;
+	/* R1 is loaded first */
+	if (ent->nr_cands[1] && place_is_caller_saved(&ent->cand[1][0]))
+		return BPF_CONFLICT_CALLER_SAVED;
+	return get_release(env, &ent->release);
 }
 
 /* All visits of @plan are over. Returns the reason of a conflict. */
@@ -684,13 +1021,27 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	int i, class, err = plan->conflict;
 
 	for (i = 0; !err && i < plan->nr_ents; i++)
-		err = get_release(env, &plan->ents[i].release);
+		err = settle_ent(env, plan, &plan->ents[i]);
 	for (class = 0; !err && class < BPF_PAD_NR_SECTIONS; class++) {
 		release = release_call(class);
 		if (plan->sections[class])
 			err = get_release(env, &release);
 	}
 	return err;
+}
+
+/*
+ * Sites whose pads have the same insns share one. But not a pad that frees an object of the
+ * program: the same insns free another type at another site, see ent_imm().
+ */
+bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan)
+{
+	int i;
+
+	for (i = 0; i < plan->nr_ents; i++)
+		if (is_obj_drop(&plan->ents[i].release))
+			return false;
+	return true;
 }
 
 /* 'spin_lock@5(r6-8)': what insn 5 brought to the frame, the arguments of its release */
@@ -701,6 +1052,7 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 		[BPF_PAD_RES_LOCK]		= "res_lock",
 		[BPF_PAD_RES_LOCK_IRQ]		= "res_lock_irq",
 		[BPF_PAD_SPIN_LOCK]		= "spin_lock",
+		[BPF_PAD_REF]			= "ref",
 	};
 	const struct bpf_pad_place *place;
 	int arg;
@@ -713,11 +1065,13 @@ static void print_ent(struct bpf_verifier_env *env, const struct bpf_pad_ent *en
 			verbose(env, "*fp%d", place->at);
 		else if (place->loc == BPF_PLACE_MAP_VALUE)
 			verbose(env, "map#%d", place->at);
+		else if (place->loc == BPF_PLACE_IMM)
+			verbose(env, "%d", place->delta);
 		else if (place->at == BPF_REG_FP)
 			verbose(env, "fp");
 		else
 			verbose(env, "r%d", place->at);
-		if (place->delta)
+		if (place->delta && place->loc != BPF_PLACE_IMM)
 			verbose(env, "%+d", -place->delta);
 	}
 	verbose(env, ") ");
@@ -739,6 +1093,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
 		[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
 		[BPF_CONFLICT_CANNOT_UNWIND]	= "the frame cannot unwind",
+		[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
 	};
 	int j;
 
