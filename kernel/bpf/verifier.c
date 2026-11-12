@@ -194,6 +194,7 @@ struct bpf_verifier_stack_elem {
 	struct bpf_verifier_state st;
 	int insn_idx; /* -1: its frame is left at 'prev_insn_idx', see unwind_frame() */
 	int prev_insn_idx;
+	enum bpf_site_kind site_kind; /* of the site at 'prev_insn_idx' */
 	/* it goes there only if may_goto in front of prev_insn_idx does, see check_loop_guard() */
 	enum bpf_guard_edge guard_edge;
 	struct bpf_verifier_stack_elem *next;
@@ -21579,9 +21580,9 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, bool *backedge, bool *drop
 }
 
 /*
- * What @subprog returns when it is unwound, see push_budget_exit(). No code of the program chooses
- * that value. For the main program: where check_return_code() has a range with 0 in it, 0 refuses
- * or changes nothing, but for an LSM hook that returns an errno: there 0 lets the operation go on.
+ * What @subprog returns when it is unwound, see unwind_frame(). No code of the program chooses that
+ * value. For the main program: where check_return_code() has a range with 0 in it, 0 refuses or
+ * changes nothing, but for an LSM hook that returns an errno: there 0 lets the operation go on.
  * A range without 0 is [1, 1]: hooks that cannot refuse.
  * An extension returns into the program that it extends, with the value of that program.
  * The exception callback returns in place of the main program.
@@ -21603,6 +21604,30 @@ int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog)
 }
 
 /*
+ * The kernel called the current frame of @st, or it is the main prog of an extension: either exit
+ * ends the prog
+ */
+static bool frame_is_top(const struct bpf_verifier_state *st)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+
+	if (st->curframe)
+		return false;
+	return !frame->subprogno || frame->in_async_callback_fn ||
+	       frame->in_exception_callback_fn;
+}
+
+/* The current frame of @st holds resources that it acquired since its entry */
+static bool frame_holds_resources(const struct bpf_verifier_state *st)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+
+	return st->acquired_refs != frame->entry_refs ||
+	       st->active_rcu_locks != frame->entry_rcu_locks ||
+	       st->active_preempt_locks != frame->entry_preempt_locks;
+}
+
+/*
  * A loop or a recursion is out of budget in the current frame of @st. What the
  * program computed so far is not what it was meant to compute, so it's better
  * not to go on. The way to stop is to unwind: 'r0 = 0; unwind_exit'. The landing
@@ -21610,7 +21635,8 @@ int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog)
  * hold, or the program is rejected.
  *
  * False when it cannot:
- * - There is no landing pad for what this frame took itself.
+ * - This frame acquired something itself, and there is no landing pad for that: the verifier
+ *   emits one for sections only.
  * - There is a call of the subprog that unwind_goto doesn't follow. That is every
  *   program that is compiled without unwinding.
  * - A helper that calls a callback doesn't expect it to unwind.
@@ -21629,17 +21655,11 @@ static bool budget_can_unwind(struct bpf_verifier_env *env, const struct bpf_ver
 	/* see unwind_frame() */
 	if (sub->exit_idx == U32_MAX)
 		return false;
-	if (st->acquired_refs != frame->entry_refs ||
-	    st->active_rcu_locks != frame->entry_rcu_locks ||
-	    st->active_preempt_locks != frame->entry_preempt_locks)
+	if (st->acquired_refs != frame->entry_refs)
 		return false;
 	if (frame->in_callback_fn)
 		return false;
-	/* the kernel called it: either exit ends it */
-	if (!st->curframe && (!frame->subprogno || frame->in_async_callback_fn ||
-			      frame->in_exception_callback_fn))
-		return true;
-	return sub->bail_unwinds || or_exit;
+	return frame_is_top(st) || sub->bail_unwinds || or_exit;
 }
 
 /* May_goto at the head of a loop skips the body. Does it go to code that reads what is not set? */
@@ -21655,26 +21675,15 @@ static bool guard_reads_unset_reg(struct bpf_verifier_env *env,
 	return false;
 }
 
-/*
- * The current frame leaves with 0 in place of the result: with unwind_exit if the subprog
- * can do that, with exit otherwise. The insns are added when the main pass is over.
- * What the kernel called leaves with bpf_unwound_retval().
- */
-static int push_budget_exit(struct bpf_verifier_env *env)
+/* This insn is a site of @kind: the current frame may be left here, see unwind_frame() */
+static int push_unwind_edge(struct bpf_verifier_env *env, enum bpf_site_kind kind)
 {
-	struct bpf_subprog_info *sub = &env->subprog_info[cur_func(env)->subprogno];
 	struct bpf_verifier_state *branch;
-	struct bpf_reg_state *regs;
 
 	branch = push_stack(env, -1, env->insn_idx, false);
 	if (IS_ERR(branch))
 		return PTR_ERR(branch);
-	branch->unwound = sub->bail_unwinds;
-	regs = branch->frame[branch->curframe]->regs;
-	bpf_mark_reg_known_scalar(&regs[BPF_REG_0],
-				  bpf_unwound_retval(env, cur_func(env)->subprogno));
-	if (bpf_ret_reg_pair(env, cur_func(env)->subprogno))
-		__mark_reg_const_zero(&regs[BPF_REG_2]);
+	env->head->site_kind = kind;
 	return 0;
 }
 
@@ -21749,7 +21758,7 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 			env->guards_late = true;
 	}
 	if (!aux->guard_no_unwind) {
-		err = push_budget_exit(env);
+		err = push_unwind_edge(env, BPF_SITE_GUARD);
 		if (err)
 			return err;
 		env->head->guard_edge = BPF_GUARD_LEAVES_SUBPROG;
@@ -21763,23 +21772,62 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 }
 
 /*
- * The current frame of @st is left at @insn_idx, where the program has no exit: the verifier
- * emits one after the main pass. @st->unwound tells which one. No insn stands for it in the
- * main pass. What an exit does to a state is done to @st here, and what is left of @st goes
- * where the frame returns to, through the worklist like every other state. @st is taken.
+ * The current frame is left at a site, and its landing pad releases what the frame acquired since
+ * its entry. Do to the current state what the calls of the pad do to it, with the functions that
+ * such a call of the program ends up in. The callers may have pointers that are good as long as a
+ * lock or a section is held.
  */
-static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int insn_idx)
+static int release_frame_resources(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_func_state *frame = cur_func(env);
+
+	st->active_rcu_locks = frame->entry_rcu_locks;
+	st->active_preempt_locks = frame->entry_preempt_locks;
+	if (!in_rcu_cs(env))
+		invalidate_rcu_protected_refs(env);
+	return 0;
+}
+
+/*
+ * The current frame of @st is left at @insn_idx, a site of @kind. The program has no code for
+ * that: the verifier emits a landing pad after the main pass, see kernel/bpf/pads.c. No insn
+ * stands for it in the main pass. @st visits the plan of the site, which notes what the pad has to
+ * do. Then what the pad does to a state is done to @st: the releases, see
+ * release_frame_resources(), the value in place of the result, then unwind_exit if the subprog can
+ * do that, exit otherwise. What is left of @st goes where the frame returns to, through the
+ * worklist like every other state. @st is taken.
+ *
+ * With a conflict there is no pad. @st is dropped, and bpf_pads_settle() rejects the program.
+ */
+static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int insn_idx,
+			enum bpf_site_kind kind)
 {
 	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_verifier_state *cur = env->cur_state;
 	int cur_idx = env->insn_idx, err;
+	struct bpf_pad_plan *plan;
 	bool print_state;
 
+	env->cur_state = st;
+	env->insn_idx = insn_idx;
+	plan = bpf_pad_visit(env, st, insn_idx, kind);
+	err = PTR_ERR_OR_ZERO(plan);
+	if (err || plan->conflict)
+		goto out;
+
+	err = release_frame_resources(env);
+	if (err)
+		goto out;
+	bpf_mark_reg_known_scalar(&frame->regs[BPF_REG_0],
+				  bpf_unwound_retval(env, frame->subprogno));
+	if (bpf_ret_reg_pair(env, frame->subprogno))
+		__mark_reg_const_zero(&frame->regs[BPF_REG_2]);
+
+	st->unwound = env->subprog_info[frame->subprogno].bail_unwinds;
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
 			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
-	env->cur_state = st;
-	env->insn_idx = insn_idx;
 	if (!st->curframe && st->flow_entry) {
 		/* What leaves the function is compared as if it were at one exit, out of loops. */
 		frame->loop_stack_cnt = 0;
@@ -21791,6 +21839,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		err = bpf_flow_deliver(env, st, env->insn_idx, insn_idx);
 	else if (err == PROCESS_BPF_EXIT)
 		err = 0;
+out:
 	env->cur_state = cur;
 	env->insn_idx = cur_idx;
 	return err;
@@ -21808,7 +21857,7 @@ static int flow_drain(struct bpf_verifier_env *env)
 			    !bpf_flow_guard_edge(env, elem->prev_insn_idx, elem->guard_edge)))
 			;
 		else if (elem->insn_idx < 0)
-			err = unwind_frame(env, &elem->st, elem->prev_insn_idx);
+			err = unwind_frame(env, &elem->st, elem->prev_insn_idx, elem->site_kind);
 		else
 			err = bpf_flow_deliver(env, &elem->st, elem->insn_idx,
 					       elem->prev_insn_idx);
@@ -21830,7 +21879,10 @@ static int check_recursion_guard(struct bpf_verifier_env *env)
 
 	if (!sub->recursive || env->insn_idx != sub->start)
 		return 0;
-	return push_budget_exit(env);
+	/* It got here by a jump, which goes past the check: at its entry a frame holds nothing. */
+	if (frame_holds_resources(env->cur_state))
+		return 0;
+	return push_unwind_edge(env, BPF_SITE_RECURSION);
 }
 
 /* Process the current state until it gets to the start of a basic block. */
@@ -23422,10 +23474,16 @@ static int do_check_all(struct bpf_verifier_env *env)
 
 	for (;;) {
 		bpf_flow_new_round(env);
+		bpf_pads_new_round(env);
 		ret = do_check_main(env);
 		ret = ret ?: do_check_subprogs(env);
-		if (!round_is_dropped(env))
+		/* a state that never gets to a site makes no conflict there */
+		if (!round_is_dropped(env)) {
+			ret = ret ?: bpf_pads_settle(env);
+			if (!ret)
+				bpf_pads_log(env);
 			return ret;
+		}
 		/* the log is dropped when a function is found to be safe */
 		bpf_vlog_reset(&env->log, min(log_pos, env->log.end_pos));
 		for (i = 0; i < env->prog->len; i++)
@@ -25539,9 +25597,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
 		ret = bpf_prog_offload_finalize(env);
 
-	if (ret == 0)
-		ret = bpf_insert_loop_guards(env);
-
 skip_full_check:
 	/* might decrease stack depth, keep it before passes that
 	 * allocate additional slots.
@@ -25553,6 +25608,9 @@ skip_full_check:
 		ret = check_max_stack_depth(env);
 
 	/* instruction rewrites happen after this point */
+	if (ret == 0)
+		ret = bpf_insert_sites(env);
+
 	if (ret == 0)
 		ret = bpf_optimize_bpf_loop(env);
 
