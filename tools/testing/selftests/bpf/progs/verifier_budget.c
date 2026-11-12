@@ -961,6 +961,73 @@ __naked void objects_in_the_stack(void)
 	);
 }
 
+/* fp-8: Option<T>, not r8: its upper half is dead. r7: the test comes first. r6: not tested yet. */
+SEC("tc")
+__description("budget: references are held on some paths or may be NULL")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("r0 = 7")
+__xlated("exit")
+__xlated("r1 = r6")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r1 = r7")
+__xlated("if r1 == 0x0 goto pc+3")
+__xlated("r1 += -8")
+__xlated("r2 = 0")
+__xlated("call unknown")
+__xlated("r1 = *(u64 *)(r10 -8)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__naked void references_or_null(void)
+{
+	asm volatile (
+		"r7 = 0;"
+		"w8 = 0;"
+		"*(u64 *)(r10 - 8) = r7;"
+		"call %[bpf_get_prandom_u32];"
+		"if r0 == 0 goto 2f;"
+	ACQUIRE_TASK(r6)
+		"r8 = r6;"
+		"*(u64 *)(r10 - 8) = r6;"
+		"r1 = %[ringbuf] ll;"
+		"r2 = 16;"
+		"r3 = 0;"
+		"call %[bpf_ringbuf_reserve];"
+		"if r0 == 0 goto 2f;"
+		"r7 = r0;"
+		"r7 += 8;"
+	"2:"
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"r6 = r0;"
+	SPIN
+		"if r6 == 0 goto +2;"
+		"r1 = r6;"
+		"call %[bpf_task_release];"
+		"if r7 == 0 goto +4;"
+		"r1 = r7;"
+		"r1 += -8;"
+		"r2 = 0;"
+		"call %[bpf_ringbuf_discard];"
+		"r1 = *(u64 *)(r10 - 8);"
+		"if r1 == 0 goto +1;"
+		"call %[bpf_task_release];"
+		"w0 = w8;"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(ringbuf), __imm_addr(one), __imm(bpf_get_prandom_u32),
+		  __imm(bpf_ringbuf_reserve), __imm(bpf_ringbuf_discard),
+		  __imm(bpf_task_from_pid), __imm(bpf_task_release)
+		: __clobber_all
+	);
+}
+
 /* Nothing can destroy it any more, no landing pad either. The main pass finds no other way out. */
 SEC("syscall")
 __description("budget: an iterator is held, its RCU section is over")
