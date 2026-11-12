@@ -3095,6 +3095,8 @@ int bpf_flow_deliver(struct bpf_verifier_env *env, struct bpf_verifier_state *st
 	/*
 	 * Cycles that have no loop head: the callback that came back to the helper
 	 * that calls it, and calls that go through the entry of a function.
+	 * A callback that was left at a site comes from no exit insn. It is on no cycle: the helper
+	 * doesn't call it again, see push_callback_call().
 	 */
 	sub = bpf_find_containing_subprog(env, insn_idx);
 	cycle = FLOW_NO_CYCLE;

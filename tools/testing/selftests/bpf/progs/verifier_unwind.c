@@ -981,13 +981,13 @@ static unsigned long cb_unwinds(void)
 	);
 }
 
-/* bpf_loop() has a pad for it, so what's missing is the one after the call */
+/* bpf_loop() has a pad for it, and the verifier adds the one after the call */
 SEC("tc")
 __description("unwind: callback unwinds")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__failure __msg("no unwind_goto after the call of bpf_loop()")
+__success __retval(0)
 __naked int callback_unwinds(void)
 {
 	asm volatile (

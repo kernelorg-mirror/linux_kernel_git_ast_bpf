@@ -218,7 +218,7 @@ __naked int loop_cb_r0_known(void)
 SEC("tc")
 __description("unwind cb: a helper in the pad starts its rounds afresh")
 __arch_x86_64 __arch_arm64 __load_if_JITed()
-__failure __msg("no unwind_goto after the call of bpf_loop()")
+__success __retval(0)
 __naked int loop_cb_unwinds_then_loops(void)
 {
 	asm volatile (
