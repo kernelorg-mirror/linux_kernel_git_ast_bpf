@@ -52,10 +52,10 @@ struct {
  * Two iterations are looked at as they are. The second one ends the walk: its jump goes both
  * ways. Its state is joined with the one before, nothing stops n, so n is any number.
  * What comes back next is within that. The number of insns tells that there is no fourth pass.
- * The loop gets may_goto when the walk ends, and all is done again: two times 24 insns.
+ * The loop gets may_goto when the walk ends, and all is done again: two times 23 insns.
  */
 OK("the state that ends a walk is joined with the one before")
-__log_level(1) __msg("processed 48 insns")
+__log_level(1) __msg("processed 46 insns")
 __naked void two_passes(void)
 {
 	asm volatile (
@@ -78,7 +78,7 @@ __naked void two_passes(void)
  * the known bits are what the range says after the first one.
  */
 OK("known bits are not lost one by one")
-__log_level(1) __msg("processed 74 insns")
+__log_level(1) __msg("processed 72 insns")
 __naked void bits_one_by_one(void)
 {
 	asm volatile (
@@ -107,7 +107,7 @@ __naked void bits_one_by_one(void)
  * time: no signed bound moves, and the range does, a million times if nothing is done about it.
  */
 OK("a range moves and its signed bounds do not")
-__log_level(1) __msg("processed 68 insns")
+__log_level(1) __msg("processed 66 insns")
 __naked void unsigned_bound_moves(void)
 {
 	asm volatile (

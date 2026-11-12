@@ -1103,7 +1103,6 @@ struct bpf_subprog_info {
 	/* some call of it is not followed by unwind_goto */
 	bool plain_call: 1;
 	u8 code_stack_args;
-	int bail_insn; /* an exit of it, for the main pass. -1 if there is none */
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
 };
@@ -1557,8 +1556,7 @@ struct bpf_verifier_state *bpf_flow_keep_state(struct bpf_verifier_env *env,
 					       const struct bpf_verifier_state *st);
 int bpf_flow_deliver(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 		     int insn_idx, int prev_insn_idx);
-int bpf_flow_guard_edge(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
-			int insn_idx, int prev_insn_idx, enum bpf_guard_edge edge);
+bool bpf_flow_guard_edge(struct bpf_verifier_env *env, int insn_idx, enum bpf_guard_edge edge);
 int bpf_flow_next(struct bpf_verifier_env *env, int *prev_insn_idx);
 void bpf_flow_print_way(struct bpf_verifier_env *env, u64 log_pos, int head, int i);
 int bpf_flow_call(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
@@ -1875,10 +1873,10 @@ struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
  * Where the program goes from may_goto and from the checks that the verifier adds:
  * - May_goto in front of a jump goes where the jump goes, with the registers and the stack
  *   as they are in front of the jump. bpf_insn_successors() has that edge.
- * - A subprog that is out of budget goes to bail_insn, an exit. No such edge.
+ * - A subprog that is out of budget is left at once, see unwind_frame(). No insn of it follows.
  * - May_goto in front of the head of a loop goes to where the loops around it are left: from
- *   @idx to what is returned here, -1 if there is none. No such edge either. The registers
- *   and the stack are what they are in front of @idx.
+ *   @idx to what is returned here, -1 if there is none. No such edge. The registers and the
+ *   stack are what they are before @idx.
  *
  * The main pass looks at the states that go there. What is computed from the graph before
  * the main pass has to take these edges into account where the main pass believes it:

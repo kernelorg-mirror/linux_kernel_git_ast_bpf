@@ -848,8 +848,8 @@ static bool flow_kinds_step(struct bpf_verifier_env *env, struct flow_kinds *kin
  * miss a store through a pointer to the stack, and to take what callx calls for unknown.
  *
  * The edges that the verifier adds, see bpf_head_guard_target(): may_goto at the head of a loop
- * takes what holds there to its target. A subprog that is out of budget goes to an exit with 0
- * in place of the result, a number.
+ * takes what holds there to its target. A subprog that is out of budget is left with 0 in place
+ * of the result, a number.
  */
 int bpf_flow_compute_kinds(struct bpf_verifier_env *env)
 {
@@ -2947,25 +2947,24 @@ static bool flow_guard_edge_is_real(struct bpf_verifier_env *env, int insn_idx, 
 }
 
 /*
- * @st gets to @insn_idx if the loop has may_goto in front of @prev_insn_idx and that is where it
- * goes, see check_loop_guard(). If that is not so, or not known yet, @st is dropped. If it turns
- * out to be so later all is done again.
+ * A state takes @edge if the loop has may_goto before @insn_idx and that is where it goes,
+ * see check_loop_guard(). If that is not so, or not known yet, false is returned and the state is
+ * dropped. If it turns out to be so later all is done again.
  */
-int bpf_flow_guard_edge(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
-			int insn_idx, int prev_insn_idx, enum bpf_guard_edge edge)
+bool bpf_flow_guard_edge(struct bpf_verifier_env *env, int insn_idx, enum bpf_guard_edge edge)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 
-	if (flow_guard_edge_is_real(env, prev_insn_idx, edge)) {
-		aux[prev_insn_idx].loop_guard = true;
-		return bpf_flow_deliver(env, st, insn_idx, prev_insn_idx);
+	if (flow_guard_edge_is_real(env, insn_idx, edge)) {
+		aux[insn_idx].loop_guard = true;
+		return true;
 	}
 	/* it's not going to leave the subprog any more */
-	if (edge == BPF_GUARD_LEAVES_SUBPROG && aux[prev_insn_idx].guard_no_unwind)
-		return 0;
-	aux[prev_insn_idx].guard_edge_dropped = true;
-	aux[bpf_loop_at_index(env, prev_insn_idx)].loop->no_guard_edges = true;
-	return 0;
+	if (edge == BPF_GUARD_LEAVES_SUBPROG && aux[insn_idx].guard_no_unwind)
+		return false;
+	aux[insn_idx].guard_edge_dropped = true;
+	aux[bpf_loop_at_index(env, insn_idx)].loop->no_guard_edges = true;
+	return false;
 }
 
 /*
@@ -3266,8 +3265,15 @@ int bpf_flow_exit(struct bpf_verifier_env *env, struct bpf_verifier_state *st, i
 	struct flow_exit *x, *o, *on;
 	struct flow_state *w, *wn;
 	struct flow_entry *entry;
-	u16 joins = 0;
+	u16 joins = 0, max_joins;
 	int err;
+
+	/*
+	 * What comes out of a recursive function gets into it again: what keeps growing is
+	 * forgotten early. Not at the first join: 0 in place of the result comes out ahead of the
+	 * results, see check_recursion_guard(), and they didn't grow out of it.
+	 */
+	max_joins = env->subprog_info[st->frame[0]->subprogno].recursive ? 0 : BPF_FLOW_MAX_JOINS;
 
 	st->insn_idx = exit_idx;
 	err = bpf_clean_verifier_state(env, st);
@@ -3283,10 +3289,7 @@ int bpf_flow_exit(struct bpf_verifier_env *env, struct bpf_verifier_state *st, i
 			return 0;
 		if (flow_has_room(env, ++cnt) && flow_join_makes_up(flow, &o->st, st))
 			continue;
-		/* what comes out of a recursive function gets into it again */
-		err = bpf_states_join(env, &flow->tmp, &o->st, st,
-				      env->subprog_info[st->frame[0]->subprogno].recursive ||
-				      o->joins > BPF_FLOW_MAX_JOINS);
+		err = bpf_states_join(env, &flow->tmp, &o->st, st, o->joins > max_joins);
 		if (err < 0)
 			return err;
 		if (err)

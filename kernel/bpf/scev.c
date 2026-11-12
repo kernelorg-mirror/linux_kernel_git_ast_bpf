@@ -2134,7 +2134,7 @@ static int join_added_edges(struct bpf_verifier_env *env, struct bpf_subprog_inf
 		if (err)
 			return err;
 	}
-	return sub->bail_insn < 0 ? 0 : join_successor(env, -1, sub->bail_insn, old_env, cur_env);
+	return 0;
 }
 
 /*

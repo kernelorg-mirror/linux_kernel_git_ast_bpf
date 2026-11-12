@@ -1729,7 +1729,7 @@ __description("budget: every second trip leaves everything as it was")
 __arch_x86_64
 __arch_arm64
 __success __retval(0) __log_level(2)
-__msg("processed 25 insns")
+__msg("processed 24 insns")
 __naked void trips_of_period_two(void)
 {
 	asm volatile (
@@ -1758,7 +1758,7 @@ __description("budget: a trip is dropped in the middle of the loop")
 __arch_x86_64
 __arch_arm64
 __success __retval(0) __log_level(2)
-__msg("processed 33 insns")
+__msg("processed 32 insns")
 __naked void trip_dropped_in_the_middle(void)
 {
 	asm volatile (
@@ -1811,7 +1811,7 @@ __description("budget: a trip is dropped at a call that waits")
 __arch_x86_64
 __arch_arm64
 __success __retval(0) __log_level(2)
-__msg("processed 27 insns")
+__msg("processed 23 insns")
 __naked void trip_dropped_at_a_call(void)
 {
 	asm volatile (

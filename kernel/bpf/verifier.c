@@ -192,7 +192,7 @@ struct bpf_verifier_stack_elem {
 	 * and after processing instruction 'prev_insn_idx'
 	 */
 	struct bpf_verifier_state st;
-	int insn_idx;
+	int insn_idx; /* -1: its frame is left at 'prev_insn_idx', see unwind_frame() */
 	int prev_insn_idx;
 	/* it goes there only if may_goto in front of prev_insn_idx does, see check_loop_guard() */
 	enum bpf_guard_edge guard_edge;
@@ -3403,17 +3403,12 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 	bool seen = false;
 	int i;
 
-	for (i = 0; i < env->subprog_cnt; i++)
-		env->subprog_info[i].bail_insn = -1;
-
 	for (i = 0; i < env->prog->len; i++, insn++) {
 		if (bpf_is_ldimm64(insn)) {
 			i++;
 			insn++;
 			continue;
 		}
-		if (insn->code == (BPF_JMP | BPF_EXIT))
-			bpf_find_containing_subprog(env, i)->bail_insn = i;
 		if (bpf_is_unwind_exit(insn)) {
 			bpf_find_containing_subprog(env, i)->can_unwind = true;
 			seen = true;
@@ -6155,7 +6150,7 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 				si[s].has_tail_call ? "tail calls" : "LD_ABS");
 			break;
 		}
-		if (si[s].bail_insn < 0) {
+		if (si[s].exit_idx == U32_MAX) {
 			verbose(env, "recursive %s() has no exit\n", bpf_subprog_name(env, s));
 			break;
 		}
@@ -11731,8 +11726,11 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 	return err ?: PROCESS_BPF_EXIT;
 }
 
-/* The current state is at exit of a function that is verified on its own. */
-static int exit_func_on_its_own(struct bpf_verifier_env *env)
+/*
+ * The current state leaves a function that is verified on its own.
+ * @exit_idx: an exit of the function, the one that the state is at if it is at one.
+ */
+static int exit_func_on_its_own(struct bpf_verifier_env *env, int exit_idx)
 {
 	struct bpf_verifier_state *state = env->cur_state;
 	struct bpf_func_state *callee = state->frame[0];
@@ -11755,7 +11753,7 @@ static int exit_func_on_its_own(struct bpf_verifier_env *env)
 		return err;
 
 	account_current_path(env);
-	err = bpf_flow_exit(env, state, env->insn_idx);
+	err = bpf_flow_exit(env, state, exit_idx);
 	return err ?: PROCESS_BPF_EXIT;
 }
 
@@ -20764,7 +20762,7 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	struct bpf_func_state *cur_frame = cur_func(env);
 
 	if (!exception_exit && !env->cur_state->curframe && env->cur_state->flow_entry)
-		return exit_func_on_its_own(env);
+		return exit_func_on_its_own(env, env->insn_idx);
 
 	/* We must do check_reference_leak here before
 	 * prepare_func_exit to handle the case when
@@ -21612,7 +21610,8 @@ static bool budget_can_unwind(struct bpf_verifier_env *env, const struct bpf_ver
 	const struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
 	bool top;
 
-	if (sub->bail_insn < 0)
+	/* see unwind_frame() */
+	if (sub->exit_idx == U32_MAX)
 		return false;
 	if (st->acquired_refs != frame->entry_refs ||
 	    st->active_rcu_locks != frame->entry_rcu_locks ||
@@ -21643,8 +21642,7 @@ static bool guard_reads_unset_reg(struct bpf_verifier_env *env,
 
 /*
  * The current frame leaves with 0 in place of the result: with unwind_exit if the subprog
- * can do that, with exit otherwise. The insns are added when the main pass is over. Until
- * then an exit that the subprog has stands for them.
+ * can do that, with exit otherwise. The insns are added when the main pass is over.
  */
 static int push_budget_exit(struct bpf_verifier_env *env)
 {
@@ -21652,7 +21650,7 @@ static int push_budget_exit(struct bpf_verifier_env *env)
 	struct bpf_verifier_state *branch;
 	struct bpf_reg_state *regs;
 
-	branch = push_stack(env, sub->bail_insn, env->insn_idx, false);
+	branch = push_stack(env, -1, env->insn_idx, false);
 	if (IS_ERR(branch))
 		return PTR_ERR(branch);
 	branch->unwound = sub->bail_unwinds;
@@ -21747,6 +21745,40 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/*
+ * The current frame of @st is left at @insn_idx, where the program has no exit: the verifier
+ * emits one after the main pass. @st->unwound tells which one. No insn stands for it in the
+ * main pass. What an exit does to a state is done to @st here, and what is left of @st goes
+ * where the frame returns to, through the worklist like every other state. @st is taken.
+ */
+static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int insn_idx)
+{
+	struct bpf_func_state *frame = st->frame[st->curframe];
+	struct bpf_verifier_state *cur = env->cur_state;
+	int cur_idx = env->insn_idx, err;
+	bool print_state;
+
+	if (env->log.level & BPF_LOG_LEVEL2)
+		verbose(env, "from %d to %s of func#%d\n", insn_idx,
+			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
+	env->cur_state = st;
+	env->insn_idx = insn_idx;
+	if (!st->curframe && st->flow_entry) {
+		/* What leaves the function is compared as if it were at one exit, out of loops. */
+		frame->loop_stack_cnt = 0;
+		err = exit_func_on_its_own(env, env->subprog_info[frame->subprogno].exit_idx);
+	} else {
+		err = process_bpf_exit_full(env, &print_state, false);
+	}
+	if (err == INSN_IDX_UPDATED)
+		err = bpf_flow_deliver(env, st, env->insn_idx, insn_idx);
+	else if (err == PROCESS_BPF_EXIT)
+		err = 0;
+	env->cur_state = cur;
+	env->insn_idx = cur_idx;
+	return err;
+}
+
 /* The states that the insn pushed go where they were pushed to. */
 static int flow_drain(struct bpf_verifier_env *env)
 {
@@ -21755,10 +21787,12 @@ static int flow_drain(struct bpf_verifier_env *env)
 
 	while ((elem = env->head)) {
 		env->head = elem->next;
-		if (!err && elem->guard_edge)
-			err = bpf_flow_guard_edge(env, &elem->st, elem->insn_idx,
-						  elem->prev_insn_idx, elem->guard_edge);
-		else if (!err)
+		if (err || (elem->guard_edge &&
+			    !bpf_flow_guard_edge(env, elem->prev_insn_idx, elem->guard_edge)))
+			;
+		else if (elem->insn_idx < 0)
+			err = unwind_frame(env, &elem->st, elem->prev_insn_idx);
+		else
 			err = bpf_flow_deliver(env, &elem->st, elem->insn_idx,
 					       elem->prev_insn_idx);
 		bpf_free_verifier_state(&elem->st, false);
