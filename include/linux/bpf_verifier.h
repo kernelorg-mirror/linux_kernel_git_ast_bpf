@@ -573,8 +573,6 @@ struct bpf_verifier_state {
 
 	bool speculative;
 	bool in_sleepable;
-	/* a global function or an extension, and what it calls: exit of frame 0 is not the end */
-	bool callers_unknown;
 	/* The callee left with unwind_exit. Next insn is unwind_goto. */
 	bool unwound;
 	/*
@@ -1893,6 +1891,7 @@ static inline int bpf_head_guard_target(const struct bpf_verifier_env *env, int 
 	return aux->guard_at_header ? aux->guard_to : -1;
 }
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
+int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
 
 /* Kinds of member a by-value struct or union may be composed of. */
 enum btf_member_kind {

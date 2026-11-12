@@ -673,9 +673,6 @@ bool bpf_state_subsumes(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	if (old->speculative && !cur->speculative)
 		return false;
 
-	if (old->callers_unknown != cur->callers_unknown)
-		return false;
-
 	if (old->in_sleepable != cur->in_sleepable)
 		return false;
 

@@ -633,7 +633,7 @@ static int append_budget_exit(struct bpf_verifier_env *env, int s)
 		return 0;
 
 	buf[n++] = env->prog->insnsi[last];
-	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+	buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env, s));
 	if (bpf_ret_reg_pair(env, s))
 		buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 	buf[n++] = budget_exit_insn(env, sub);
@@ -744,6 +744,8 @@ int bpf_insert_loop_guards(struct bpf_verifier_env *env)
 			for (r = BPF_REG_0; r < BPF_REG_FP; r++)
 				if (zero[i] & BIT(r))
 					patch[n++] = BPF_MOV64_IMM(r, 0);
+			s = bpf_find_containing_subprog(env, i) - env->subprog_info;
+			patch[2].imm = bpf_unwound_retval(env, s);
 		}
 		jmp = n++;
 		/* What is behind moves with this patch. The other patches are not there yet. */

@@ -1787,7 +1787,6 @@ int bpf_copy_verifier_state(struct bpf_verifier_state *dst_state,
 		return err;
 	dst_state->speculative = src->speculative;
 	dst_state->in_sleepable = src->in_sleepable;
-	dst_state->callers_unknown = src->callers_unknown;
 	dst_state->unwound = src->unwound;
 	dst_state->changed_pkt_data = src->changed_pkt_data;
 	dst_state->flow_entry = src->flow_entry;
@@ -3431,6 +3430,11 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 	if (!bpf_jit_supports_unwind() || bpf_prog_is_offloaded(env->prog->aux)) {
 		verbose(env, "JIT does not support unwinding\n");
 		return -ENOTSUPP;
+	}
+	/* it ends in its main program: nothing unwinds into the program that it extends */
+	if (env->prog->type == BPF_PROG_TYPE_EXT && env->subprog_info[0].can_unwind) {
+		verbose(env, "unwind_exit in the main program of an extension\n");
+		return -EINVAL;
 	}
 	env->prog->jit_required = 1;
 	env->prog->aux->can_unwind = env->subprog_info[0].can_unwind;
@@ -11674,7 +11678,6 @@ static int call_func_on_its_own(struct bpf_verifier_env *env, int subprog, int i
 		return -ENOMEM;
 	entry.frame[0] = callee;
 	entry.in_sleepable = state->in_sleepable;
-	entry.callers_unknown = state->callers_unknown;
 	init_func_state(env, callee, BPF_MAIN_FUNC, 0, subprog);
 	/* the frame that says so is not there when the function is verified */
 	callee->in_rcu_callback_fn = in_rcu_callback(env);
@@ -21575,14 +21578,28 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, bool *backedge, bool *drop
 	return err < 0 ? err : 0;
 }
 
-/* Can the main program return 0? */
-static bool zero_is_valid_retval(struct bpf_verifier_env *env)
+/*
+ * What @subprog returns when it is unwound, see push_budget_exit(). No code of the program chooses
+ * that value. For the main program: where check_return_code() has a range with 0 in it, 0 refuses
+ * or changes nothing, but for an LSM hook that returns an errno: there 0 lets the operation go on.
+ * A range without 0 is [1, 1]: hooks that cannot refuse.
+ * An extension returns into the program that it extends, with the value of that program.
+ * The exception callback returns in place of the main program.
+ */
+int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog)
 {
+	struct bpf_prog *prog = env->prog;
 	struct bpf_retval_range range;
 
-	if (program_returns_void(env) || !return_retval_range(env, &range))
-		return true;
-	return range.minval <= 0 && range.maxval >= 0;
+	if (subprog && subprog != env->exception_callback_subprog)
+		return 0;
+	while (prog->type == BPF_PROG_TYPE_EXT)
+		prog = prog->aux->dst_prog;
+	if (get_func_retval_range(prog, &range) && range.minval < 0)
+		return -EPERM;
+	if (!program_returns_void(env) && return_retval_range(env, &range) && range.minval > 0)
+		return range.minval;
+	return 0;
 }
 
 /*
@@ -21608,7 +21625,6 @@ static bool budget_can_unwind(struct bpf_verifier_env *env, const struct bpf_ver
 {
 	const struct bpf_func_state *frame = st->frame[st->curframe];
 	const struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
-	bool top;
 
 	/* see unwind_frame() */
 	if (sub->exit_idx == U32_MAX)
@@ -21617,14 +21633,13 @@ static bool budget_can_unwind(struct bpf_verifier_env *env, const struct bpf_ver
 	    st->active_rcu_locks != frame->entry_rcu_locks ||
 	    st->active_preempt_locks != frame->entry_preempt_locks)
 		return false;
-	if (frame->in_callback_fn || frame->in_exception_callback_fn)
+	if (frame->in_callback_fn)
 		return false;
 	/* the kernel called it: either exit ends it */
-	top = !st->curframe && !st->callers_unknown &&
-	      (!frame->subprogno || frame->in_async_callback_fn);
-	if (top && !frame->subprogno && !zero_is_valid_retval(env))
-		return false;
-	return top || sub->bail_unwinds || or_exit;
+	if (!st->curframe && (!frame->subprogno || frame->in_async_callback_fn ||
+			      frame->in_exception_callback_fn))
+		return true;
+	return sub->bail_unwinds || or_exit;
 }
 
 /* May_goto at the head of a loop skips the body. Does it go to code that reads what is not set? */
@@ -21643,6 +21658,7 @@ static bool guard_reads_unset_reg(struct bpf_verifier_env *env,
 /*
  * The current frame leaves with 0 in place of the result: with unwind_exit if the subprog
  * can do that, with exit otherwise. The insns are added when the main pass is over.
+ * What the kernel called leaves with bpf_unwound_retval().
  */
 static int push_budget_exit(struct bpf_verifier_env *env)
 {
@@ -21655,7 +21671,8 @@ static int push_budget_exit(struct bpf_verifier_env *env)
 		return PTR_ERR(branch);
 	branch->unwound = sub->bail_unwinds;
 	regs = branch->frame[branch->curframe]->regs;
-	__mark_reg_const_zero(&regs[BPF_REG_0]);
+	bpf_mark_reg_known_scalar(&regs[BPF_REG_0],
+				  bpf_unwound_retval(env, cur_func(env)->subprogno));
 	if (bpf_ret_reg_pair(env, cur_func(env)->subprogno))
 		__mark_reg_const_zero(&regs[BPF_REG_2]);
 	return 0;
@@ -23146,8 +23163,6 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 	state->curframe = 0;
 	state->speculative = false;
 	state->in_sleepable = context == BPF_FUNC_CTX_SLEEPABLE;
-	/* nobody knows what the callers of a global function or of an extension hold */
-	state->callers_unknown = subprog || env->prog->type == BPF_PROG_TYPE_EXT;
 	env->no_rcu_read_lock = context == BPF_FUNC_CTX_NO_RCU_LOCK;
 	state->frame[0] = kzalloc_obj(struct bpf_func_state, GFP_KERNEL_ACCOUNT);
 	if (!state->frame[0]) {
@@ -24014,10 +24029,8 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 				prog_extension ? "Extension" : "Tracing");
 			return -EINVAL;
 		}
-		/* unwind_exit of the main prog is exit, unless it's an extension */
-		tgt_can_unwind = (subprog || tgt_prog->type == BPF_PROG_TYPE_EXT) &&
-				 (aux->func ? aux->func[subprog]->aux->can_unwind
-					    : aux->can_unwind);
+		/* unwind_exit of the main prog is exit */
+		tgt_can_unwind = subprog && aux->func && aux->func[subprog]->aux->can_unwind;
 		/* unwind_exit would return to the trampoline that called the target */
 		if (tgt_can_unwind && !prog_extension &&
 		    prog->expected_attach_type != BPF_TRACE_FENTRY) {
@@ -24074,12 +24087,6 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			if (prog->aux->might_sleep && !tgt_might_sleep) {
 				bpf_log(log,
 					"Extension program may sleep, while original does not\n");
-				return -EINVAL;
-			}
-			/* There is no unwind_goto after the calls of the original */
-			if (prog->aux->can_unwind && !tgt_can_unwind) {
-				bpf_log(log,
-					"Extension program can unwind, while original does not\n");
 				return -EINVAL;
 			}
 		}

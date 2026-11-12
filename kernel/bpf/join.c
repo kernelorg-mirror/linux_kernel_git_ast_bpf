@@ -494,7 +494,6 @@ static bool join_check_state(const struct bpf_verifier_state *a,
 	if (a->curframe != b->curframe || a->insn_idx != b->insn_idx)
 		return false;
 	if (a->speculative != b->speculative || a->in_sleepable != b->in_sleepable ||
-	    a->callers_unknown != b->callers_unknown ||
 	    a->unwound != b->unwound || a->changed_pkt_data != b->changed_pkt_data)
 		return false;
 	if (a->active_locks != b->active_locks ||
