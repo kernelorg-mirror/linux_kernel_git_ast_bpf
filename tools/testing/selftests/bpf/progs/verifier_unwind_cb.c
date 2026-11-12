@@ -59,6 +59,9 @@ private(C) struct bpf_rb_root troot __contains(node_task, node);
 /* How many times the callback ran */
 __u64 runs;
 
+/* What the verifier doesn't know: bpf_loop() is not inlined, a loop doesn't end */
+volatile __u64 no_flags, forever = 1;
+
 #define count_run()				\
 	"r1 = %[runs] ll;"			\
 	"r2 = *(u64 *)(r1 + 0);"		\
@@ -141,6 +144,35 @@ __naked int loop_cb_unwinds(void)
 	);
 }
 
+/* Nothing is in the map. What follows the loop counts on its exit. */
+static long cb_waits(u32 i, long *sum)
+{
+	int key = 0, *val;
+
+	bpf_rcu_read_lock();
+	do {
+		val = bpf_map_lookup_elem(&hash, &key);
+	} while (!val);
+	*sum += *val;
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* The callback leaves its RCU section and unwinds, bpf_loop() leaves, the caller turns preemption on */
+SEC("tc")
+__description("unwind cb: a loop in the callback of bpf_loop is out of time")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__success __retval(0)
+int loop_in_cb(void *ctx)
+{
+	long sum = 7;
+
+	bpf_preempt_disable();
+	bpf_loop(2, cb_waits, &sum, no_flags);
+	bpf_preempt_enable();
+	return sum;
+}
+
 /* Unwinds with a pointer into its own stack */
 __naked __noinline __used
 static unsigned long cb_unwinds_with_fp(void)
@@ -170,6 +202,40 @@ __naked int loop_cb_unwinds_with_fp(void)
 		:
 		: __imm_ptr(cb_unwinds_with_fp),
 		  __imm(bpf_loop)
+		: __clobber_common
+	);
+}
+
+/* Unwinds with the key, which is in the frame of bpf_for_each_array_elem() */
+__naked __noinline __used
+static unsigned long cb_unwinds_with_key(void)
+{
+	asm volatile (
+		"r0 = r2;"
+		unwind_exit
+	);
+}
+
+SEC("tc")
+__description("unwind cb: the callback unwinds with a pointer into the frame of the helper")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__failure __msg("R0 invalid mem access 'scalar'")
+__naked int for_each_cb_unwinds_with_key(void)
+{
+	asm volatile (
+		"r1 = %[array] ll;"
+		"r2 = %[cb_unwinds_with_key];"
+		"r3 = 0;"
+		"r4 = 0;"
+		"call %[bpf_for_each_map_elem];"
+		unwind_goto(1)
+		"exit;"
+		"r0 = *(u32 *)(r0 + 0);"
+		"exit;"
+		:
+		: __imm_addr(array),
+		  __imm_ptr(cb_unwinds_with_key),
+		  __imm(bpf_for_each_map_elem)
 		: __clobber_common
 	);
 }
@@ -357,6 +423,84 @@ int rbtree_cb_unwinds(void *ctx)
 	return rbtree_cb_unwinds_via(false) + rbtree_cb_unwinds_via(true);
 }
 
+static bool less_waits(struct bpf_rb_node *a, const struct bpf_rb_node *b)
+{
+	while (forever)
+		;
+	return false;
+}
+
+/* The kfunc drops the node. The pad that the verifier adds releases the lock and nothing else. */
+SEC("tc")
+__description("unwind cb: a loop in the comparator of bpf_rbtree_add is out of time")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__success __retval(0)
+int loop_in_comparator(void *ctx)
+{
+	struct node_data *n;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		n = bpf_obj_new(typeof(*n));
+		if (!n)
+			return 1;
+		bpf_spin_lock(&glock);
+		bpf_rbtree_add(&groot, &n->node, less_waits);
+		bpf_spin_unlock(&glock);
+	}
+	return 2;
+}
+
+struct node_tree {
+	struct bpf_rb_node node;
+	struct bpf_spin_lock lock;
+	struct bpf_rb_root root __contains(node_data, node);
+};
+
+private(D) struct bpf_spin_lock nlock;
+private(D) struct bpf_rb_root nroot __contains(node_tree, node);
+
+/* The kfunc would drop the node under the lock of the tree, and to free it takes the lock in it */
+SEC("tc")
+__description("unwind cb: a loop in the comparator, the node has a lock and a tree of its own")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the JIT or the helper that calls the function cannot unwind it")
+int loop_in_comparator_node_with_tree(void *ctx)
+{
+	struct node_tree *n = bpf_obj_new(typeof(*n));
+
+	if (!n)
+		return 0;
+	bpf_spin_lock(&nlock);
+	bpf_rbtree_add(&nroot, &n->node, less_waits);
+	bpf_spin_unlock(&nlock);
+	return 0;
+}
+
+/* It is one function for both trees, and it has unwound out of the first one */
+SEC("tc")
+__description("unwind cb: one comparator with a loop for two trees, one of them has such nodes")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__failure __msg("callback cannot unwind at insn {{[0-9]+}}: less_waits() does")
+int loop_in_comparator_of_two_trees(void *ctx)
+{
+	struct node_data *d = bpf_obj_new(typeof(*d));
+	struct node_tree *n;
+
+	if (!d)
+		return 0;
+	bpf_spin_lock(&glock);
+	bpf_rbtree_add(&groot, &d->node, less_waits);
+	bpf_spin_unlock(&glock);
+	n = bpf_obj_new(typeof(*n));
+	if (!n)
+		return 0;
+	bpf_spin_lock(&nlock);
+	bpf_rbtree_add(&nroot, &n->node, less_waits);
+	bpf_spin_unlock(&nlock);
+	return 0;
+}
+
 static __noinline int first_goes_in_again(void)
 {
 	struct bpf_rb_node *m = bpf_rbtree_first(&groot);
@@ -434,6 +578,24 @@ int BPF_PROG(rbtree_cb_unwinds_nmi_unsafe, struct task_struct *task, u64 clone_f
 	ret = rbtree_add_with_pad(&troot, &n->node, (void *)less_unwinds);
 	bpf_spin_unlock(&tlock);
 	return ret;
+}
+
+/* So the verifier doesn't let a comparator unwind there */
+SEC("tp_btf/task_newtask")
+__description("unwind cb: a loop in the comparator, tracing program, type with NMI unsafe fields")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the JIT or the helper that calls the function cannot unwind it")
+int BPF_PROG(loop_in_comparator_nmi_unsafe, struct task_struct *task, u64 clone_flags)
+{
+	struct node_task *n;
+
+	n = bpf_obj_new(typeof(*n));
+	if (!n)
+		return 0;
+	bpf_spin_lock(&tlock);
+	bpf_rbtree_add(&troot, &n->node, less_waits);
+	bpf_spin_unlock(&tlock);
+	return 0;
 }
 
 char _license[] SEC("license") = "GPL";
