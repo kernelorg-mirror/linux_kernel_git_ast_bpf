@@ -475,6 +475,66 @@ __naked int no_pruning_after_the_call(void)
 	);
 }
 
+/* 1, 5, 9 .. in r1 are kept apart up to the jump that tests them. What unwinds leaves before. */
+__naked __noinline __used
+static unsigned long passes_on_then_tests_arg(void)
+{
+	asm volatile (
+		"r6 = r1;"
+		"r1 = %[zero] ll;"
+		"r1 = *(u64 *)(r1 + 0);"
+		"call may_unwind;"
+		unwind_goto(4)
+		"if r6 == 3 goto 1f;"
+		"r0 = 0;"
+	"1:"
+		"r0 = 7;"
+		"exit;"
+		unwind_exit
+		:
+		: __imm_addr(zero),
+		  __imm_unwind_goto(4),
+		  __imm_unwind_exit
+	);
+}
+
+#define CALL(arg)				\
+	"r1 = " #arg ";"			\
+	"call passes_on_then_tests_arg;"	\
+	unwind_goto(1)				\
+	"goto +2;"				\
+	"r0 = 42;"				\
+	"exit;"
+#define CALL8(a, b, c, d, e, f, g, h) \
+	CALL(a) CALL(b) CALL(c) CALL(d) CALL(e) CALL(f) CALL(g) CALL(h)
+
+/*
+ * The same unwound state comes out of the subprog for each call, before the state of the call
+ * meets those of the calls before it. Each call gets it twice at most: 14 states per call, 450 in
+ * all. If each call gets all copies there are 1411.
+ */
+SEC("socket")
+__description("unwind: what unwinds out of a subprog gets to each of 32 calls once")
+__arch_x86_64
+__arch_arm64
+__load_if_JITed()
+__success __retval(0) __log_level(4)
+__msg("total_states {{[0-9][0-9][0-9]}} peak_states")
+__naked int unwinds_to_32_calls(void)
+{
+	asm volatile (
+		CALL8(1, 5, 9, 13, 17, 21, 25, 29)
+		CALL8(33, 37, 41, 45, 49, 53, 57, 61)
+		CALL8(65, 69, 73, 77, 81, 85, 89, 93)
+		CALL8(97, 101, 105, 109, 113, 117, 121, 125)
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_unwind_goto(1)
+		: __clobber_all
+	);
+}
+
 /* Returns ctx, or unwinds with a number in r0 */
 __naked __noinline __used
 static unsigned long ctx_or_unwind(void)
