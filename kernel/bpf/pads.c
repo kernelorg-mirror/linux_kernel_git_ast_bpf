@@ -6,6 +6,7 @@
  * for that:
  *   - may_goto that the verifier adds
  *   - the check at the entry of a recursive subprog
+ *   - a call of a subprog that comes back with unwind_exit and has no unwind_goto after it
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
  * then 'r0 = 0' and unwind_exit, or exit in a frame that cannot unwind.
@@ -47,7 +48,29 @@
  * join_check_state(): the numbers of sections, refs[] entry by entry, and what is in the registers
  * and stack slots that are live at the site.
  *
- * Plans live as long as a round of the main pass.
+ * Plans live as long as a round of the main pass. What survives a round grows to the safe side:
+ * bail_unwinds, did_unwind.
+ *
+ * The frames of a program are unwound one by one. The pad of a frame ends in unwind_exit, which
+ * goes to unwind_goto after the call in the caller, and that goes to the pad of the caller:
+ *
+ *	static int wait(void)				wait:
+ *	{						1: ...
+ *		do {					   may_goto pad
+ *			...				   if r0 == 0 goto 1b
+ *		} while (!p);				   ...
+ *		return *p;				   exit
+ *	}					      pad: r0 = 0
+ *							   unwind_exit
+ *	bpf_rcu_read_lock();				prog:
+ *	v = wait();					   call bpf_rcu_read_lock
+ *	bpf_rcu_read_unlock();				   call wait
+ *	return v;					   unwind_goto pad
+ *							   ...
+ *							   exit
+ *						      pad: call bpf_rcu_read_unlock
+ *							   r0 = 0
+ *							   exit
  *
  * A section has no handle: the plan has their number. Every other resource that the frame
  * acquired is an ENTRY of the plan. Its release takes a handle: the address of the lock, of
@@ -156,6 +179,19 @@ struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx
 	return plan;
 }
 
+/* @callee was left with unwind_exit and comes back to the call at @call_idx, which is a site */
+int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee)
+{
+	struct bpf_pad_plan *plan = bpf_pad_plan_get(env, call_idx, BPF_SITE_CALL);
+
+	if (plan && !plan->callees)
+		plan->callees = bitmap_zalloc(env->subprog_cnt, GFP_KERNEL_ACCOUNT);
+	if (!plan || !plan->callees)
+		return -ENOMEM;
+	__set_bit(callee, plan->callees);
+	return 0;
+}
+
 void bpf_pad_plans_free(struct bpf_insn_aux_data *aux)
 {
 	struct bpf_pad_plan *plan;
@@ -163,6 +199,7 @@ void bpf_pad_plans_free(struct bpf_insn_aux_data *aux)
 	while ((plan = aux->pad_plans)) {
 		aux->pad_plans = plan->next;
 		kfree(plan->ents);
+		bitmap_free(plan->callees);
 		kfree(plan);
 	}
 }
@@ -486,6 +523,8 @@ static int visit_refs(struct bpf_verifier_env *env, struct bpf_pad_plan *plan,
 	struct bpf_pad_ent new, *ent;
 	int i, arg, pass, pos, err;
 
+	/* the pad of a call runs after the call: what is live at the next insn is there */
+	insn_idx += plan->kind == BPF_SITE_CALL;
 	for (i = 0; i < plan->nr_ents; i++)
 		plan->ents[i].ref = -1;
 	for (pass = 0; pass < 2; pass++) {
@@ -689,6 +728,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 	static const char * const kind[] = {
 		[BPF_SITE_GUARD]		= "may_goto",
 		[BPF_SITE_RECURSION]		= "recursion check",
+		[BPF_SITE_CALL]			= "call",
 	};
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
@@ -697,6 +737,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_CONFLICT_NOT_ALWAYS_HELD]	= "a resource is held on some paths only",
 		[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
 		[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
+		[BPF_CONFLICT_CANNOT_UNWIND]	= "the frame cannot unwind",
 	};
 	int j;
 

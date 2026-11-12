@@ -700,12 +700,18 @@ __naked int shared_pad(void)
 	);
 }
 
+/* The verifier adds it, and a landing pad that ends the prog with 0 */
 SEC("tc")
 __description("unwind: no unwind_goto after a call of a global subprog")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__failure __msg("no unwind_goto after the call of global_returns()")
+__success __retval(7)
+__xlated("0: call pc+4")
+__xlated("1: unwind_goto pc+1")
+__xlated("2: exit")
+__xlated("3: r0 = 0")
+__xlated("4: exit")
 __naked int global_no_unwind_goto(void)
 {
 	asm volatile (
@@ -720,7 +726,7 @@ __description("unwind: no unwind_goto after a call of a static subprog")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__failure __msg("unwind_exit, but no unwind_goto after the call at insn 1")
+__success __retval(0)
 __naked int static_no_unwind_goto(void)
 {
 	asm volatile (

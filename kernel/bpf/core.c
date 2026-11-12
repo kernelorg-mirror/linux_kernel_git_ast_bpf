@@ -562,8 +562,8 @@ int __bpf_patch_list_del(struct bpf_patch_list *pl, const struct bpf_prog *prog,
  * instruction arrays and poke descriptors still name the insn at 'off', while
  * subprogs, line info, function pointers and calls that start at 'off' start
  * at the first inserted insn. Inserting in front of a queued patch puts the
- * insns in front of it. 'off' is the start of a subprog, so nothing falls
- * through to the inserted insns.
+ * insns before it. The program gets to the inserted insns by a call of the
+ * subprog that starts at 'off', or from the insn before 'off'.
  */
 int __bpf_patch_list_insert(struct bpf_patch_list *pl, const struct bpf_prog *prog,
 			    u32 off, const struct bpf_insn *insns, u32 cnt)
