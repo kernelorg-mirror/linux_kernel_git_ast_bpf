@@ -1200,7 +1200,10 @@ struct bpf_subprog_info {
 	 * adds it. Not after the call of a helper, see subprog_cannot_unwind().
 	 */
 	bool bail_unwinds: 1;
-	/* it has unwind_exit, or a state left it that way in a round of the main pass */
+	/*
+	 * It has unwind_exit, or a state left it that way in a round of the main pass, or that is
+	 * expected of it, see mark_unwind_above().
+	 */
 	bool did_unwind: 1;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
@@ -1333,6 +1336,7 @@ struct bpf_verifier_env {
 	bool uses_arena_sp;		/* the program has insns with BPF_REG_ARENA_SP */
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_loop_gets_guards() */
+	bool pads_late;			/* a global subprog unwinds: see do_check_all() */
 	u32 loop_entry_cnt;		/* see loop_stack_entry.entry_id, callback_entry_id */
 	u32 walk_cnt;			/* see loop_stack_entry.walk_id */
 	u32 *walk_insns;		/* the insns that were looked at in each of them */
@@ -1423,6 +1427,8 @@ struct bpf_verifier_env {
 	u32 max_states_per_insn;
 	/* total number of allocated verifier states */
 	u32 total_states;
+	/* those of them that rounds of the main pass made which were dropped, see do_check_all() */
+	u32 dropped_states;
 	/* some states are freed during program analysis.
 	 * this is peak number of states. this number dominates kernel
 	 * memory consumption during verification

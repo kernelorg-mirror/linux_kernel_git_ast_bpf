@@ -44,7 +44,10 @@
  */
 #define BPF_FLOW_LIVE_PER_INSN	16
 #define BPF_FLOW_LIVE_BASE	4096
-/* All states that were ever there. It bounds the work by the size of the prog. */
+/*
+ * All states that a round of the main pass made, see flow_round_states(). It bounds the work of a
+ * round by the size of the prog.
+ */
 #define BPF_FLOW_TOTAL_PER_INSN	256
 #define BPF_FLOW_TOTAL_BASE	65536
 /*
@@ -2663,6 +2666,12 @@ static bool flow_entries_differ(const struct bpf_verifier_state *t,
 	       ft->loop_stack[cnt - 1].entry_id != fs->loop_stack[cnt - 1].entry_id;
 }
 
+/* The states that this round of the main pass made. Those of dropped rounds don't count. */
+static u32 flow_round_states(const struct bpf_verifier_env *env)
+{
+	return env->total_states - env->dropped_states;
+}
+
 /*
  * States that have a join are kept apart while there is room: half of every limit.
  * After that they are joined, which may lose what the prog needs, and does not run into the limit.
@@ -2673,7 +2682,7 @@ static bool flow_has_room(const struct bpf_verifier_env *env, u32 nr_states)
 
 	return nr_states < BPF_FLOW_MAX_STATES / 2 &&
 	       env->flow->live_states < (BPF_FLOW_LIVE_PER_INSN * len + BPF_FLOW_LIVE_BASE) / 2 &&
-	       env->total_states < (BPF_FLOW_TOTAL_PER_INSN * len + BPF_FLOW_TOTAL_BASE) / 2;
+	       flow_round_states(env) < (BPF_FLOW_TOTAL_PER_INSN * len + BPF_FLOW_TOTAL_BASE) / 2;
 }
 
 /* The state of @set behind @t, the first one if @t is NULL, that @s may be related to */
@@ -2860,10 +2869,10 @@ again:
 		goto err_free;
 	}
 	if (flow->live_states > BPF_FLOW_LIVE_PER_INSN * env->prog->len + BPF_FLOW_LIVE_BASE ||
-	    env->total_states >
+	    flow_round_states(env) >
 	    BPF_FLOW_TOTAL_PER_INSN * (u64)env->prog->len + BPF_FLOW_TOTAL_BASE) {
 		verbose(env, "too many states for %d insns: %d, %d at a time\n",
-			env->prog->len, env->total_states, flow->live_states);
+			env->prog->len, flow_round_states(env), flow->live_states);
 		err = -E2BIG;
 		goto err_free;
 	}

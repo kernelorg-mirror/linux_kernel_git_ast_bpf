@@ -3408,6 +3408,30 @@ static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 }
 
 /*
+ * A subprog unwinds. What calls it without unwind_goto is unwound in turn, and so on. The callers
+ * of a global subprog among them have to know, see unwind_frame(): one more round will do for all.
+ */
+static void mark_unwind_above(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *si = env->subprog_info, *caller;
+	const struct bpf_insn *insn = env->prog->insnsi;
+	bool changed;
+	int i;
+
+	do {
+		changed = false;
+		for (i = 0; i < env->prog->len; i++) {
+			if (!bpf_pseudo_call(&insn[i]) || bpf_is_unwind_goto(&insn[i + 1]) ||
+			    !si[bpf_find_subprog(env, i + insn[i].imm + 1)].did_unwind)
+				continue;
+			caller = bpf_find_containing_subprog(env, i);
+			changed |= !caller->did_unwind;
+			caller->did_unwind = true;
+		}
+	} while (changed);
+}
+
+/*
  * 'call foo; unwind_goto pad' goes to the pad when foo left with unwind_exit.
  * JITs don't emit a branch for it. unwind_exit finds the pad by its return
  * address. So unwind_goto has to follow the call and nothing may jump to it.
@@ -6137,14 +6161,10 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 		bitmap_andnot(called, called, calls + s * words, cnt);
 	}
 
-	/*
-	 * What only the kernel calls returns to it: the main prog, the callback of a timer.
-	 * Callers of a global subprog look at can_unwind before the subprog is verified.
-	 */
+	/* What only the kernel calls returns to it: the main prog, the callback of a timer. */
 	for (s = 0; s < cnt; s++) {
 		si[s].bail_unwinds = si[s].can_unwind ||
-				     (s && !bpf_subprog_is_global(env, s) &&
-				      env->prog->jit_requested && bpf_jit_supports_unwind() &&
+				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && test_bit(s, called));
 		si[s].did_unwind = si[s].can_unwind;
 	}
@@ -12082,7 +12102,9 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			}
 		}
 
-		if (env->subprog_info[subprog].can_unwind) {
+		/* No state comes out of a global subprog, see unwind_frame() */
+		if (env->subprog_info[subprog].did_unwind &&
+		    env->subprog_info[subprog].bail_unwinds) {
 			struct bpf_verifier_state *branch;
 
 			err = check_unwound_return(env, *insn_idx, subprog);
@@ -21908,6 +21930,15 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		__mark_reg_const_zero(&frame->regs[BPF_REG_2]);
 
 	st->unwound = sub->bail_unwinds && !frame_is_top(st);
+	/*
+	 * The callers of a global subprog are verified ahead of it. They look at what follows
+	 * when it unwinds once it is known to do that: all is done again.
+	 */
+	if (st->unwound && !sub->did_unwind && bpf_subprog_is_global(env, frame->subprogno)) {
+		sub->did_unwind = true;
+		mark_unwind_above(env);
+		env->pads_late = true;
+	}
 	sub->did_unwind |= st->unwound;
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
@@ -22175,7 +22206,8 @@ process_bpf_exit:
 /* All is done again, whatever came out, see do_check_all() */
 static bool round_is_dropped(struct bpf_verifier_env *env)
 {
-	return (env->restart && bpf_flow_loops_lost_bound(env)) || env->guards_late;
+	return (env->restart && bpf_flow_loops_lost_bound(env)) || env->guards_late ||
+	       env->pads_late;
 }
 
 static int do_check(struct bpf_verifier_env *env)
@@ -23569,6 +23601,7 @@ static int do_check_main(struct bpf_verifier_env *env)
  * for none, so all are done again when the assumption doesn't hold, whatever came out.
  * The same when a loop gets may_goto, or its may_goto gets another way out, and what went through
  * the loop before is not there any more, see bpf_flow_loop_gets_guards().
+ * The same when a global subprog unwinds whose callers didn't know, see unwind_frame().
  *
  * A round that is dropped counts as paths that never run. What it found out about the insns, the
  * subprogs and the prog stays. Each of these is made for more than one state that gets to an insn:
@@ -23594,6 +23627,7 @@ static int do_check_all(struct bpf_verifier_env *env)
 				bpf_pads_log(env);
 			return ret;
 		}
+		env->dropped_states = env->total_states;
 		/* the log is dropped when a function is found to be safe */
 		bpf_vlog_reset(&env->log, min(log_pos, env->log.end_pos));
 		for (i = 0; i < env->prog->len; i++)
