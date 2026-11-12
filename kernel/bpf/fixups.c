@@ -621,9 +621,9 @@ static bool guard_leaves_subprog(const struct bpf_insn_aux_data *aux)
  * Returns the number of insns, BPF_PAD_MAX_INSNS at most.
  */
 static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_plan *plan,
-		    struct bpf_insn *buf)
+		    struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
-	int n = bpf_pad_insns(env, plan, s, buf);
+	int n = bpf_pad_insns(env, plan, s, buf, aux);
 
 	buf[n++] = budget_exit_insn(env, &env->subprog_info[s]);
 	return n;
@@ -631,10 +631,11 @@ static int emit_pad(struct bpf_verifier_env *env, int s, const struct bpf_pad_pl
 
 /*
  * The landing pads of the sites of subprog @s go after its last insn. Sites whose pads have the
- * same insns share one. @new has room for a pad. Returns the number of insns that are going to be
- * added.
+ * same insns share one. @new and @new_aux have room for a pad. Returns the number of insns that are
+ * going to be added.
  */
-static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new)
+static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new,
+		       struct bpf_insn_aux_data *new_aux)
 {
 	int last = env->subprog_info[s + 1].start - 1, cnt = 1, i, n, pad, len;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
@@ -649,7 +650,7 @@ static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new
 			/* bpf_insert_recursion_checks() emits the pad of the check */
 			if (plan->kind == BPF_SITE_RECURSION || !guard_leaves_subprog(&aux[i]))
 				continue;
-			n = emit_pad(env, s, plan, new);
+			n = emit_pad(env, s, plan, new, new_aux);
 			for (pad = 1; pad < cnt; pad += len) {
 				for (len = 1; buf[pad + len - 1].code != (BPF_JMP | BPF_EXIT);
 				     len++)
@@ -712,7 +713,7 @@ static int emit_goto_pad(struct bpf_verifier_env *env, int i, int s, int added,
  */
 int bpf_insert_sites(struct bpf_verifier_env *env)
 {
-	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_insn_aux_data *aux = env->insn_aux_data, *pad_aux;
 	int len = env->prog->len, i, s, to, n, err = 0;
 	const struct bpf_pad_plan *plan;
 	int *front = NULL, *added, *moved;
@@ -732,13 +733,14 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	 */
 	added = kvzalloc_objs(int, 2 * env->subprog_cnt, GFP_KERNEL_ACCOUNT);
 	patch = kvzalloc_objs(*patch, BPF_PAD_MAX_INSNS, GFP_KERNEL_ACCOUNT);
-	if (!added || !patch) {
+	pad_aux = kvzalloc_objs(*pad_aux, BPF_PAD_MAX_INSNS, GFP_KERNEL_ACCOUNT);
+	if (!added || !patch || !pad_aux) {
 		err = -ENOMEM;
 		goto out;
 	}
 	moved = added + env->subprog_cnt;
 	for (s = 0; s < env->subprog_cnt && !err; s++) {
-		added[s] = append_pads(env, s, patch);
+		added[s] = append_pads(env, s, patch, pad_aux);
 		if (added[s] < 0)
 			err = added[s];
 	}
@@ -766,6 +768,11 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		/* the last insn may be dead code */
 		while (--i >= to)
 			aux[i].seen = 1;
+		/* the insns of the pads have aux data now */
+		for (i = env->subprog_info[s].start; i < to; i++)
+			for (plan = aux[i].pad_plans; plan; plan = plan->next)
+				if (plan->kind != BPF_SITE_RECURSION && guard_leaves_subprog(&aux[i]))
+					emit_pad(env, s, plan, patch, &aux[to - 1 + plan->pad]);
 	}
 
 	/* the number of insns that go before the insn */
@@ -820,7 +827,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	 *  - The guard of a jump goes where the jump goes.
 	 *  - What is live where the guard at the head of a loop goes is live at the head,
 	 *    see bpf_head_guard_target().
-	 *  - A landing pad reads no register.
+	 *  - A landing pad reads places, which are live before the insn.
 	 */
 	aux = env->insn_aux_data;
 	for (i = 0, n = 0; i < len; i++) {
@@ -832,6 +839,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 out:
 	kvfree(added);
 	kvfree(patch);
+	kvfree(pad_aux);
 	kvfree(front);
 	return err;
 }
