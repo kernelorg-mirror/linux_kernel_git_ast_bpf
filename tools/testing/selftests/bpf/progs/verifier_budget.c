@@ -29,6 +29,16 @@ extern void bpf_rcu_read_lock(void) __ksym;
 extern void bpf_rcu_read_unlock(void) __ksym;
 extern void bpf_preempt_disable(void) __ksym;
 extern void bpf_preempt_enable(void) __ksym;
+extern void bpf_local_irq_save(unsigned long *flags) __ksym;
+extern void bpf_local_irq_restore(unsigned long *flags) __ksym;
+
+struct bpf_res_spin_lock {
+	__u32 val;
+};
+
+extern int bpf_res_spin_lock_irqsave(struct bpf_res_spin_lock *lock, unsigned long *flags) __ksym;
+extern void bpf_res_spin_unlock_irqrestore(struct bpf_res_spin_lock *lock,
+					   unsigned long *flags) __ksym;
 
 extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
 extern int *bpf_iter_num_next(struct bpf_iter_num *it) __ksym;
@@ -37,6 +47,7 @@ extern void bpf_iter_num_destroy(struct bpf_iter_num *it) __ksym;
 /* The verifier doesn't know what is in there */
 unsigned long zero;
 unsigned long one = 1;
+unsigned long no_index = 4;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -116,6 +127,32 @@ __naked void loop_in_main_retval(void)
 	);
 }
 
+/* 0 lets the operation go on */
+SEC("lsm/file_mprotect")
+__description("budget: a loop in the main prog on an LSM hook ends it with -EPERM")
+__arch_x86_64
+__arch_arm64
+__success
+__xlated("...")
+__xlated("r0 = -13")
+__xlated("exit")
+__xlated("r0 = -1")
+__xlated("exit")
+__naked void loop_in_main_lsm(void)
+{
+	asm volatile (
+		"r6 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r6 + 0);"
+		"if r1 != 0 goto 1b;"
+		"r0 = -13;"
+		"exit;"
+		:
+		: __imm_addr(zero)
+		: __clobber_all
+	);
+}
+
 /*
  * rcu_read_lock(); do { p = lookup(); } while (!p); v = *p; rcu_read_unlock(); return v;
  * may_goto must not go where the loop goes when it's over: p may be NULL. It ends the prog, by way
@@ -153,6 +190,119 @@ __naked void exit_of_loop_checks_null_rcu(void)
 		  __imm(bpf_map_lookup_elem),
 		  __imm(bpf_rcu_read_lock),
 		  __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+struct locked {
+	struct bpf_spin_lock lock;
+	long t[4];
+};
+
+struct locked locked_global SEC(".data.locked") __hidden;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 2);
+	__type(key, int);
+	__type(value, struct { struct bpf_res_spin_lock lock; long t[4]; });
+} res_locked SEC(".maps");
+
+/* r6 = a value of @map */
+#define LOOKUP(map)					\
+		"r1 = 0;"				\
+		"*(u32 *)(r10 - 4) = r1;"		\
+		"r2 = r10;"				\
+		"r2 += -4;"				\
+		"r1 = %[" #map "] ll;"			\
+		"call %[bpf_map_lookup_elem];"		\
+		"if r0 != 0 goto +1;"			\
+		"exit;"					\
+		"r6 = r0;"
+
+/* may_goto must not go where the loop goes when it's over: i may be anything */
+SEC("tc")
+__description("budget: a spin lock is held and the code behind the loop counts on its exit")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("exit")
+__xlated("r1 = 0x{{.*}}")
+__xlated("call unknown")
+__xlated("r0 = 0")
+__xlated("exit")
+int lock_in_global(void *ctx)
+{
+	unsigned long i;
+	long v;
+
+	bpf_spin_lock(&locked_global.lock);
+	do {
+		i = *(volatile unsigned long *)&no_index;
+	} while (i > 3);
+	v = locked_global.t[i];
+	bpf_spin_unlock(&locked_global.lock);
+	return v + 1;
+}
+
+#define SAVES_IRQ_FLAGS(name)				\
+__naked __noinline __used				\
+static unsigned long name(unsigned long *flags)		\
+{							\
+	asm volatile (					\
+		"call %[bpf_local_irq_save];"		\
+		"r0 = 0;"				\
+		"exit;"					\
+		:					\
+		: __imm(bpf_local_irq_save)		\
+	);						\
+}
+
+SAVES_IRQ_FLAGS(saves_first)
+SAVES_IRQ_FLAGS(saves_second)
+
+#define IRQ_FLAGS(off, func)				\
+		"r1 = r10;"				\
+		"r1 += " #off ";"			\
+		"call " #func ";"
+
+/* Irq flags are restored youngest first, and a landing pad has one order */
+SEC("tc")
+__description("budget: a loop holds irq flags which were saved in two orders")
+__arch_x86_64
+__arch_arm64
+__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: the order of the releases differs")
+__naked void loop_with_irq_flags_in_two_orders(void)
+{
+	asm volatile (
+		"r7 = %[one] ll;"
+		"r6 = %[zero] ll;"
+		"r6 = *(u64 *)(r6 + 0);"
+		"if r6 == 0 goto 1f;"
+	IRQ_FLAGS(-8, saves_first)
+	IRQ_FLAGS(-16, saves_second)
+		"goto 2f;"
+	"1:"
+	IRQ_FLAGS(-16, saves_second)
+	IRQ_FLAGS(-8, saves_first)
+	"2:"
+		"r1 = *(u64 *)(r7 + 0);"
+		"if r1 != 0 goto 2b;"
+		"if r6 == 0 goto 3f;"
+	IRQ_FLAGS(-16, %[bpf_local_irq_restore])
+	IRQ_FLAGS(-8, %[bpf_local_irq_restore])
+		"goto 4f;"
+	"3:"
+	IRQ_FLAGS(-8, %[bpf_local_irq_restore])
+	IRQ_FLAGS(-16, %[bpf_local_irq_restore])
+	"4:"
+		"r0 = 7;"
+		"exit;"
+		:
+		: __imm_addr(one),
+		  __imm_addr(zero),
+		  __imm(bpf_local_irq_restore)
 		: __clobber_all
 	);
 }
@@ -210,6 +360,80 @@ __naked void loop_in_subprog(void)
 		"call spins;"
 		"exit;"
 		::: __clobber_all
+	);
+}
+
+/* 16 bits may not get may_goto and unwind_goto to the landing pad that they share: gotol does */
+SEC("socket")
+__description("budget: a loop and a call that are far from their landing pad")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("goto pc+1")
+__xlated("gotol pc+2108")
+__xlated("if r1 != 0x0 goto pc-")
+__xlated("call pc+")
+__xlated("unwind_goto pc+1")
+__xlated("goto pc+1")
+__xlated("gotol pc+2103")
+__naked void far_from_the_pad(void)
+{
+	asm volatile (
+		"call %[bpf_rcu_read_lock];"
+		"r2 = %[zero] ll;"
+	"1:"
+		"r1 = *(u64 *)(r2 + 0);"
+		"if r1 != 0 goto 1b;"
+		"call spins;"
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = 0;"
+		".rept 2100;"
+		"r0 += 1;"
+		".endr;"
+		"exit;"
+		:
+		: __imm_addr(zero),
+		  __imm(bpf_rcu_read_lock),
+		  __imm(bpf_rcu_read_unlock)
+		: __clobber_all
+	);
+}
+
+__noinline int global_spins(void)
+{
+	while (*(volatile unsigned long *)&one)
+		;
+	return 7;
+}
+
+/* A global subprog is verified after its callers. They find out late that it unwinds. */
+SEC("socket")
+__description("budget: a loop in a global subprog, the caller is in an RCU section")
+__arch_x86_64
+__arch_arm64
+__success __retval(0)
+__xlated("...")
+__xlated("call pc+")
+__xlated("unwind_goto pc+4")
+__xlated("...")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
+__naked void loop_in_global(void)
+{
+	asm volatile (
+		"call %[bpf_rcu_read_lock];"
+		"call global_spins;"
+		"r6 = r0;"
+		"call %[bpf_rcu_read_unlock];"
+		"r0 = r6;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock),
+		  __imm(bpf_rcu_read_unlock)
+		: __clobber_all
 	);
 }
 
@@ -687,6 +911,46 @@ __naked void callback_arms_itself(void)
 		"exit;"
 		:
 		: __imm_addr(timers), __imm_addr(arms_itself), __imm(bpf_map_lookup_elem),
+		  __imm(bpf_timer_set_callback)
+		: __clobber_all
+	);
+}
+
+static __used int spins_in_rcu(void *map, int *key, void *value)
+{
+	bpf_rcu_read_lock();
+	while (*(volatile unsigned long *)&one)
+		;
+	bpf_rcu_read_unlock();
+	return 0;
+}
+
+/* The kernel calls the callback: there is nothing to unwind to */
+SEC("socket")
+__description("budget: the landing pad of a callback that only the kernel calls ends in exit")
+__arch_x86_64
+__arch_arm64
+__success
+__xlated("...")
+__xlated("= r13")
+__xlated("...")
+__xlated("call kernel-function")
+__xlated("{{[rw]}}0 = 0")
+__xlated("exit")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("{{[0-9]+}}: exit")
+__naked void loop_in_timer_callback(void)
+{
+	asm volatile (
+	LOOKUP(timers)
+		"r1 = r6;"
+		"r2 = %[spins_in_rcu] ll;"
+		"call %[bpf_timer_set_callback];"
+		"r0 = 0;"
+		"exit;"
+		:
+		: __imm_addr(timers), __imm_addr(spins_in_rcu), __imm(bpf_map_lookup_elem),
 		  __imm(bpf_timer_set_callback)
 		: __clobber_all
 	);
@@ -1411,6 +1675,10 @@ void __kfunc_btf_root(void)
 	bpf_rcu_read_unlock();
 	bpf_preempt_disable();
 	bpf_preempt_enable();
+	bpf_local_irq_save(0);
+	bpf_local_irq_restore(0);
+	bpf_res_spin_lock_irqsave(0, 0);
+	bpf_res_spin_unlock_irqrestore(0, 0);
 	bpf_iter_num_new(0, 0, 0);
 	bpf_iter_num_next(0);
 	bpf_iter_num_destroy(0);

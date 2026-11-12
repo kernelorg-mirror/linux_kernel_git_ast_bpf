@@ -739,6 +739,25 @@ __naked int static_no_unwind_goto(void)
 	);
 }
 
+/* In more RCU sections than a landing pad that the verifier could add leaves */
+SEC("tc")
+__description("unwind: no unwind_goto after a call, and no landing pad will do")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__failure __msg("landing pad of call at 9: conflict: too much is held")
+__naked int static_no_landing_pad(void)
+{
+	asm volatile (
+		".rept 9;"
+		"call %[bpf_rcu_read_lock];"
+		".endr;"
+		"call always_unwinds;"
+		"exit;"
+		:
+		: __imm(bpf_rcu_read_lock)
+		: __clobber_all
+	);
+}
+
 /* The verifier sees that it doesn't get to unwind_exit */
 SEC("tc")
 __description("unwind: no unwind_goto is fine when the callee doesn't unwind")
@@ -1035,6 +1054,27 @@ __success __retval(7)
 int exception_callback_unwinds(struct __sk_buff *skb)
 {
 	bpf_throw(skb->len);
+	return 0;
+}
+
+__noinline int exception_cb_spins_lsm(__u64 cookie)
+{
+	while (*(volatile unsigned long *)&one)
+		;
+	return -13;
+}
+
+/* It returns in place of the main prog, so it ends like the main prog when its time slice is over */
+SEC("lsm/file_mprotect")
+__description("unwind: a loop in the exception callback on an LSM hook ends the prog with -EPERM")
+__arch_x86_64 __arch_arm64 __load_if_JITed()
+__attribute__((btf_decl_tag("exception_callback:exception_cb_spins_lsm")))
+__success
+__xlated("r0 = -1")
+__xlated("exit")
+int exception_callback_spins_lsm(void *ctx)
+{
+	bpf_throw(0);
 	return 0;
 }
 
