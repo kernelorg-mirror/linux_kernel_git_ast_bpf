@@ -1047,6 +1047,7 @@ struct bpf_insn_aux_data {
 	u64 fault_skips:1; /* when it faults it is skipped: there is no pad, or no way to unwind */
 	u64 fault_empty:1; /* in this round a state that holds nothing went by without a visit */
 	u64 fault_full:1; /* all states visit the plan */
+	u64 fault_unwinds:1; /* emission: when it faults the program goes to 'fault_pad' */
 	u64 need_scev:1;
 	/* a jump in a loop: the edge that is not taken, bit 0, or the other one leaves the loop */
 	u64 edge_leaves:2;
@@ -1288,6 +1289,8 @@ struct bpf_subprog_info {
 	/* they take that many words of 8 bytes below its stack */
 	u8 hidden_words;
 	u8 code_stack_args;
+	/* the pad that releases nothing, for all accesses to arena with 'fault_unwinds'. 0: none */
+	u32 fault_pad;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
 };

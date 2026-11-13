@@ -292,6 +292,8 @@ static void patch_list_adj_aux(struct bpf_prog *prog, struct bpf_insn_patch *p,
 		if (i >= p->target && !memcmp(&patch[i], orig, sizeof(*orig))) {
 			slot[i].non_stack_access = last->non_stack_access;
 			last->non_stack_access = false;
+			slot[i].fault_unwinds = last->fault_unwinds;
+			last->fault_unwinds = false;
 		} else if (bpf_is_mem_insn(&patch[i])) {
 			slot[i].non_stack_access = true;
 		}
@@ -459,6 +461,10 @@ static void patch_list_remap_subprogs(struct bpf_verifier_env *env,
 	/* NOTE: fake 'exit' subprog should be updated as well. */
 	for (i = 0; i <= env->subprog_cnt; i++) {
 		info[i].start = bpf_patch_image_remap(img, img->new_off, info[i].start);
+		/* the program gets there like by a jump */
+		if (info[i].fault_pad)
+			info[i].fault_pad = bpf_patch_image_remap(img, img->new_tgt,
+								  info[i].fault_pad);
 		if (img->new_linfo)
 			info[i].linfo_idx =
 				img->new_linfo[min(info[i].linfo_idx, img->nr_linfo)];
@@ -688,15 +694,23 @@ static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new
 	int last = env->subprog_info[s + 1].start - 1, cnt = 1, i, n, pad, len;
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_insn *buf = NULL, *insn;
-	struct bpf_pad_plan *plan;
+	struct bpf_pad_plan *plan, *shared = NULL;
 
 	for (i = env->subprog_info[s].start; i <= last; i++) {
 		/* no state got there in the last round of the main pass: the empty plan will do */
 		if (aux[i].loop_guard && !bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
 			goto nomem;
-		/* nothing is held there: the same */
-		if (aux[i].fault_empty && !bpf_pad_plan_get(env, i, BPF_SITE_FAULT))
-			goto nomem;
+		/*
+		 * Nothing is held there: the same. There are many such accesses. They get no insn,
+		 * a bit in the entry that they have in the exception table tells, and the pad of
+		 * the first one serves all of the function, see bpf_arena_fault().
+		 */
+		aux[i].fault_unwinds = aux[i].fault_empty && !aux[i].fault_skips;
+		if (aux[i].fault_unwinds && !shared) {
+			shared = bpf_pad_plan_get(env, i, BPF_SITE_FAULT);
+			if (!shared)
+				goto nomem;
+		}
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
 			/* bpf_insert_recursion_checks() emits the pad of the check */
 			if (plan->kind == BPF_SITE_RECURSION || !site_is_used(env, i, plan))
@@ -770,7 +784,7 @@ static const struct bpf_pad_plan *unwind_goto_plan(struct bpf_verifier_env *env,
 	const struct bpf_pad_plan *plan;
 
 	plan = bpf_pad_plan(aux, BPF_SITE_CALL) ?: bpf_pad_plan(aux, BPF_SITE_FAULT);
-	return plan && site_is_used(env, i, plan) ? plan : NULL;
+	return plan && site_is_used(env, i, plan) && !aux->fault_unwinds ? plan : NULL;
 }
 
 /*
@@ -913,10 +927,15 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		while (--i >= to)
 			aux[i].seen = 1;
 		/* the insns of the pads have aux data now */
-		for (i = env->subprog_info[s].start; i < to; i++)
-			for (plan = aux[i].pad_plans; plan; plan = plan->next)
-				if (plan->kind != BPF_SITE_RECURSION && site_is_used(env, i, plan))
-					emit_pad(env, s, plan, patch, &aux[to - 1 + plan->pad]);
+		for (i = env->subprog_info[s].start; i < to; i++) {
+			for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+				if (plan->kind == BPF_SITE_RECURSION || !site_is_used(env, i, plan))
+					continue;
+				emit_pad(env, s, plan, patch, &aux[to - 1 + plan->pad]);
+				if (plan->kind == BPF_SITE_FAULT && aux[i].fault_unwinds)
+					env->subprog_info[s].fault_pad = to - 1 + plan->pad;
+			}
+		}
 	}
 
 	/* the number of insns that go before the insn */
@@ -2283,6 +2302,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->jited_len = func[0]->jited_len;
 	prog->aux->extable = func[0]->aux->extable;
 	prog->aux->num_exentries = func[0]->aux->num_exentries;
+	prog->aux->fault_pad = func[0]->aux->fault_pad;
 	prog->aux->func = func;
 	prog->aux->func_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
 	prog->aux->real_func_cnt = env->subprog_cnt;

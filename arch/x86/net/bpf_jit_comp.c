@@ -1850,11 +1850,11 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  *
  * Bit layout of `fixup` (32-bit):
  *
- * +-----------+-------------+----------+--------+-----------+---------+----------+
- * | 31        | 30          | 29       | 28-24  |   23-16   |   15-8  |    7-0   |
- * |           |             |          |        |           |         |          |
- * | ARENA_ACC | ARENA_WRITE | R0_IN_AX | Unused | ARENA_REG | DST_REG | INSN_LEN |
- * +-----------+-------------+----------+--------+-----------+---------+----------+
+ * +-----------+-------------+----------+---------+--------+-----------+---------+----------+
+ * | 31        | 30          | 29       | 28      | 27-24  |   23-16   |   15-8  |    7-0   |
+ * |           |             |          |         |        |           |         |          |
+ * | ARENA_ACC | ARENA_WRITE | R0_IN_AX | UNWINDS | Unused | ARENA_REG | DST_REG | INSN_LEN |
+ * +-----------+-------------+----------+---------+--------+-----------+---------+----------+
  *
  * - INSN_LEN (8 bits): How far the end of the code of the BPF insn is from the faulting insn.
  *                      That is its own length for a single-insn access, but the distance to
@@ -1873,6 +1873,8 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
  * - R0_IN_AX (1 bit): R0 is in BPF_REG_AX while the faulting insn runs: the CMPXCHG loop of a
  *                     fetching AND/OR/XOR keeps it there while RAX serves the CMPXCHG. The
  *                     handler puts it back, since it leaves the sequence.
+ * - UNWINDS (1 bit): The frame holds nothing at the insn: the handler goes to the landing pad of
+ *                    the function that releases nothing. No unwind_goto follows the insn.
  *
  * Bit layout of `data` (32-bit):
  *
@@ -1890,6 +1892,7 @@ static int emit_atomic_fetch_rmw(u8 **pprog, struct bpf_insn *insn, u32 dst_reg,
 #define FIXUP_INSN_LEN_MASK	GENMASK(7, 0)
 #define FIXUP_REG_MASK		GENMASK(15, 8)
 #define FIXUP_ARENA_REG_MASK	GENMASK(23, 16)
+#define FIXUP_ARENA_UNWINDS	BIT(28)
 #define FIXUP_ARENA_R0_IN_AX	BIT(29)
 #define FIXUP_ARENA_WRITE	BIT(30)
 #define FIXUP_ARENA_ACCESS	BIT(31)
@@ -1910,7 +1913,8 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 		arena_reg = FIELD_GET(FIXUP_ARENA_REG_MASK, x->fixup);
 		off = FIELD_GET(DATA_ARENA_OFFSET_MASK, x->data);
 		addr = *(unsigned long *)((void *)regs + arena_reg) + off;
-		pad = bpf_arena_fault(is_write, addr, regs->ip, end);
+		pad = bpf_arena_fault(is_write, addr, regs->ip, end,
+				      x->fixup & FIXUP_ARENA_UNWINDS);
 	}
 
 	/*
@@ -2576,6 +2580,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 		u8 *func;
 		int nops;
 		u32 jmp_op = BPF_OP(insn->code);
+		u32 fault_unwinds;
 		s32 cmp_imm;
 
 		if (priv_frame_ptr) {
@@ -2594,6 +2599,8 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 		accesses_stack_only =
 			env ? !env->insn_aux_data[insn_idx].non_stack_access :
 			      false;
+		fault_unwinds = bpf_insn_fault_unwinds(env, bpf_prog, i - 1) ?
+				FIXUP_ARENA_UNWINDS : 0;
 
 		switch (insn->code) {
 			/* ALU */
@@ -3088,8 +3095,8 @@ populate_extable:
 				err = emit_arena_exentry(bpf_prog, image, rw_image, &excnt,
 							 image + proglen + (start_of_ldx - temp),
 							 prog - start_of_ldx, fixup_reg, arena_reg,
-							 is_write ? FIXUP_ARENA_WRITE : 0,
-							 insn->off);
+							 (is_write ? FIXUP_ARENA_WRITE : 0) |
+							 fault_unwinds, insn->off);
 				if (err)
 					return err;
 			}
@@ -3323,7 +3330,7 @@ populate_extable:
 								 prog - fault[j],
 								 reg2pt_regs[real_src_reg],
 								 reg2pt_regs[real_dst_reg],
-								 FIXUP_ARENA_WRITE |
+								 FIXUP_ARENA_WRITE | fault_unwinds |
 								 FIXUP_ARENA_R0_IN_AX, insn->off);
 					if (err)
 						return err;
@@ -4970,6 +4977,10 @@ out_image:
 		 * decrement proglen.
 		 */
 		prog->bpf_func = (void *)image + cfi_get_offset();
+		/* addrs[] counts from the image, not from bpf_func */
+		if (bpf_prog_fault_pad(env, prog))
+			prog->aux->fault_pad = (unsigned long)image +
+					       addrs[bpf_prog_fault_pad(env, prog)];
 		prog->jited = 1;
 		prog->jited_len = proglen - cfi_get_offset();
 	}
