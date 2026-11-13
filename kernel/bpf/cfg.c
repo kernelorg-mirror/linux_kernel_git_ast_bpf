@@ -67,14 +67,6 @@ static void mark_subprog_might_sleep(struct bpf_verifier_env *env, int off)
 	subprog->might_sleep = true;
 }
 
-static void mark_subprog_might_throw(struct bpf_verifier_env *env, int off)
-{
-	struct bpf_subprog_info *subprog;
-
-	subprog = bpf_find_containing_subprog(env, off);
-	subprog->might_throw = true;
-}
-
 /*
  * 't' is an index of a call-site.
  * 'w' is a callee entry point.
@@ -90,12 +82,10 @@ static bool merge_callee_effects(struct bpf_verifier_env *env, int t, int w)
 	caller = bpf_find_containing_subprog(env, t);
 	callee = bpf_find_containing_subprog(env, w);
 	if (caller->changes_pkt_data >= callee->changes_pkt_data &&
-	    caller->might_sleep >= callee->might_sleep &&
-	    caller->might_throw >= callee->might_throw)
+	    caller->might_sleep >= callee->might_sleep)
 		return false;
 	caller->changes_pkt_data |= callee->changes_pkt_data;
 	caller->might_sleep |= callee->might_sleep;
-	caller->might_throw |= callee->might_throw;
 	return true;
 }
 
@@ -620,8 +610,6 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 				mark_subprog_might_sleep(env, t);
 			if (ret == 0 && bpf_is_kfunc_pkt_changing(&meta))
 				mark_subprog_changes_pkt_data(env, t);
-			if (ret == 0 && bpf_is_throw_kfunc(insn))
-				mark_subprog_might_throw(env, t);
 		}
 		return visit_func_call_insn(t, insns, env, insn->src_reg == BPF_PSEUDO_CALL);
 

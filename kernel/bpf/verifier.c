@@ -474,13 +474,15 @@ const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog)
 	return btf_type_name(env->prog->aux->btf, info->type_id);
 }
 
-void bpf_mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog)
+static void mark_subprog_exc_cb(struct bpf_verifier_env *env, int subprog)
 {
 	struct bpf_subprog_info *info = subprog_info(env, subprog);
 
 	info->is_cb = true;
 	info->is_async_cb = true;
 	info->is_exception_cb = true;
+	/* by the landing pads of the main program */
+	info->is_called = true;
 }
 
 static bool subprog_is_exc_cb(struct bpf_verifier_env *env, int subprog)
@@ -3246,7 +3248,7 @@ static int add_subprogs(struct bpf_verifier_env *env)
 			if (env->subprog_info[i].start != ex_cb_insn)
 				continue;
 			env->exception_callback_subprog = i;
-			bpf_mark_subprog_exc_cb(env, i);
+			mark_subprog_exc_cb(env, i);
 			break;
 		}
 	}
@@ -3510,7 +3512,11 @@ static int check_unwind_insns(struct bpf_verifier_env *env)
 			bpf_find_containing_subprog(env, i)->can_unwind = true;
 			seen = true;
 		}
-		env->has_throw |= bpf_is_throw_kfunc(insn);
+		/* it unwinds through landing pads, see kernel/bpf/pads.c */
+		if (bpf_is_throw_kfunc(insn)) {
+			env->has_throw = true;
+			seen = true;
+		}
 		if (!bpf_is_unwind_goto(insn))
 			continue;
 		seen = true;
@@ -5741,16 +5747,33 @@ static int find_call_insn(struct bpf_verifier_env *env, int caller, int callee)
 	return i;
 }
 
-/* The exception callback is an async callback, so only a call is an edge to it */
+/*
+ * The landing pads of the main program call the exception callback, and nothing else does: it is
+ * verified as a frame that ends the invocation, see frame_is_top().
+ * It is an async callback, so only a call is an edge to it.
+ *
+ * What is thrown below it is what the program returns, so check_unwound_value() looks at the value
+ * in all that it gets to. mark_recursive_subprogs() didn't see a subprog coming that a helper got
+ * as its callback from a table of functions, or from another subprog.
+ */
 static int check_exception_cb(struct bpf_verifier_env *env, struct bpf_call_graph *cg)
 {
 	int cb = env->exception_callback_subprog, s;
 
+	if (!cb)
+		return 0;
 	for_each_set_bit(s, cg->live, cg->cnt) {
-		if (!cb || !test_bit(cb, subprog_calls(cg, s)))
+		if (!test_bit(cb, subprog_calls(cg, s)))
 			continue;
 		verbose(env, "insn %d cannot call exception cb directly\n",
 			find_call_insn(env, s, cb));
+		return -EINVAL;
+	}
+	for_each_set_bit(s, subprog_reach(cg, cb), cg->cnt) {
+		if (env->subprog_info[s].in_exception_cb)
+			continue;
+		verbose(env, "exception cb gets to %s(), whose address is taken elsewhere\n",
+			bpf_subprog_name(env, s));
 		return -EINVAL;
 	}
 	return 0;
@@ -5936,6 +5959,12 @@ static void compute_call_depth(struct bpf_verifier_env *env, struct bpf_call_gra
 	for (s = 0; s < cg->cnt; s++) {
 		dinfo[s].caller = -1;
 		dinfo[s].depth = !s || si[s].is_async_cb ? 0 : -1;
+	}
+	/* a landing pad of the main program calls it */
+	s = env->exception_callback_subprog;
+	if (s) {
+		dinfo[s].caller = 0;
+		dinfo[s].depth = subprog_stack_size(env, 0);
 	}
 	do {
 		cond_resched();
@@ -6230,6 +6259,10 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 	}
 
 	close_call_graph(calls, cnt);
+
+	j = env->exception_callback_subprog;
+	for (s = 1; j && s < cnt; s++)
+		si[s].in_exception_cb = s == j || test_bit(s, calls + j * words);
 
 	for (s = 0; s < cnt; s++) {
 		if (!test_bit(s, calls + s * words))
@@ -11802,8 +11835,6 @@ enum {
 	INSN_IDX_UPDATED = 2,
 };
 
-static int process_bpf_exit_full(struct bpf_verifier_env *env,
-				 bool *do_print_state, bool exception_exit);
 static void account_current_path(struct bpf_verifier_env *env);
 
 /*
@@ -12312,17 +12343,6 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (env->has_throw)
 				mark_reg_unknown(env, branch->frame[branch->curframe]->regs,
 						 BPF_REG_0);
-		}
-
-		if (env->subprog_info[subprog].might_throw) {
-			struct bpf_verifier_state *branch;
-
-			branch = push_stack(env, *insn_idx + 1, *insn_idx, false);
-			if (IS_ERR(branch)) {
-				verbose(env, "failed to push state for global subprog exception path\n");
-				return PTR_ERR(branch);
-			}
-			return process_bpf_exit_full(env, NULL, true);
 		}
 
 		/* continue with next insn after call */
@@ -12909,8 +12929,7 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 		print_verifier_state(env, state, caller->frameno, true);
 	}
 	account_processed_insns(env, callee, caller);
-	/* clear everything in the callee. In case of exceptional exits using
-	 * bpf_throw, this will be done by do_check_block() for extra frames. */
+	/* clear everything in the callee */
 	free_func_state(callee);
 	state->frame[state->curframe--] = NULL;
 	invalidate_outgoing_stack_args(env, caller);
@@ -13051,7 +13070,7 @@ record_func_key(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 	return 0;
 }
 
-static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exit)
+static int check_reference_leak(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *state = env->cur_state;
 	enum bpf_prog_type type = resolve_prog_type(env->prog);
@@ -13059,7 +13078,7 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 	bool refs_lingering = false;
 	int i;
 
-	if (!exception_exit && cur_func(env)->frameno)
+	if (cur_func(env)->frameno)
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -13068,8 +13087,7 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 		/* Allow struct_ops programs to return a referenced kptr back to
 		 * kernel. Type checks are performed later in check_return_code.
 		 */
-		if (type == BPF_PROG_TYPE_STRUCT_OPS && !exception_exit &&
-		    reg->id == state->refs[i].id)
+		if (type == BPF_PROG_TYPE_STRUCT_OPS && reg->id == state->refs[i].id)
 			continue;
 		verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
 			state->refs[i].id, state->refs[i].insn_idx);
@@ -13079,7 +13097,7 @@ static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exi
 	return refs_lingering ? -EINVAL : 0;
 }
 
-static int check_resource_leak(struct bpf_verifier_env *env, bool exception_exit, bool check_lock, const char *prefix)
+static int check_resource_leak(struct bpf_verifier_env *env, bool check_lock, const char *prefix)
 {
 	int err;
 
@@ -13090,7 +13108,7 @@ static int check_resource_leak(struct bpf_verifier_env *env, bool exception_exit
 		return -EINVAL;
 	}
 
-	err = check_reference_leak(env, exception_exit);
+	err = check_reference_leak(env);
 	if (err) {
 		verbose(env, "%s would lead to reference leak\n", prefix);
 		return err;
@@ -13412,7 +13430,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 
 	switch (func_id) {
 	case BPF_FUNC_tail_call:
-		err = check_resource_leak(env, false, true, "tail_call");
+		err = check_resource_leak(env, true, "tail_call");
 		if (err)
 			return err;
 		break;
@@ -15848,8 +15866,8 @@ u16 bpf_call_checked_arg_regs(struct bpf_verifier_env *env, struct bpf_insn *ins
 {
 	if (bpf_helper_call(insn) && insn->imm == BPF_FUNC_set_retval)
 		return BIT(BPF_REG_1);
-	/* without an exception callback the prog returns what bpf_throw() takes */
-	if (bpf_is_throw_kfunc(insn) && !env->exception_callback_subprog)
+	/* see check_unwound_value() */
+	if (bpf_is_throw_kfunc(insn))
 		return BIT(BPF_REG_1);
 	return call_arg_regs(env, insn, arg_type_is_mem_size);
 }
@@ -16224,7 +16242,8 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_call_arg
 	return 1;
 }
 
-static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
+static int check_unwound_value(struct bpf_verifier_env *env, int regno, const char *reg_name);
+static int push_unwind_edge(struct bpf_verifier_env *env, enum bpf_site_kind kind);
 
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
@@ -16543,22 +16562,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
+	/* No call is made: the frame is left here, with the registers and the stack as they are. */
 	if (meta.func_id == special_kfunc_list[KF_bpf_throw]) {
-		if (!bpf_jit_supports_exceptions()) {
-			verbose(env, "JIT does not support calling kfunc %s#%d\n",
-				func_name, meta.func_id);
-			return -ENOTSUPP;
-		}
-		env->seen_exception = true;
-
-		/* In the case of the default callback, the cookie value passed
-		 * to bpf_throw becomes the return value of the program.
-		 */
-		if (!env->exception_callback_subprog) {
-			err = check_return_code(env, BPF_REG_1, "R1");
-			if (err < 0)
-				return err;
-		}
+		err = check_unwound_value(env, BPF_REG_1, "R1");
+		err = err ?: push_unwind_edge(env, BPF_SITE_THROW);
+		return err ?: PROCESS_BPF_EXIT;
 	}
 
 	bpf_diag_record_caller_saved(env, regs);
@@ -16806,9 +16814,6 @@ unwound:
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_session_cookie])
 		env->prog->call_session_cookie = true;
-
-	if (bpf_is_throw_kfunc(insn))
-		return process_bpf_exit_full(env, NULL, true);
 
 	return 0;
 }
@@ -20330,7 +20335,7 @@ static int check_ld_abs(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	 * gen_ld_abs() may terminate the program at runtime, leading to
 	 * reference leak.
 	 */
-	err = check_resource_leak(env, false, true, "BPF_LD_[ABS|IND]");
+	err = check_resource_leak(env, true, "BPF_LD_[ABS|IND]");
 	if (err)
 		return err;
 
@@ -21010,8 +21015,7 @@ static void adjust_btf_func(struct bpf_verifier_env *env)
 	if (!aux->func_info)
 		return;
 
-	/* func_info is not available for hidden subprogs */
-	for (i = 0; i < env->subprog_cnt - env->hidden_subprog_cnt; i++)
+	for (i = 0; i < env->subprog_cnt; i++)
 		aux->func_info[i].insn_off = env->subprog_info[i].start;
 }
 
@@ -21113,23 +21117,25 @@ static int save_aux_ptr_type(struct bpf_verifier_env *env, enum bpf_reg_type typ
 
 /*
  * The program starts to unwind with the value in R@regno. In a program with bpf_throw() the landing
- * pads that the verifier emits pass the value on, and the main program returns it. Nobody
- * looks at what an async callback returns.
+ * pads that the verifier emits pass the value on. The main program returns it, or hands it to the
+ * exception callback. That is not called a second time: what unwinds out of it is returned.
+ * Nobody looks at what an async callback returns.
  */
 static int check_unwound_value(struct bpf_verifier_env *env, int regno, const char *reg_name)
 {
 	if (env->cur_state->frame[0]->in_async_callback_fn)
 		return 0;
+	if (env->exception_callback_subprog &&
+	    !env->subprog_info[cur_func(env)->subprogno].in_exception_cb)
+		return 0;
 	return check_return_code(env, regno, reg_name);
 }
 
-static int process_bpf_exit_full(struct bpf_verifier_env *env,
-				 bool *do_print_state,
-				 bool exception_exit)
+static int process_bpf_exit_full(struct bpf_verifier_env *env, bool *do_print_state)
 {
 	struct bpf_func_state *cur_frame = cur_func(env);
 
-	if (!exception_exit && !env->cur_state->curframe && env->cur_state->flow_entry)
+	if (!env->cur_state->curframe && env->cur_state->flow_entry)
 		return exit_func_on_its_own(env, env->insn_idx);
 
 	/* We must do check_reference_leak here before
@@ -21138,24 +21144,10 @@ static int process_bpf_exit_full(struct bpf_verifier_env *env,
 	 * for which reference_state must match caller reference
 	 * state when it exits.
 	 */
-	int err = check_resource_leak(env, exception_exit,
-				      exception_exit || !env->cur_state->curframe,
-				      exception_exit ? "bpf_throw" :
+	int err = check_resource_leak(env, !env->cur_state->curframe,
 				      "BPF_EXIT instruction in main prog");
 	if (err)
 		return err;
-
-	/* The side effect of the prepare_func_exit which is
-	 * being skipped is that it frees bpf_func_state.
-	 * Typically, process_bpf_exit will only be hit with
-	 * outermost exit. do_check_block() frees the state with
-	 * any extra bpf_func_state left over
-	 * from not processing all nested function exits. We
-	 * also skip return code checks as they are not needed
-	 * for exceptional exits.
-	 */
-	if (exception_exit)
-		return PROCESS_BPF_EXIT;
 
 	if (env->cur_state->curframe) {
 		/* exit from nested function */
@@ -21477,7 +21469,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				if (err)
 					return err;
 			}
-			return process_bpf_exit_full(env, do_print_state, false);
+			return process_bpf_exit_full(env, do_print_state);
 		}
 		return check_cond_jmp_op(env, insn, &env->insn_idx);
 	}
@@ -21955,11 +21947,12 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, bool *backedge, bool *drop
 
 /*
  * What the program returns when the verifier unwinds it, see unwind_frame(). No code of the program
- * chooses that value. Where check_return_code() has a range with 0 in it, 0 refuses or
+ * makes that value. Where check_return_code() has a range with 0 in it, 0 refuses or
  * changes nothing, but for an LSM hook that returns an errno: there 0 lets the operation go on.
  * A range without 0 is [1, 1]: hooks that cannot refuse.
  * An extension returns into the program that it extends, with the value of that program.
  * A subprog is left with the same value: its callers may pass it on, see bpf_site_has_value().
+ * The exception callback gets it and decides. A landing pad that the program has can replace it.
  */
 int bpf_unwound_retval(struct bpf_verifier_env *env)
 {
@@ -22000,9 +21993,9 @@ static bool frame_holds_resources(const struct bpf_verifier_state *st)
 }
 
 /*
- * A loop or a recursion is out of budget in the current frame of @st, or what it called came back
- * with unwind_exit. What the program computed so far is not what it was meant to compute, so it's
- * better not to go on. The way to stop is to unwind: 'r0 = 0; unwind_exit'. The landing
+ * A loop or a recursion is out of budget in the current frame of @st, it calls bpf_throw(), or what
+ * it called came back with unwind_exit. What the program computed so far is not what it was meant
+ * to compute, so it's better not to go on. The way to stop is to unwind: unwind_exit. The landing
  * pads that the callers have in the program are code like any other. They release what
  * the callers hold, or the program is rejected. Where a caller has none the verifier emits it.
  * There is no other way out. Returns why the frame cannot unwind, 0 if it can.
@@ -22245,7 +22238,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		if (!err && !plan->conflict)
 			plan->conflict = frame_cannot_unwind(env, st);
 		if (!err && !plan->conflict && bpf_site_has_value(env, kind) &&
-		    frame->regs[BPF_REG_0].type != SCALAR_VALUE)
+		    frame->regs[bpf_site_value_reg(kind)].type != SCALAR_VALUE)
 			plan->conflict = BPF_CONFLICT_NO_VALUE;
 		if (err || plan->conflict)
 			goto out;
@@ -22254,7 +22247,9 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	err = release_frame_resources(env);
 	if (err)
 		goto out;
-	if (!bpf_site_has_value(env, kind))
+	if (bpf_site_has_value(env, kind))
+		frame->regs[BPF_REG_0] = frame->regs[bpf_site_value_reg(kind)];
+	else
 		bpf_mark_reg_known_scalar(&frame->regs[BPF_REG_0], bpf_unwound_retval(env));
 	if (bpf_ret_reg_pair(env, frame->subprogno))
 		__mark_reg_const_zero(&frame->regs[BPF_REG_2]);
@@ -22281,7 +22276,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		frame->loop_stack_cnt = 0;
 		err = exit_func_on_its_own(env, sub->exit_idx);
 	} else {
-		err = process_bpf_exit_full(env, &print_state, false);
+		err = process_bpf_exit_full(env, &print_state);
 	}
 	if (err == INSN_IDX_UPDATED)
 		err = bpf_flow_deliver(env, st, env->insn_idx, insn_idx);
@@ -23888,8 +23883,9 @@ static int do_check_subprogs(struct bpf_verifier_env *env)
 		return 0;
 
 	/*
-	 * Callbacks cannot throw, so the exception callback always runs in the
-	 * main program's context. It is presumed to be always called.
+	 * A landing pad of the main program calls the exception callback, after
+	 * its releases: it always runs in the main program's context. It is
+	 * presumed to be always called.
 	 */
 	if (env->exception_callback_subprog) {
 		sub_aux = subprog_aux(env, env->exception_callback_subprog);
@@ -24025,8 +24021,7 @@ static void add_insns_of_callees(struct bpf_verifier_env *env)
 
 static void print_verification_stats(struct bpf_verifier_env *env)
 {
-	/* Skip over hidden subprogs which are not verified. */
-	int i, subprog_cnt = env->subprog_cnt - env->hidden_subprog_cnt;
+	int i, subprog_cnt = env->subprog_cnt;
 
 	if (env->log.level & BPF_LOG_STATS) {
 		verbose(env, "verification time %lld usec\n",
@@ -24576,7 +24571,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 				BPF_REG_ARENA_SP);
 			return -EOPNOTSUPP;
 		}
-		if (aux->func && aux->func[subprog]->aux->exception_cb) {
+		if (subprog && subprog == aux->exception_callback_subprog) {
 			bpf_log(log,
 				"%s programs cannot attach to exception callback\n",
 				prog_extension ? "Extension" : "Tracing");

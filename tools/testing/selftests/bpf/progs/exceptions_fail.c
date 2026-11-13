@@ -150,7 +150,7 @@ int reject_subprog_with_lock(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(0)
 int reject_with_rcu_read_lock(void *ctx)
 {
 	bpf_rcu_read_lock();
@@ -166,7 +166,7 @@ __noinline static int throwing_subprog(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(0)
 int reject_subprog_with_rcu_read_lock(void *ctx)
 {
 	bpf_rcu_read_lock();
@@ -197,7 +197,7 @@ int reject_with_rbtree_add_throw(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_with_reference(void *ctx)
 {
 	struct foo *f;
@@ -217,7 +217,7 @@ __noinline int global_subprog_may_throw(struct __sk_buff *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_global_subprog_throw_with_reference(struct __sk_buff *ctx)
 {
 	struct foo *f;
@@ -249,7 +249,7 @@ __noinline static int subprog_cb_ref(u32 i, void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__failure
 int reject_with_cb_reference(void *ctx)
 {
 	struct foo *f;
@@ -271,7 +271,7 @@ int reject_with_cb(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("Unreleased reference")
+__success __retval(0)
 int reject_with_subprog_reference(void *ctx)
 {
 	return subprog_ref(ctx) + 1;
@@ -418,7 +418,7 @@ __noinline static int rcu_lock_then_throw(void)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_rcu_read_lock-ed region")
+__success __retval(0)
 int reject_subprog_rcu_lock_throw(void *ctx)
 {
 	rcu_lock_then_throw();
@@ -426,7 +426,7 @@ int reject_subprog_rcu_lock_throw(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_preempt_disable-ed region")
+__success __retval(0)
 int reject_subprog_throw_preempt_lock(void *ctx)
 {
 	bpf_preempt_disable();
@@ -436,7 +436,7 @@ int reject_subprog_throw_preempt_lock(void *ctx)
 }
 
 SEC("?tc")
-__failure __msg("bpf_throw cannot be used inside bpf_local_irq_save-ed region")
+__success __retval(0)
 int reject_subprog_throw_irq_lock(void *ctx)
 {
 	unsigned long flags;
