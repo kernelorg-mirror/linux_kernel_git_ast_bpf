@@ -331,11 +331,9 @@ __naked void arena_offsets(void)
 	r1 = *(u32 *)(r2 + 0);				\
 	w1 ^= -1;					\
 	r9 |= r1;					\
-	r1 = *(u64 *)(r7 + 0x2000);			\
-	r9 |= r1;					\
-	r0 = 0;						\
-	if r9 == 0 goto 9f;				\
 	r0 = 1;						\
+	if r9 != 0 goto 9f;				\
+	r0 = *(u64 *)(r7 + 0x2000);			\
 9:	exit;						\
 "	:
 	: __imm_addr(arena)
