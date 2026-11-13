@@ -22,6 +22,7 @@ extern void bpf_rcu_read_unlock(void) __ksym;
 struct task_struct {};
 extern struct task_struct *bpf_task_from_pid(int pid) __ksym;
 extern void bpf_task_release(struct task_struct *p) __ksym;
+extern int bpf_iter_num_new(struct bpf_iter_num *it, int start, int end) __ksym;
 
 /* kfuncs that only asm calls need BTF */
 void __kfunc_btf_root(void)
@@ -170,6 +171,86 @@ __naked void three_frames(void)
 		"r0 = 3;"
 		"exit;"
 		:: __imm(bpf_rcu_read_lock), __imm(bpf_rcu_read_unlock)
+		: __clobber_all);
+}
+
+static __noinline __used int makes_iter(struct bpf_iter_num *it)
+{
+	return bpf_iter_num_new(it, 0, 10);
+}
+
+/*
+ * One path makes an iterator, the other one acquires a task and drops the pointer: each holds one
+ * reference where they meet. A landing pad that trusts a hidden slot would destroy 0xdead0000.
+ */
+#define NO_SLOT_FOR(name, desc, make, on_both_paths, where_they_meet)					\
+SEC("tc")												\
+__description("throw: no place has the task, " desc)							\
+__arch_x86_64 __arch_arm64										\
+__failure __msg("landing pad of bpf_throw at {{[0-9]+}}: conflict: no place has the handle on all paths") \
+__naked void name(void)											\
+{													\
+	asm volatile (											\
+		"r6 = %[one] ll;"									\
+		"r6 = *(u64 *)(r6 + 0);"								\
+		"r8 = 0xdead0000 ll;"									\
+		"if r6 == 0 goto 1f;"									\
+		"r1 = r10;"										\
+		"r1 += -8;"										\
+		"r2 = 0;"										\
+		"r3 = 10;"										\
+		"call " make ";"									\
+		on_both_paths										\
+		"goto 2f;"										\
+	"1:"												\
+		"r1 = 1;"										\
+		"call %[bpf_task_from_pid];"								\
+		"*(u64 *)(r10 - 8) = r0;"								\
+		on_both_paths										\
+	"2:"												\
+		"r0 = 0;"										\
+		"r6 = 0;"										\
+		where_they_meet										\
+		"r1 = 7;"										\
+		"call %[bpf_throw];"									\
+		"exit;"											\
+		:: __imm_addr(one), __imm(bpf_task_from_pid), __imm(bpf_iter_num_new), __imm(bpf_throw)	\
+		: __clobber_all);									\
+}
+
+#define OVERWRITE "*(u64 *)(r10 - 8) = r8;"
+NO_SLOT_FOR(iter_or_dead_task, "an iterator is overwritten", "%[bpf_iter_num_new]", "", OVERWRITE)
+NO_SLOT_FOR(iter_or_dead_spill, "an iterator and the spill are overwritten", "%[bpf_iter_num_new]", OVERWRITE, "")
+NO_SLOT_FOR(iter_by_callee_or_dead_task, "a callee made the iterator", "makes_iter", "", OVERWRITE)
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SOCKMAP);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, int);
+} sockmap SEC(".maps");
+
+/* No store follows the lookup, so the function gets no slots */
+SEC("tc")
+__description("throw: no place has the task, nor a socket out of a sockmap")
+__arch_x86_64 __arch_arm64
+__failure __msg("landing pad of bpf_throw at {{[0-9]+}}: conflict: no place has the handle on all paths")
+__naked void sockmap_and_task_dead(void)
+{
+	asm volatile (
+		"r6 = 0;"
+		"*(u32 *)(r10 - 4) = r6;"
+		"r1 = %[sockmap] ll;"
+		"r2 = r10;"
+		"r2 += -4;"
+		"call %[bpf_map_lookup_elem];"
+		"r1 = 1;"
+		"call %[bpf_task_from_pid];"
+		"r0 = 0;"
+		"r1 = 0;"
+		"call %[bpf_throw];"
+		"exit;"
+		:: __imm_addr(sockmap), __imm(bpf_map_lookup_elem), __imm(bpf_task_from_pid), __imm(bpf_throw)
 		: __clobber_all);
 }
 

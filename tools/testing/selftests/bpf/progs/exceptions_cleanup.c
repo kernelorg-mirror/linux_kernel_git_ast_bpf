@@ -54,6 +54,44 @@ int throw_obj_dead_caller(struct __sk_buff *ctx)
 	return throw_unconditionally();
 }
 
+/* GCC puts the call of it last in its function: last insn is not an exit or jmp */
+#ifdef __clang__
+static __noinline __attribute__((noreturn)) void fail_with(int err)
+{
+	bpf_throw(err);
+	for (;;)
+		;
+}
+
+int users;
+
+/* The landing pads have run: nothing that the prog acquired is left */
+__noinline int all_released(u64 cookie)
+{
+	return bpf_get_current_task_btf()->rcu_users.refs.counter == users ? cookie : 0;
+}
+
+/* The compiler keeps nothing over a call that does not return: the task is in r0 alone */
+SEC("tc")
+__arch_x86_64
+__arch_arm64
+__exception_cb(all_released)
+__success __retval(3)
+int noreturn_callee(struct __sk_buff *ctx)
+{
+	struct task_struct *cur = bpf_get_current_task_btf(), *t;
+
+	users = cur->rcu_users.refs.counter;
+	t = bpf_task_acquire(cur);
+	if (!t)
+		return 1;
+	if (ctx->len)
+		fail_with(3);
+	bpf_task_release(t);
+	return 0;
+}
+#endif
+
 /* Every frame of the subprog holds an object from the same instruction, and releases its own. */
 static __noinline int alloc_recurse_throw(int n)
 {
