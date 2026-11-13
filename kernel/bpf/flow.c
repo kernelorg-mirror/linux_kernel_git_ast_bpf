@@ -811,7 +811,7 @@ static bool flow_kinds_step(struct bpf_verifier_env *env, struct flow_kinds *kin
  * a number costs a rule. A number that is taken for a pointer costs states. So it's fine to
  * miss a store through a pointer to the stack, and to take what callx calls for unknown.
  *
- * A subprog that is out of budget is left with 0 in place of the result, a number.
+ * A subprog that is out of budget is left with a number in place of the result.
  */
 int bpf_flow_compute_kinds(struct bpf_verifier_env *env)
 {
@@ -2237,7 +2237,7 @@ static void flow_shape_places(struct bpf_verifier_env *env, struct flow_state *s
 	for (fr = 0; fr <= st->curframe; fr++) {
 		frame = st->frame[fr];
 		/* a state that does a call again is not cleaned, dead registers are not compared */
-		live = env->insn_aux_data[bpf_frame_insn_idx(st, fr)].live_regs_before;
+		live = bpf_frame_live_regs(env, st, fr);
 		for (i = BPF_REG_0; i < BPF_REG_FP; i++)
 			if (live & BIT(i))
 				flow_shape_ptr(sh, fr << 10 | i, &frame->regs[i]);

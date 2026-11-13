@@ -608,7 +608,7 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 			return 1;
 		for (fr = 0; fr <= a->curframe; fr++) {
 			u32 insn_idx = bpf_frame_insn_idx((struct bpf_verifier_state *)a, fr);
-			u16 live_regs = env->insn_aux_data[insn_idx].live_regs_before;
+			u16 live_regs = bpf_frame_live_regs(env, (struct bpf_verifier_state *)a, fr);
 			u32 cnt;
 
 			/* not the states that get to the head through a call of the function */

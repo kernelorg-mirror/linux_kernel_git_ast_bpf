@@ -437,17 +437,20 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_CANNOT_UNWIND,
 	BPF_CONFLICT_NO_EXIT,
 	BPF_CONFLICT_CALLER_SAVED,
+	BPF_CONFLICT_NO_VALUE,
+	BPF_CONFLICT_NO_ROOM,
 };
 
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
- * per argument of a release two to load it, per entry a test, the calls, three to leave.
+ * per argument of a release two to load it, per entry a test, the calls, one to save the value,
+ * three to leave.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
 #define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
-				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 3)
+				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 4)
 #define BPF_PAD_MAX_CANDS	6
 /*
  * A function has no more hidden slots than a pad has entries. The insns around a call: per slot
@@ -1216,6 +1219,8 @@ struct bpf_subprog_info {
 	u16 stack_depth; /* max. stack depth used by this function */
 	u16 stack_extra;
 	u16 arena_stack_depth; /* size of the frame in the stack in arena */
+	/* the hidden word where its landing pads keep the value over their calls. 0: none */
+	s16 value_off;
 	u32 insns_total;
 	u32 insns_self;
 	/* offsets in range [stack_depth .. fastcall_stack_off)
@@ -1459,6 +1464,7 @@ struct bpf_verifier_env {
 	/* a global function is verified for BPF_FUNC_CTX_NO_RCU_LOCK */
 	bool no_rcu_read_lock;
 	bool seen_exception;
+	bool has_throw;			/* the program has a call of bpf_throw() */
 	bool signature;
 	u32 insn_aux_data_len;
 	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
@@ -1785,6 +1791,17 @@ bool bpf_jump_leaves_loop(struct bpf_verifier_env *env, int h, int n);
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env);
 
 /* pads.c */
+
+/*
+ * Is the landing pad of a site of @kind entered with a value that it has to pass on? What the
+ * verifier unwinds comes with bpf_unwound_retval(). Another value is passed on only in a program
+ * with bpf_throw().
+ */
+static inline bool bpf_site_has_value(const struct bpf_verifier_env *env, enum bpf_site_kind kind)
+{
+	return env->has_throw && kind == BPF_SITE_CALL;
+}
+
 struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_site_kind kind);
 struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
 				      enum bpf_site_kind kind);
@@ -1869,6 +1886,20 @@ static inline u32 bpf_frame_insn_idx(struct bpf_verifier_state *st, u32 frame)
 	return frame == st->curframe
 	       ? st->insn_idx
 	       : st->frame[frame + 1]->callsite;
+}
+
+/*
+ * The registers of @frame that are read from where @st is. An unwound state is on the way to a
+ * landing pad that reads the value, see bpf_site_has_value(). The pad is not in the text yet.
+ */
+static inline u16 bpf_frame_live_regs(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
+				      u32 frame)
+{
+	u16 live = env->insn_aux_data[bpf_frame_insn_idx(st, frame)].live_regs_before;
+
+	if (st->unwound && env->has_throw && frame == st->curframe)
+		live |= BIT(BPF_REG_0);
+	return live;
 }
 
 static inline bool bpf_is_spilled_reg(const struct bpf_stack_state *stack)
@@ -2099,7 +2130,7 @@ const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
-int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
+int bpf_unwound_retval(struct bpf_verifier_env *env);
 bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env);
 int bpf_iter_slots_valid_init(const struct bpf_func_state *state, int spi, const struct btf *btf,
 			      u32 btf_id, int nr_slots);

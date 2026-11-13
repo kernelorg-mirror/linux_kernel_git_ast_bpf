@@ -1039,8 +1039,8 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  *	if (r10 is in the upper half of the kernel stack) goto body;
  *	bpf_prog_report_recursion();
  * bail:
- *	r0 = 0;
- *	exit;
+ *	r0 = bpf_unwound_retval();
+ *	unwind_exit;
  * body:
  *
  * It is the stack as it is: whatever is there is counted, be it the callers of the prog in the
@@ -1052,8 +1052,7 @@ static int emit_stack_check(struct bpf_insn *buf, int off)
  * check_max_stack_depth() looked at together with that frame.
  *
  * A subprog that calls itself twice doesn't have to go deep to go on forever: hence may_goto.
- * Once the time slice of the invocation is over every call returns at once, and the frames
- * that are there come to an end.
+ * Once the time slice of the invocation is over the next call unwinds the program.
  */
 int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 {
@@ -1085,7 +1084,7 @@ int bpf_insert_recursion_checks(struct bpf_verifier_env *env)
 		/* The arguments are not needed any more */
 		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_recursion);
 		buf[jmp] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, n - jmp - 1, 0);
-		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, 0);
+		buf[n++] = BPF_MOV64_IMM(BPF_REG_0, bpf_unwound_retval(env));
 		if (bpf_ret_reg_pair(env, s))
 			buf[n++] = BPF_MOV64_IMM(BPF_REG_2, 0);
 		buf[n++] = budget_exit_insn(env, &si[s]);
