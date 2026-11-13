@@ -115,7 +115,7 @@ SEC("tc")
 __description("unwind cb: the callback of bpf_loop unwinds on its first run")
 __arch_x86_64 __arch_arm64 __load_if_JITed()
 __success __retval(54)
-__xlated("unwind_goto pc+7")
+__xlated("unwind_goto pc-15")
 __naked int loop_cb_unwinds(void)
 {
 	asm volatile (
@@ -247,7 +247,7 @@ SEC("tc")
 __description("unwind cb: the pad before the call of the inlined bpf_loop")
 __arch_x86_64 __arch_arm64 __load_if_JITed()
 __success __retval(47)
-__xlated("unwind_goto pc+7")
+__xlated("unwind_goto pc-15")
 __naked int loop_cb_pad_before_call(void)
 {
 	asm volatile (

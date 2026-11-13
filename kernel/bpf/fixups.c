@@ -3684,7 +3684,7 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	u32 callback_start;
 	struct bpf_insn *last;
 	s32 callback_offset;
-	u32 cnt = 0;
+	u32 cnt = 0, call;
 
 	/* This represents an inlined version of bpf_iter.c:bpf_loop,
 	 * be careful to modify this code in sync.
@@ -3693,9 +3693,20 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	/* Return error and jump to the end of the patch if
 	 * expected number of iterations is too big.
 	 */
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JLE, BPF_REG_1, BPF_MAX_LOOPS, 2);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JLE, BPF_REG_1, BPF_MAX_LOOPS, pad ? 6 : 2);
 	insn_buf[cnt++] = BPF_MOV64_IMM(BPF_REG_0, -E2BIG);
-	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, pad ? 22 : 16);
+	insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, pad ? 21 : 16);
+	if (pad) {
+		/*
+		 * The pad: r0 is what the callback unwound with. Nothing falls through to this
+		 * place, so no jump around the pad is needed.
+		 */
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, r6_offset);
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_10, r7_offset);
+		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_10, r8_offset);
+		/* to the pad of the caller, the offset is set below */
+		insn_buf[cnt++] = BPF_JMP32_A(0);
+	}
 	/* spill R6, R7, R8 to use these as loop vars */
 	insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_6, r6_offset);
 	insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_7, r7_offset);
@@ -3711,10 +3722,11 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	/* callback call, the offset is set below */
 	insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_1, reg_loop_cnt);
 	insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_2, reg_loop_ctx);
+	call = cnt;
 	insn_buf[cnt++] = BPF_CALL_REL(0);
 	if (pad)
-		/* to the pad below when the callback left with unwind_exit */
-		insn_buf[cnt++] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, 7, 0);
+		/* to the pad above when the callback left with unwind_exit */
+		insn_buf[cnt++] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, BPF_UNWIND_GOTO, -15, 0);
 	/* increment loop counter */
 	insn_buf[cnt++] = BPF_ALU64_IMM(BPF_ADD, reg_loop_cnt, 1);
 	/* jump to loop header if callback returned 0 */
@@ -3727,36 +3739,23 @@ static int inline_bpf_loop(struct bpf_verifier_env *env, int position,
 	insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, r6_offset);
 	insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_10, r7_offset);
 	insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_10, r8_offset);
-	if (pad) {
-		/* over the pad */
-		insn_buf[cnt++] = BPF_JMP_IMM(BPF_JA, 0, 0, 4);
-		/* the pad: r0 is what the callback unwound with */
-		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_10, r6_offset);
-		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_10, r7_offset);
-		insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_10, r8_offset);
-		/*
-		 * To the pad of the caller, where the unwind_goto after the call of
-		 * bpf_loop goes, from the last insn of the patch. Like any jump out
-		 * of a patch it is relative to the patch alone: a target behind the
-		 * call moves down by the insns the patch adds, one in front of it
-		 * stays. A long jump, since an unwind_goto may jump as far as a jump
-		 * can.
-		 */
-		insn_buf[cnt++] = BPF_JMP32_A(0);
-		insn_buf[cnt - 1].imm = unwind_goto->off >= -1 ? unwind_goto->off + 1 :
-							       unwind_goto->off + 2 - (int)cnt;
-	}
 
 	/*
-	 * Note: insn_buf[12] is the BPF_CALL_REL instruction. Jumps and calls
-	 * out of a patch are relative to the patch placed at 'position': its
-	 * 'cnt' insns push what is behind 'position' down by cnt - 1.
+	 * Jumps and calls out of a patch are relative to the patch placed at
+	 * 'position': its 'cnt' insns push what is behind 'position' down by
+	 * cnt - 1, what is in front of it stays.
 	 */
 	callback_start = env->subprog_info[callback_subprogno].start;
 	callback_offset = callback_start - position;
 	if (callback_start > position)
 		callback_offset += cnt - 1;
-	insn_buf[12].imm = callback_offset - 12 - 1;
+	insn_buf[call].imm = callback_offset - call - 1;
+	/*
+	 * insn_buf[6] goes where the unwind_goto after the call of bpf_loop goes. A long
+	 * jump, since an unwind_goto may jump as far as a jump can.
+	 */
+	if (pad)
+		insn_buf[6].imm = unwind_goto->off + (unwind_goto->off >= -1 ? (int)cnt : 1) - 6;
 
 	last = bpf_patch_list_add(env, position, insn_buf, cnt);
 	if (IS_ERR(last))
