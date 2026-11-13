@@ -937,6 +937,22 @@ __naked int unwind_goto_reserved(void)
 	);
 }
 
+/* 32 bits for the offset are for unwind_goto that the verifier adds */
+SEC("tc")
+__description("unwind: unwind_goto of the prog has 16 bits for the offset")
+__failure __msg("unknown opcode e6")
+__naked int unwind_goto_imm(void)
+{
+	asm volatile (
+		"call never_unwinds;"
+		".8byte %[bad];"
+		"exit;"
+		:
+		: __imm_insn(bad, BPF_RAW_INSN(BPF_JMP32 | BPF_JCOND, 0, BPF_UNWIND_GOTO, 0, 0))
+		: __clobber_all
+	);
+}
+
 SEC("tc")
 __description("unwind: unknown kind of jcond")
 __failure __msg("invalid may_goto imm 0")

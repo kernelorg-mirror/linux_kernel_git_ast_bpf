@@ -389,7 +389,10 @@ __naked void loop_in_subprog(void)
 	);
 }
 
-/* 16 bits may not get may_goto and unwind_goto to the landing pad that they share: gotol does */
+/*
+ * 16 bits don't get may_goto and unwind_goto to the landing pad that they share. gotol does it for
+ * may_goto. unwind_goto has 32 bits: nothing is added to the way from the call to the next insn.
+ */
 SEC("socket")
 __description("budget: a loop and a call that are far from their landing pad")
 __arch_x86_64
@@ -397,12 +400,11 @@ __arch_arm64
 __success __retval(0)
 __xlated("...")
 __xlated("goto pc+1")
-__xlated("gotol pc+2108")
+__xlated("gotol pc+33006")
 __xlated("if r1 != 0x0 goto pc-")
 __xlated("call pc+")
-__xlated("unwind_goto pc+1")
-__xlated("goto pc+1")
-__xlated("gotol pc+2103")
+__xlated("unwind_goto pc+33003")
+__xlated("call kernel-function")
 __naked void far_from_the_pad(void)
 {
 	asm volatile (
@@ -414,7 +416,7 @@ __naked void far_from_the_pad(void)
 		"call spins;"
 		"call %[bpf_rcu_read_unlock];"
 		"r0 = 0;"
-		".rept 2100;"
+		".rept 33000;"
 		"r0 += 1;"
 		".endr;"
 		"exit;"
