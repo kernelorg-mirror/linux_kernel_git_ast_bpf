@@ -506,6 +506,35 @@ struct bpf_pad_plan {
 	bool far;			/* 16 bits may not be enough to get there from the site */
 };
 
+/*
+ * The groups of classes. A function has HIDDEN SLOTS for all that it acquires of a group or for
+ * nothing of it, see kernel/bpf/pads.c
+ */
+enum bpf_pad_group {
+	BPF_PAD_GROUP_RCU,	/* BPF_PAD_RCU */
+	BPF_PAD_GROUP_PREEMPT,	/* BPF_PAD_PREEMPT */
+	BPF_PAD_GROUP_LOCKS,	/* locks and irq flags: they are released in an order */
+	BPF_PAD_GROUP_REFS,	/* REF_TYPE_PTR: pointers, iterators, dynptrs */
+	BPF_PAD_NR_GROUPS,
+};
+
+/*
+ * What the main pass notes about a call for the hidden slots of the function that the call is in.
+ * It holds for all states that got to the call, in all rounds.
+ */
+struct bpf_pad_note {
+	/* The call acquires a resource, or it calls a subprog that returns with one. */
+	bool acquires;
+	u8 src;			/* the register that goes to the slot */
+	u8 held;		/* the most that the frame holds of the group when it gets there */
+	struct bpf_pad_ent ent;	/* what a slot of the call is to a plan, but for the offset */
+	/* The call releases a resource that the frame acquired. */
+	bool releases;
+	u8 group;		/* enum bpf_pad_group */
+	u8 reg;			/* the register that has the handle */
+	s16 delta;		/* what is there is that much more than the handle */
+};
+
 struct loop_stack_entry {
 	struct bpf_verifier_state *entry_state;
 	u32 min_header_count;
@@ -1031,6 +1060,8 @@ struct bpf_insn_aux_data {
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
 	/* true if some jump or call instruction targets this instruction */
 	u64 jump_target:1;
+	/* a subprog returned here with no pointer to release and R0 may be not 0 */
+	u64 call_brings_nothing:1;
 
 	unsigned int orig_idx; /* original instruction index, initialized once */
 	/* registers alive before this instruction. */
@@ -1065,6 +1096,7 @@ struct bpf_insn_aux_data {
 	struct bpf_loop *loop;
 	/* the sites at this instruction, as far as the round of the main pass got to them */
 	struct bpf_pad_plan *pad_plans;
+	struct bpf_pad_note *pad_note;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */
@@ -1225,6 +1257,8 @@ struct bpf_subprog_info {
 	 * expected of it, see mark_unwind_above().
 	 */
 	bool did_unwind: 1;
+	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. For good. */
+	u8 no_slots: 4;
 	u8 code_stack_args;
 	u16 stack_arg_cnt; /* incoming + max outgoing */
 	u16 max_out_stack_arg_cnt;
@@ -1357,6 +1391,7 @@ struct bpf_verifier_env {
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_loop_gets_guards() */
 	bool pads_late;			/* a global subprog unwinds: see do_check_all() */
+	bool pad_releases;		/* see release_frame_resources() */
 	u32 loop_entry_cnt;		/* see loop_stack_entry.entry_id, callback_entry_id */
 	u32 walk_cnt;			/* see loop_stack_entry.walk_id */
 	u32 *walk_insns;		/* the insns that were looked at in each of them */
@@ -1717,6 +1752,12 @@ struct bpf_pad_plan *bpf_pad_plan(const struct bpf_insn_aux_data *aux, enum bpf_
 struct bpf_pad_plan *bpf_pad_plan_get(struct bpf_verifier_env *env, int insn_idx,
 				      enum bpf_site_kind kind);
 int bpf_pad_note_callee(struct bpf_verifier_env *env, int call_idx, int callee);
+void bpf_pad_no_slots(struct bpf_verifier_env *env, enum bpf_pad_group group);
+void bpf_pad_note_acquire(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
+void bpf_pad_note_release(struct bpf_verifier_env *env, int idx);
+void bpf_pad_note_section(struct bpf_verifier_env *env, enum bpf_pad_class class, bool enter);
+void bpf_pad_note_return(struct bpf_verifier_env *env, const struct bpf_verifier_state *st,
+			 const struct bpf_func_state *caller, int call_idx, bool plain);
 void bpf_pad_plans_free(struct bpf_insn_aux_data *aux);
 void bpf_pads_new_round(struct bpf_verifier_env *env);
 struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,

@@ -811,6 +811,12 @@ static int mark_stack_slots_dynptr(struct bpf_verifier_env *env, struct bpf_reg_
 	mark_dynptr_stack_regs(env, &bpf_stack_slot(state, spi)->spilled_ptr,
 			       &bpf_stack_slot(state, spi - 1)->spilled_ptr, type, parent_id);
 
+	/* either of a dynptr and its clone releases, and the other may be overwritten */
+	if (dynptr_type_referenced(type) && dynptr->type != BPF_DYNPTR_TYPE_INVALID)
+		bpf_pad_no_slots(env, BPF_PAD_GROUP_REFS);
+	else if (dynptr_type_referenced(type))
+		bpf_pad_note_acquire(env, reg);
+
 	return 0;
 }
 
@@ -1074,6 +1080,7 @@ static int mark_stack_slots_iter(struct bpf_verifier_env *env,
 
 		mark_stack_slot_scratched(env, spi - i);
 	}
+	bpf_pad_note_acquire(env, reg);
 
 	return 0;
 }
@@ -1207,6 +1214,9 @@ static int mark_stack_slot_irq_flag(struct bpf_verifier_env *env,
 		slot->slot_type[i] = STACK_IRQ_FLAG;
 
 	mark_stack_slot_scratched(env, spi);
+	/* irq flags that a lock saves come and go with the lock */
+	if (kfunc_class == IRQ_NATIVE_KFUNC)
+		bpf_pad_note_acquire(env, reg);
 	return 0;
 }
 
@@ -1680,6 +1690,7 @@ static int release_lock_state(struct bpf_verifier_env *env, int type, int id, vo
 	for (i = 0; i < state->acquired_refs; i++) {
 		if (state->refs[i].type == type && state->refs[i].id == id &&
 		    state->refs[i].ptr == ptr) {
+			bpf_pad_note_release(env, i);
 			release_reference_state(state, i);
 			state->active_locks--;
 			/* Reassign active lock (id, ptr). */
@@ -1710,6 +1721,7 @@ static int release_irq_state(struct bpf_verifier_env *env, int id)
 		if (state->refs[i].type != REF_TYPE_IRQ)
 			continue;
 		if (state->refs[i].id == id) {
+			bpf_pad_note_release(env, i);
 			release_reference_state(state, i);
 			state->active_irq_id = prev_id;
 			bpf_diag_record_context(env, env->insn_idx, BPF_DIAG_CONTEXT_IRQ,
@@ -8528,6 +8540,7 @@ static int process_spin_lock(struct bpf_verifier_env *env, struct bpf_reg_state 
 			verbose(env, "Failed to acquire lock state\n");
 			return err;
 		}
+		bpf_pad_note_acquire(env, reg);
 	} else {
 		void *ptr;
 		int type;
@@ -11166,9 +11179,13 @@ static int __release_reference_nomark(struct bpf_verifier_state *state, int id)
 
 static int release_reference_nomark(struct bpf_verifier_env *env, int id)
 {
-	int err;
+	struct bpf_verifier_state *state = env->cur_state;
+	int i, err;
 
-	err = __release_reference_nomark(env->cur_state, id);
+	for (i = 0; i < state->acquired_refs; i++)
+		if (state->refs[i].type == REF_TYPE_PTR && state->refs[i].id == id)
+			bpf_pad_note_release(env, i);
+	err = __release_reference_nomark(state, id);
 	if (!err)
 		bpf_diag_record_ref_release(env, env->insn_idx, id);
 	return err;
@@ -12023,6 +12040,7 @@ int bpf_flow_return(struct bpf_verifier_env *env, struct bpf_verifier_state *cal
 		env->subprog_info[callee->subprogno].releases_inherited = true;
 		return 1;
 	}
+	bpf_pad_note_return(env, exit, frame, call_idx, !exit->unwound);
 	nregs = bpf_ret_reg_pair(env, callee->subprogno) ? 2 : 1;
 	for (i = 0; i < nregs; i++) {
 		reg = &frame->regs[ret_regs[i]];
@@ -12743,6 +12761,8 @@ static int prepare_func_exit(struct bpf_verifier_env *env, int *insn_idx)
 			return err;
 		state->unwound = callee->in_callback_fn ? BPF_UNWOUND_CB : BPF_UNWOUND;
 	}
+	bpf_pad_note_return(env, state, caller, callee->callsite,
+			    !unwinds && !callee->in_callback_fn);
 	if (callee->in_callback_fn && !unwinds) {
 		if (r0->type != SCALAR_VALUE) {
 			verbose(env, "R0 not a scalar value\n");
@@ -13641,6 +13661,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 			return id;
 
 		regs[BPF_REG_0].id = id;
+		bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
 	}
 
 	if (func_id == BPF_FUNC_dynptr_data)
@@ -16348,6 +16369,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	preempt_enable = is_kfunc_bpf_preempt_enable(&meta);
 
 	if (rcu_lock) {
+		bpf_pad_note_section(env, BPF_PAD_RCU, true);
 		env->cur_state->active_rcu_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, true,
 					env->cur_state->active_rcu_locks);
@@ -16359,6 +16381,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				"Remove the extra bpf_rcu_read_unlock() call, or ensure this path first enters an RCU read lock region.");
 			return -EINVAL;
 		}
+		bpf_pad_note_section(env, BPF_PAD_RCU, false);
 		env->cur_state->active_rcu_locks--;
 		release_context_state(env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_RCU, false,
@@ -16366,6 +16389,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		if (!in_rcu_cs(env))
 			invalidate_rcu_protected_refs(env);
 	} else if (preempt_disable) {
+		bpf_pad_note_section(env, BPF_PAD_PREEMPT, true);
 		env->cur_state->active_preempt_locks++;
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, true,
 					env->cur_state->active_preempt_locks);
@@ -16377,6 +16401,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				"Remove the extra bpf_preempt_enable() call, or ensure this path first disables preemption.");
 			return -EINVAL;
 		}
+		bpf_pad_note_section(env, BPF_PAD_PREEMPT, false);
 		env->cur_state->active_preempt_locks--;
 		release_context_state(env->cur_state);
 		bpf_diag_record_context(env, insn_idx, BPF_DIAG_CONTEXT_PREEMPT, false,
@@ -16649,6 +16674,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (id < 0)
 				return id;
 			regs[BPF_REG_0].id = id;
+			bpf_pad_note_acquire(env, &regs[BPF_REG_0]);
 		} else if (is_rbtree_node_type(ptr_type) || is_list_node_type(ptr_type)) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
@@ -21985,6 +22011,8 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 	struct bpf_reference_state *ref;
 	int id, err;
 
+	/* no insn of the program releases them */
+	env->pad_releases = true;
 	while (st->acquired_refs > frame->entry_refs) {
 		ref = &st->refs[st->acquired_refs - 1];
 		id = ref->id;
@@ -21998,6 +22026,7 @@ static int release_frame_resources(struct bpf_verifier_env *env)
 			return -EFAULT;
 		unmark_stack_obj(env, id);
 	}
+	env->pad_releases = false;
 	/* a lock went, or an object was freed under the lock of a caller, who may point to it */
 	if (st->acquired_refs != refs)
 		invalidate_non_owning_refs(env);
@@ -23614,6 +23643,9 @@ static int do_check_common(struct bpf_verifier_env *env, int subprog,
 				goto out;
 
 			aux->ctx_arg_info[i].ref_id = ret;
+			/* no insn acquires it */
+			if (ret)
+				bpf_pad_no_slots(env, BPF_PAD_GROUP_REFS);
 		}
 	}
 

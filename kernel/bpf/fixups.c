@@ -1032,6 +1032,8 @@ void bpf_clear_insn_aux_data(struct bpf_verifier_env *env, int start, int len)
 			aux_data[i].loop = NULL;
 		}
 		bpf_pad_plans_free(&aux_data[i]);
+		kfree(aux_data[i].pad_note);
+		aux_data[i].pad_note = NULL;
 	}
 }
 
