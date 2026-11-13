@@ -1100,12 +1100,18 @@ out:
 
 /*
  * The main pass does not get to the fill after the loop, so nothing but a landing pad would read
- * fp-8 of the longer pattern, and its store would go.
+ * fp-8 of the longer pattern, and its store would go. fp-8 is no place: a hidden slot has the task.
  */
 SEC("syscall")
 __description("budget: a reference is in the slot of a bpf_fastcall spill only")
 __arch_x86_64
-__failure __msg("landing pad of may_goto at {{[0-9]+}}: conflict: no place has the handle on all paths")
+__success __retval(0)
+__xlated("...")
+__xlated("r1 = *(u64 *)(r10 -24)")
+__xlated("if r1 == 0x0 goto pc+1")
+__xlated("call kernel-function")
+__xlated("r0 = 0")
+__xlated("exit")
 __naked void reference_in_fastcall_spill(void)
 {
 	asm volatile (
