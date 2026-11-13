@@ -622,6 +622,13 @@ int bpf_states_join(struct bpf_verifier_env *env, struct bpf_verifier_state *dst
 				return 1;
 		}
 	}
+	/*
+	 * See check_arena_site(). @dst describes more than @a and @b, and a state that is within it
+	 * is dropped: the callers never saw their frames as that state has them.
+	 */
+	dst->frame[dst->curframe]->fault_edge = a->frame[a->curframe]->fault_edge &&
+						b->frame[b->curframe]->fault_edge &&
+						!dst->curframe;
 
 	return join_check(js, dst, a, "a") ?: join_check(js, dst, b, "b");
 }

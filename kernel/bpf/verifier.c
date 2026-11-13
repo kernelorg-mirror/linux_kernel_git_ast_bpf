@@ -220,6 +220,7 @@ static bool is_trusted_reg(struct bpf_verifier_env *env, const struct bpf_reg_st
 static inline bool in_sleepable_context(struct bpf_verifier_env *env);
 static bool in_rcu_callback(struct bpf_verifier_env *env);
 static const char *non_sleepable_context_description(struct bpf_verifier_env *env);
+static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_state *reg);
 
 static void bpf_map_ptr_store(struct bpf_insn_aux_data *aux,
 			      struct bpf_map *map,
@@ -3426,12 +3427,17 @@ static bool is_indirect_call(const struct bpf_insn *insn)
 static int subprog_cannot_unwind(struct bpf_verifier_env *env, int subprog)
 {
 	struct bpf_subprog_info *sub = &env->subprog_info[subprog];
+	bool did_unwind = sub->did_unwind && sub->bail_unwinds;
 
-	if (sub->did_unwind) {
+	if (did_unwind)
+		bpf_pads_must_unwind(env);
+	if (did_unwind && sub->must_unwind) {
 		verbose(env, "callback cannot unwind at insn %d: %s() does\n",
 			env->insn_idx, bpf_subprog_name(env, subprog));
 		return -EINVAL;
 	}
+	/* It did at accesses to arena only. They are skipped, and all is done again. */
+	env->pads_late |= did_unwind;
 	sub->bail_unwinds = false;
 	return 0;
 }
@@ -4423,6 +4429,8 @@ static int check_stack_write(struct bpf_verifier_env *env,
 	int max_off = reg_smax(reg) + off + size;
 	int err;
 
+	if (state != cur_func(env))
+		cur_func(env)->fault_edge = false;
 	if (tnum_is_const(reg->var_off)) {
 		off += reg->var_off.value;
 		err = check_stack_write_fixed_off(env, state, off, size,
@@ -6206,7 +6214,14 @@ static int mark_recursive_subprogs(struct bpf_verifier_env *env)
 		si[s].bail_unwinds = si[s].can_unwind ||
 				     (s && env->prog->jit_requested && bpf_jit_supports_unwind() &&
 				      !bpf_prog_is_offloaded(env->prog->aux) && test_bit(s, called));
-		si[s].did_unwind = si[s].can_unwind;
+		si[s].must_unwind = si[s].can_unwind;
+		/*
+		 * The callers of a global subprog are verified ahead of it, see unwind_frame().
+		 * Where there is an arena expect it to unwind, that saves a round.
+		 */
+		si[s].did_unwind = si[s].can_unwind ||
+				   (env->prog->aux->arena && si[s].bail_unwinds &&
+				    bpf_subprog_is_global(env, s));
 	}
 
 	close_call_graph(calls, cnt);
@@ -7839,6 +7854,9 @@ static int check_load_mem(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	src_reg_type = regs[insn->src_reg].type;
+	err = check_arena_site(env, &regs[insn->src_reg]);
+	if (err)
+		return err;
 
 	/*
 	 * check_stack_read_fixed_off() may refine the modification's origin to
@@ -7897,6 +7915,9 @@ static int check_store_reg(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return err;
 
 	dst_reg_type = regs[insn->dst_reg].type;
+	err = check_arena_site(env, &regs[insn->dst_reg]);
+	if (err)
+		return err;
 
 	/* Check if (dst_reg + off) is writeable. */
 	err = check_mem_access(env, env->insn_idx, regs + insn->dst_reg,
@@ -7955,6 +7976,11 @@ static int check_atomic_rmw(struct bpf_verifier_env *env,
 			reg_type_str(env, reg_state(env, insn->dst_reg)->type));
 		return -EACCES;
 	}
+
+	/* load_reg may be dst_reg. Look at dst_reg before it's marked as unknown. */
+	err = check_arena_site(env, cur_regs(env) + insn->dst_reg);
+	if (err)
+		return err;
 
 	load_reg = bpf_atomic_load_reg(insn);
 	if (load_reg >= 0) {
@@ -21288,6 +21314,11 @@ static int check_arena_sp_insn(struct bpf_verifier_env *env, struct bpf_insn *in
 		return err;
 	}
 
+	/* An access to the stack in arena is probed like any arena access. */
+	err = check_arena_site(env, &arena);
+	if (err)
+		return err;
+
 	if (is_arena_sp_ldx(insn)) {
 		err = check_reg_arg(env, insn->dst_reg, DST_OP_NO_MARK);
 		if (err)
@@ -21353,6 +21384,9 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 			return err;
 
 		dst_reg_type = cur_regs(env)[insn->dst_reg].type;
+		err = check_arena_site(env, cur_regs(env) + insn->dst_reg);
+		if (err)
+			return err;
 
 		err = check_mem_access(env, env->insn_idx, cur_regs(env) + insn->dst_reg,
 				       argno_from_reg(insn->dst_reg),
@@ -21368,6 +21402,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 		u8 opcode = BPF_OP(insn->code);
 
 		if (opcode == BPF_CALL) {
+			cur_func(env)->fault_edge = false;
 			if (env->cur_state->active_locks) {
 				/* similar to static subprog calls callx is allowed under a lock */
 				if (!bpf_is_callx(insn) &&
@@ -22010,6 +22045,79 @@ static int check_loop_guard(struct bpf_verifier_env *env)
 	return push_unwind_edge(env, BPF_SITE_GUARD);
 }
 
+/* Is all that the current frame of @st holds a pointer, which is NULL where nothing is held? */
+static bool frame_holds_pointers_only(const struct bpf_verifier_state *st)
+{
+	const struct bpf_func_state *frame = st->frame[st->curframe];
+	int i;
+
+	for (i = frame->entry_refs; i < st->acquired_refs; i++)
+		if (st->refs[i].type != REF_TYPE_PTR)
+			return false;
+	return st->active_rcu_locks == frame->entry_rcu_locks &&
+	       st->active_preempt_locks == frame->entry_preempt_locks;
+}
+
+/*
+ * An access through an arena pointer, @reg, faults when the page is not mapped. Then the program
+ * is unwound. The site is the access itself, with the state before it takes effect, since the
+ * fault precedes any write of its result.
+ *
+ * This site has another way out, which costs nothing: the access is skipped, a load reads 0. It
+ * is taken where the frame cannot unwind and where no pad serves all states: a conflict here does
+ * not reject the program. There are many of them. The normal path pays nothing, the main pass little:
+ *
+ *   The frame holds nothing, in all states that get here: there is no plan and no visit.
+ *
+ *   It holds something: each state visits the plan, as it is. If states went by without a visit
+ *   the plan does not know what is NULL where nothing is held, see visit_refs(). All is done again,
+ *   and then all states visit. Unless what is held is no pointer: no test tells.
+ *
+ *   A copy of the state leaves the frame, see unwind_frame(), once per stretch of insns
+ *   without a call and without a store to the stack of a caller. They alone change what gets to the
+ *   caller: what the frame holds is dropped, R0 is set. See 'fault_edge', and bpf_states_join().
+ */
+static int check_arena_site(struct bpf_verifier_env *env, const struct bpf_reg_state *reg)
+{
+	struct bpf_insn_aux_data *aux = cur_aux(env);
+	struct bpf_verifier_state *st = env->cur_state;
+	struct bpf_func_state *frame = cur_func(env);
+	struct bpf_pad_plan *plan;
+	bool visits;
+
+	/* frame_cannot_unwind() does not ask the JIT about a frame that the kernel called */
+	if (reg->type != PTR_TO_ARENA || st->speculative || aux->fault_skips ||
+	    !bpf_jit_supports_unwind())
+		return 0;
+	visits = frame_holds_resources(st) || aux->fault_full || bpf_pad_plan(aux, BPF_SITE_FAULT);
+	if (!visits) {
+		aux->fault_empty = true;
+		if (frame->fault_edge)
+			return 0;
+	}
+	if (frame_cannot_unwind(env, st)) {
+		aux->fault_skips = true;
+		return 0;
+	}
+	if (visits) {
+		if (aux->fault_empty && !aux->fault_full) {
+			if (!frame_holds_pointers_only(st)) {
+				aux->fault_skips = true;
+				return 0;
+			}
+			aux->fault_full = true;
+			env->pads_late = true;
+		}
+		plan = bpf_pad_visit(env, st, env->insn_idx, BPF_SITE_FAULT);
+		if (IS_ERR(plan))
+			return PTR_ERR(plan);
+		if (plan->conflict || frame->fault_edge)
+			return 0;
+	}
+	frame->fault_edge = true;
+	return push_unwind_edge(env, BPF_SITE_FAULT);
+}
+
 /*
  * Irq flags or an iterator, @id, are released. A caller may have the object: its slots are none any
  * more.
@@ -22086,7 +22194,7 @@ static int release_frame_resources(struct bpf_verifier_env *env)
  * worklist like every other state. @st is taken.
  *
  * With a conflict there is no pad. @st is dropped, and bpf_pads_settle() rejects the program.
- * A frame that cannot unwind is a conflict.
+ * A frame that cannot unwind is a conflict. At an access to arena check_arena_site() saw to both.
  */
 static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state *st, int insn_idx,
 			enum bpf_site_kind kind)
@@ -22094,18 +22202,20 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 	struct bpf_func_state *frame = st->frame[st->curframe];
 	struct bpf_subprog_info *sub = &env->subprog_info[frame->subprogno];
 	struct bpf_verifier_state *cur = env->cur_state;
-	int cur_idx = env->insn_idx, err;
-	struct bpf_pad_plan *plan;
+	int cur_idx = env->insn_idx, err = 0;
+	struct bpf_pad_plan *plan = NULL;
 	bool print_state;
 
 	env->cur_state = st;
 	env->insn_idx = insn_idx;
-	plan = bpf_pad_visit(env, st, insn_idx, kind);
-	err = PTR_ERR_OR_ZERO(plan);
-	if (!err && !plan->conflict)
-		plan->conflict = frame_cannot_unwind(env, st);
-	if (err || plan->conflict)
-		goto out;
+	if (kind != BPF_SITE_FAULT) {
+		plan = bpf_pad_visit(env, st, insn_idx, kind);
+		err = PTR_ERR_OR_ZERO(plan);
+		if (!err && !plan->conflict)
+			plan->conflict = frame_cannot_unwind(env, st);
+		if (err || plan->conflict)
+			goto out;
+	}
 
 	err = release_frame_resources(env);
 	if (err)
@@ -22126,6 +22236,7 @@ static int unwind_frame(struct bpf_verifier_env *env, struct bpf_verifier_state 
 		env->pads_late = true;
 	}
 	sub->did_unwind |= st->unwound;
+	sub->must_unwind |= st->unwound && plan && bpf_pad_must_unwind(env, plan);
 	if (env->log.level & BPF_LOG_LEVEL2)
 		verbose(env, "from %d to %s of func#%d\n", insn_idx,
 			st->unwound ? "unwind_exit" : "exit", frame->subprogno);
@@ -23803,6 +23914,8 @@ static int do_check_main(struct bpf_verifier_env *env)
  * The same when a loop gets may_goto and what went through the loop before is not there any more,
  * see bpf_flow_loop_gets_guards().
  * The same when a global subprog unwinds whose callers didn't know, see unwind_frame().
+ * The same when accesses to arena turn out to be other sites than they were taken for, see
+ * check_arena_site(), subprog_cannot_unwind() and bpf_pads_settle().
  *
  * A round that is dropped counts as paths that never run. What it found out about the insns, the
  * subprogs and the prog stays. Each of these is made for more than one state that gets to an insn:
@@ -23822,8 +23935,9 @@ static int do_check_all(struct bpf_verifier_env *env)
 		ret = do_check_main(env);
 		ret = ret ?: do_check_subprogs(env);
 		/* a state that never gets to a site makes no conflict there */
+		if (!ret && !round_is_dropped(env))
+			ret = bpf_pads_settle(env);
 		if (!round_is_dropped(env)) {
-			ret = ret ?: bpf_pads_settle(env);
 			if (!ret)
 				bpf_pads_log(env);
 			return ret;

@@ -405,6 +405,7 @@ enum bpf_site_kind {
 	BPF_SITE_GUARD,		/* may_goto that the verifier adds before the insn */
 	BPF_SITE_RECURSION,	/* the check at the entry of a recursive subprog */
 	BPF_SITE_CALL,		/* unwind_goto that the verifier adds after the insn, a call */
+	BPF_SITE_FAULT,		/* the same after an access to arena, for when it faults */
 };
 
 /* The classes of resources that a landing pad can release */
@@ -670,6 +671,11 @@ struct bpf_func_state {
 	u32 entry_refs;
 	u32 entry_rcu_locks;
 	u32 entry_preempt_locks;
+	/*
+	 * A copy of the state left the frame at an access to arena, and since then the frame made
+	 * no call and no store to the stack of a caller, see check_arena_site()
+	 */
+	bool fault_edge;
 
 	/* The following fields should be last. See copy_func_state() */
 	/* The state of the stack. Each element of the array describes BPF_REG_SIZE
@@ -1037,6 +1043,10 @@ struct bpf_insn_aux_data {
 	u64 bb_end:1; /* last instruction of a basic block */
 	u64 loop_guard:1; /* may_goto is added in front of this instruction */
 	u64 guard_place:1; /* it's the place for may_goto if the loop needs one */
+	/* An access to arena, see check_arena_site() */
+	u64 fault_skips:1; /* when it faults it is skipped: there is no pad, or no way to unwind */
+	u64 fault_empty:1; /* in this round a state that holds nothing went by without a visit */
+	u64 fault_full:1; /* all states visit the plan */
 	u64 need_scev:1;
 	/* a jump in a loop: the edge that is not taken, bit 0, or the other one leaves the loop */
 	u64 edge_leaves:2;
@@ -1265,6 +1275,12 @@ struct bpf_subprog_info {
 	 * expected of it, see mark_unwind_above().
 	 */
 	bool did_unwind: 1;
+	/*
+	 * It did so where there is no other way out: at may_goto, at a recursion check, at
+	 * unwind_exit that it has, at a call of such a subprog. An access to arena that faults
+	 * has one: it is skipped. See bpf_pads_must_unwind().
+	 */
+	bool must_unwind: 1;
 	/* it cannot have hidden slots for these groups, bits by enum bpf_pad_group. For good. */
 	u8 no_slots: 4;
 	/* it has them for these. Each bpf_pads_settle() decides anew. */
@@ -1408,7 +1424,7 @@ struct bpf_verifier_env {
 	bool uses_arena_sp;		/* the program has insns with BPF_REG_ARENA_SP */
 	bool restart;			/* see bpf_flow_next_is_no_bound() */
 	bool guards_late;		/* see bpf_flow_loop_gets_guards() */
-	bool pads_late;			/* a global subprog unwinds: see do_check_all() */
+	bool pads_late;			/* a site is not what it seemed: see do_check_all() */
 	bool pad_releases;		/* see release_frame_resources() */
 	u32 loop_entry_cnt;		/* see loop_stack_entry.entry_id, callback_entry_id */
 	u32 walk_cnt;			/* see loop_stack_entry.walk_id */
@@ -1783,6 +1799,8 @@ struct bpf_pad_plan *bpf_pad_visit(struct bpf_verifier_env *env,
 				   enum bpf_site_kind kind);
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux);
+bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan);
+void bpf_pads_must_unwind(struct bpf_verifier_env *env);
 int bpf_pads_settle(struct bpf_verifier_env *env);
 bool bpf_pad_can_be_shared(const struct bpf_pad_plan *plan);
 bool bpf_obj_free_takes_lock(const struct btf *btf, u32 btf_id);

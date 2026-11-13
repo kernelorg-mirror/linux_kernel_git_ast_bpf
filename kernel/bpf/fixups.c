@@ -627,6 +627,9 @@ static bool site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_p
 		for_each_set_bit(s, plan->callees, env->subprog_cnt)
 			if (env->subprog_info[s].can_unwind)
 				return true;
+		return false;
+	case BPF_SITE_FAULT:
+		return !env->insn_aux_data[i].fault_skips;
 	}
 	return false;
 }
@@ -651,7 +654,8 @@ static void mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 			if (sub->can_unwind || !sub->bail_unwinds)
 				continue;
 			for (i = sub->start; i < sub[1].start && !sub->can_unwind; i++) {
-				sub->can_unwind = aux[i].loop_guard;
+				sub->can_unwind = aux[i].loop_guard ||
+						  (aux[i].fault_empty && !aux[i].fault_skips);
 				for (plan = aux[i].pad_plans; plan; plan = plan->next)
 					sub->can_unwind |= site_is_used(env, i, plan);
 			}
@@ -689,6 +693,9 @@ static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new
 	for (i = env->subprog_info[s].start; i <= last; i++) {
 		/* no state got there in the last round of the main pass: the empty plan will do */
 		if (aux[i].loop_guard && !bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
+			goto nomem;
+		/* nothing is held there: the same */
+		if (aux[i].fault_empty && !bpf_pad_plan_get(env, i, BPF_SITE_FAULT))
 			goto nomem;
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
 			/* bpf_insert_recursion_checks() emits the pad of the check */
@@ -756,21 +763,31 @@ static int emit_goto_pad(struct bpf_verifier_env *env, int i, int s, int added,
 	return 3;
 }
 
+/* The plan of insn @i if it is a site that has unwind_goto after it: a call, an access to arena */
+static const struct bpf_pad_plan *unwind_goto_plan(struct bpf_verifier_env *env, int i)
+{
+	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[i];
+	const struct bpf_pad_plan *plan;
+
+	plan = bpf_pad_plan(aux, BPF_SITE_CALL) ?: bpf_pad_plan(aux, BPF_SITE_FAULT);
+	return plan && site_is_used(env, i, plan) ? plan : NULL;
+}
+
 /*
- * Add unwind_goto after the calls that are sites, see check_unwound_arrival(). Nothing stands
- * between a call and its unwind_goto, and jumps to the insn that follows the call go past it.
+ * Add unwind_goto after the calls that are sites, see check_unwound_arrival(), and after the
+ * accesses to arena that are, see check_arena_site(). Nothing stands between such an insn and its
+ * unwind_goto, and jumps to the insn that follows it go past unwind_goto.
  * @added: how many insns the pads after each subprog have.
  */
 static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 {
-	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	const struct bpf_pad_plan *plan;
 	struct bpf_insn insn;
 	int i, s, err;
 
 	for (i = 1; i < env->prog->len; i++) {
-		plan = bpf_pad_plan(&aux[i - 1], BPF_SITE_CALL);
-		if (!plan || !site_is_used(env, i - 1, plan))
+		plan = unwind_goto_plan(env, i - 1);
+		if (!plan)
 			continue;
 		s = bpf_find_containing_subprog(env, i) - env->subprog_info;
 		emit_goto_pad(env, i, s, added[s], plan, BPF_UNWIND_GOTO, &insn);
@@ -782,14 +799,10 @@ static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 	if (err)
 		return err;
 
-	aux = env->insn_aux_data;
-	for (i = 0; i < env->prog->len; i++) {
-		plan = bpf_pad_plan(&aux[i], BPF_SITE_CALL);
-		if (!plan || !site_is_used(env, i, plan))
-			continue;
-		/* the insn that follows the call may be dead code */
-		aux[++i].seen = 1;
-	}
+	/* the insn that follows the site may be dead code */
+	for (i = 0; i < env->prog->len; i++)
+		if (unwind_goto_plan(env, i))
+			env->insn_aux_data[++i].seen = 1;
 	return 0;
 }
 
@@ -843,9 +856,9 @@ static int insert_slot_stores(struct bpf_verifier_env *env, struct bpf_insn *buf
 
 /*
  * Emit what the main pass decided about the sites: may_goto before the insns that it
- * marked, see check_loop_guard(), unwind_goto after calls, the landing pads, and the stores to the
- * hidden slots that the pads read. What a pad does it did to the states that left the frame at the
- * site, see unwind_frame().
+ * marked, see check_loop_guard(), unwind_goto after calls and after accesses to arena, the landing
+ * pads, and the stores to the hidden slots that the pads read. What a pad does it did to the states
+ * that left the frame at the site, see unwind_frame().
  */
 int bpf_insert_sites(struct bpf_verifier_env *env)
 {
@@ -857,7 +870,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	bool indirect;
 
 	for (i = 0; i < len; i++)
-		if (aux[i].loop_guard || aux[i].pad_plans)
+		if (aux[i].loop_guard || aux[i].pad_plans || aux[i].fault_empty)
 			break;
 	if (i == len)
 		return 0;

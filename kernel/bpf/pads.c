@@ -8,6 +8,7 @@
  *   - the check at the entry of a recursive subprog
  *   - a call of a subprog that comes back with unwind_exit and has no unwind_goto after it
  *   - a call of a helper whose callback comes back that way
+ *   - a load, a store or an atomic insn in arena, when it faults
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
  * then 'r0 = 0' and unwind_exit, or exit in a frame that the kernel called.
@@ -35,7 +36,7 @@
  *               dropped from the state, by the functions that a release call of the program ends
  *               up in, and what is left of the state goes to the caller.
  *   settle      bpf_pads_settle(), after a round of the main pass that counts. A conflict rejects
- *               the program.
+ *               the program, unless the site has another way out.
  *   code        bpf_pad_insns(). The insns of the pad of a plan, and their aux data.
  *   emission    bpf_insert_sites() in fixups.c, after the main pass.
  *
@@ -54,7 +55,7 @@
  * and stack slots that are live at the site.
  *
  * Plans live as long as a round of the main pass. What survives a round grows to the safe side:
- * bail_unwinds, did_unwind.
+ * bail_unwinds, did_unwind, must_unwind, fault_skips, fault_full.
  *
  * The frames of a program are unwound one by one. The pad of a frame ends in unwind_exit, which
  * goes to unwind_goto after the call in the caller, and that goes to the pad of the caller:
@@ -145,6 +146,23 @@
  * and irq flags have to be released that way, and a dynptr ahead of the pointer that it was made
  * from. States that acquired them in different orders can be a conflict.
  *
+ * An ACCESS TO ARENA has unwind_goto after it like a call. It is no code: the handler of the fault
+ * looks it up. The pad gets the registers and the stack as they were before the access.
+ *
+ *	t = bpf_task_from_pid(pid);			   r6 = r0
+ *	...						   ...
+ *	v = node->val;					   r1 = *(u64 *)(r7 + 8)
+ *	bpf_task_release(t);				   unwind_goto pad
+ *							   ...
+ *						      pad: r1 = r6
+ *							   call bpf_task_release
+ *							   r0 = 0
+ *							   exit
+ *
+ * It is the one site with another way out: without unwind_goto the handler skips the access, a load
+ * reads 0. That is what a conflict means here, see skip_faults(): it does not reject the program.
+ * Nor does a call that has nothing but such accesses below it, see bpf_pad_must_unwind().
+ *
  * HIDDEN SLOTS are the fallback for what neither the program counter nor a place tells. Here only
  * the program knows what 'own' means:
  *
@@ -190,7 +208,7 @@
  * compared when that is done. What no store can follow is noted as well, see 'no_slots'.
  * A function has slots for a GROUP of classes, see enum bpf_pad_group and settle_slots(). All its
  * pads release that group through the slots alone. All else stays as it is: a program that needs no
- * slot has no store and no byte of stack for them.
+ * slot has no store and no byte of stack for them. A site with another way out never asks for them.
  */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
@@ -423,8 +441,10 @@ void bpf_pads_new_round(struct bpf_verifier_env *env)
 	int i;
 
 	env->pads_late = false;
-	for (i = 0; i < env->prog->len; i++)
+	for (i = 0; i < env->prog->len; i++) {
 		bpf_pad_plans_free(&env->insn_aux_data[i]);
+		env->insn_aux_data[i].fault_empty = false;
+	}
 }
 
 /* How many sections of @class the current frame of @st has entered and not left */
@@ -1535,13 +1555,53 @@ static int settle_plan(struct bpf_verifier_env *env, struct bpf_pad_plan *plan)
 	return err;
 }
 
-/* The groups of which @plan has something that its pad cannot tell whether it is held */
+/*
+ * Is the pad the only way out of the site of @plan? An access to arena that faults can be skipped.
+ * So can all of them below a call, unless a subprog comes back to the call that is left elsewhere.
+ */
+bool bpf_pad_must_unwind(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+{
+	int s;
+
+	if (plan->kind != BPF_SITE_CALL)
+		return plan->kind != BPF_SITE_FAULT;
+	for_each_set_bit(s, plan->callees, env->subprog_cnt)
+		if (env->subprog_info[s].must_unwind)
+			return true;
+	return false;
+}
+
+/* What a subprog is left for may be found after its callers were unwound: look at them again */
+void bpf_pads_must_unwind(struct bpf_verifier_env *env)
+{
+	struct bpf_subprog_info *sub;
+	const struct bpf_pad_plan *plan;
+	bool changed;
+	int i, s;
+
+	do {
+		changed = false;
+		for (s = 0; s < env->subprog_cnt; s++) {
+			sub = &env->subprog_info[s];
+			for (i = sub->start; i < sub[1].start && !sub->must_unwind; i++) {
+				plan = bpf_pad_plan(&env->insn_aux_data[i], BPF_SITE_CALL);
+				sub->must_unwind = plan && bpf_pad_must_unwind(env, plan);
+				changed |= sub->must_unwind;
+			}
+		}
+	} while (changed);
+}
+
+/*
+ * The groups of which @plan has something that its pad cannot tell whether it is held. Slots are
+ * stores on the normal path: none where there is another way out.
+ */
 static u8 plan_needs_slots(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
 {
 	u8 groups = plan->sections_differ;
 	int i, err;
 
-	if (plan->conflict)
+	if (plan->conflict || !bpf_pad_must_unwind(env, plan))
 		return 0;
 	for (i = 0; i < plan->nr_ents; i++) {
 		err = settle_ent(env, plan, &plan->ents[i]);
@@ -1561,6 +1621,16 @@ static int slot_words(const struct bpf_pad_note *note)
 static bool plan_has_slots(const struct bpf_pad_plan *plan)
 {
 	return plan->kind != BPF_SITE_RECURSION && !plan->conflict;
+}
+
+/* Has @plan room for @slots entries in place of those that it has of @group? */
+static bool plan_has_room(const struct bpf_pad_plan *plan, int group, int slots)
+{
+	int i;
+
+	for (i = 0; i < plan->nr_ents; i++)
+		slots += class_group(plan->ents[i].class) != group;
+	return slots <= BPF_PAD_MAX_ENTS;
 }
 
 /*
@@ -1617,7 +1687,7 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	struct bpf_subprog_info *sub = &env->subprog_info[s];
 	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	struct bpf_pad_note *note, *notes[BPF_PAD_MAX_ENTS];
-	int i, j, err, left, nr = 0, slots = 0, words = 0;
+	int i, err, nr = 0, slots = 0, words = 0;
 	struct bpf_pad_plan *plan;
 
 	for (i = sub->start; i < sub[1].start; i++) {
@@ -1635,14 +1705,11 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	}
 	if (!nr)
 		return 0;
-	for (i = sub->start; i < sub[1].start; i++) {
-		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
-			for (j = 0, left = 0; j < plan->nr_ents; j++)
-				left += class_group(plan->ents[j].class) != group;
-			if (plan_has_slots(plan) && left + slots > BPF_PAD_MAX_ENTS)
+	for (i = sub->start; i < sub[1].start; i++)
+		for (plan = aux[i].pad_plans; plan; plan = plan->next)
+			if (plan_has_slots(plan) && !plan_has_room(plan, group, slots) &&
+			    bpf_pad_must_unwind(env, plan))
 				return 0;
-		}
-	}
 	sub->hidden_words += words;
 	if (!bpf_hidden_slots_fit(env)) {
 		sub->hidden_words -= words;
@@ -1650,6 +1717,9 @@ static int subprog_take_slots(struct bpf_verifier_env *env, int s, int group)
 	}
 	for (i = sub->start; i < sub[1].start; i++) {
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
+			/* it has another way out */
+			if (plan_has_slots(plan) && !plan_has_room(plan, group, slots))
+				plan->conflict = BPF_CONFLICT_TOO_MUCH;
 			err = plan_has_slots(plan) ? plan_take_slots(plan, group, notes, nr) : 0;
 			if (err)
 				return err;
@@ -1883,6 +1953,7 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_SITE_GUARD]		= "may_goto",
 		[BPF_SITE_RECURSION]		= "recursion check",
 		[BPF_SITE_CALL]			= "call",
+		[BPF_SITE_FAULT]		= "arena access",
 	};
 	static const char * const why[] = {
 		[BPF_CONFLICT_SECTIONS_DIFFER]	= "the number of sections differs",
@@ -1908,6 +1979,39 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 			plan->sections[BPF_PAD_PREEMPT]);
 }
 
+/*
+ * The site of @plan, at insn @i, has no pad. An access to arena: it is skipped when it faults.
+ * What follows the access was verified, and less unwinds than the main pass looked at.
+ * Or it is a call, and only accesses to arena unwind below it. They are skipped: what came back to
+ * the call cannot unwind, nor can what came back to the calls in there. All is done again.
+ */
+static void skip_faults(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
+{
+	DECLARE_BITMAP(todo, BPF_MAX_SUBPROGS + 2);
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	int s, cnt = env->subprog_cnt;
+	struct bpf_subprog_info *sub;
+
+	if (plan->kind == BPF_SITE_FAULT) {
+		aux[i].fault_skips = true;
+		return;
+	}
+	env->pads_late = true;
+	bitmap_copy(todo, plan->callees, cnt);
+	while ((s = find_first_bit(todo, cnt)) < cnt) {
+		__clear_bit(s, todo);
+		sub = &env->subprog_info[s];
+		if (!sub->bail_unwinds)
+			continue;
+		sub->bail_unwinds = false;
+		for (i = sub->start; i < sub[1].start; i++) {
+			plan = bpf_pad_plan(&aux[i], BPF_SITE_CALL);
+			if (plan)
+				bitmap_or(todo, todo, plan->callees, cnt);
+		}
+	}
+}
+
 /* A round of the main pass that counts is over: all states have visited the plans */
 int bpf_pads_settle(struct bpf_verifier_env *env)
 {
@@ -1915,6 +2019,7 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	struct bpf_pad_plan *plan;
 	int i, s, err;
 
+	bpf_pads_must_unwind(env);
 	err = settle_slots(env);
 	if (err)
 		return err;
@@ -1924,14 +2029,16 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 			if (err < 0)
 				return err;
 			plan->conflict = err;
-			if (plan->conflict) {
+			if (plan->conflict && bpf_pad_must_unwind(env, plan)) {
 				print_plan(env, i, plan);
 				return -EINVAL;
 			}
+			if (plan->conflict)
+				skip_faults(env, i, plan);
 		}
 	}
 	/* The main pass is over: the program has no access to its stack that is not known. */
-	for (s = 0; s < env->subprog_cnt; s++) {
+	for (s = 0; !env->pads_late && s < env->subprog_cnt; s++) {
 		sub = &env->subprog_info[s];
 		if (!sub->hidden_words)
 			continue;
