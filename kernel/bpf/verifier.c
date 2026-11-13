@@ -6314,6 +6314,45 @@ out:
 	return ret;
 }
 
+/*
+ * Is there room in the stack for the hidden slots of the subprogs, see bpf_pads_settle()? No room
+ * is a conflict, so check_max_stack_depth() is asked ahead of time: in the end what it says is the
+ * verdict. The main pass may go on and find more calls: what is found out about the subprogs here
+ * is dropped, a subprog that is not recursive so far may turn out to be.
+ */
+bool bpf_hidden_slots_fit(struct bpf_verifier_env *env)
+{
+	size_t size = (env->subprog_cnt + 1) * sizeof(env->subprog_info[0]);
+	bool priv_stack = env->prog->aux->jits_use_priv_stack;
+	u32 max_depth = env->max_stack_depth, log_level = env->log.level;
+	struct bpf_subprog_info *sub, *saved;
+	int s, err;
+
+	saved = kvmemdup(env->subprog_info, size, GFP_KERNEL_ACCOUNT);
+	if (!saved)
+		return false;
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		if (sub->hidden_words)
+			sub->stack_depth = bpf_stack_depth_with_slots(sub);
+	}
+	env->log.level = 0;
+	err = check_max_stack_depth(env);
+	env->log.level = log_level;
+	for (s = 0; s < env->subprog_cnt; s++) {
+		sub = &env->subprog_info[s];
+		/* see insert_arena_stack_get() */
+		if (sub->hidden_words && sub->arena_stack_entry &&
+		    sub->stack_depth + MAX_BPF_FUNC_REG_ARGS * BPF_REG_SIZE > env->stack_limit)
+			err = -EACCES;
+	}
+	memcpy(env->subprog_info, saved, size);
+	env->max_stack_depth = max_depth;
+	env->prog->aux->jits_use_priv_stack = priv_stack;
+	kvfree(saved);
+	return !err;
+}
+
 static int __check_buffer_access(struct bpf_verifier_env *env,
 				 const char *buf_info,
 				 const struct bpf_reg_state *reg,
