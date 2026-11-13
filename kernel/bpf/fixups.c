@@ -643,7 +643,8 @@ static bool site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_p
 /*
  * The main pass looked at more ways to unwind than the program has in the end: a subprog that is
  * not recursive after all has no check. Find the subprogs that get unwind_exit: those that are
- * left at a site. A call is a site if it calls one of them.
+ * left at a site. A call is a site if it calls one of them. The main program leaves with exit: it
+ * is marked for bpf_check_attach_target().
  */
 static void mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 {
@@ -657,7 +658,7 @@ static void mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 		changed = false;
 		for (s = 0; s < env->subprog_cnt; s++) {
 			sub = &env->subprog_info[s];
-			if (sub->can_unwind || !sub->bail_unwinds)
+			if (sub->can_unwind || (s && !sub->bail_unwinds))
 				continue;
 			for (i = sub->start; i < sub[1].start && !sub->can_unwind; i++) {
 				sub->can_unwind = aux[i].loop_guard ||
@@ -668,6 +669,7 @@ static void mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 			changed |= sub->can_unwind;
 		}
 	} while (changed);
+	env->prog->aux->can_unwind = env->subprog_info[0].can_unwind;
 }
 
 /*
