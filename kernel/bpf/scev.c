@@ -2069,7 +2069,7 @@ static int join_successor(struct bpf_verifier_env *env, int cur_header, int succ
 	 * The header of an irreducible loop does not dominate its body. An insn whose immediate
 	 * dominator is outside of the loop is reached from a secondary entry, without the header.
 	 * The env at the source of an entering edge is not known: all '?', like a new env. So the
-	 * insn is a join point with a phi for every live register, see join_added_edges().
+	 * insn is a join point with a phi for every live register.
 	 */
 	idom = env->idoms[succ_idx];
 	if (cur_header >= 0 && succ_idx != cur_header &&
@@ -2114,27 +2114,6 @@ static bool can_compute_subprog_scev(struct bpf_verifier_env *env, struct bpf_su
 			return false;
 	}
 	return true;
-}
-
-/*
- * The edges that the verifier adds, see bpf_head_guard_target(): bpf_insn_successors() doesn't have
- * them. They leave all loops. The env at their source is not known: @cur_env is all '?'. So their
- * target is a join point with a phi for every live register.
- */
-static int join_added_edges(struct bpf_verifier_env *env, struct bpf_subprog_info *sub,
-			    struct env *old_env, struct env *cur_env)
-{
-	int i, t, err;
-
-	for (i = sub->start; i < (sub + 1)->start; i++) {
-		t = bpf_head_guard_target(env, i);
-		if (t < 0)
-			continue;
-		err = join_successor(env, -1, t, old_env, cur_env);
-		if (err)
-			return err;
-	}
-	return 0;
 }
 
 /*
@@ -2655,9 +2634,6 @@ static int compute_scev_for_loop(struct bpf_verifier_env *env, int cur_header, i
 	if (!cur_loop) {
 		/* no backedge overwrites it */
 		header_env->empty = false;
-		err = join_added_edges(env, sub, old_env, cur_env);
-		if (err)
-			goto out;
 	}
 
 	while (worklist->nr) {

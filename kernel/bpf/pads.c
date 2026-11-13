@@ -10,7 +10,7 @@
  *   - a call of a helper whose callback comes back that way
  * The resources that the frame acquired since its entry have to be released on the way out. The
  * code that does it is a LANDING PAD: calls of the functions that the program itself would call,
- * then 'r0 = 0' and unwind_exit, or exit in a frame that cannot unwind.
+ * then 'r0 = 0' and unwind_exit, or exit in a frame that the kernel called.
  *
  *	bpf_rcu_read_lock();				   call bpf_rcu_read_lock
  *	do {						1: ...
@@ -1276,7 +1276,9 @@ static void print_plan(struct bpf_verifier_env *env, int i, const struct bpf_pad
 		[BPF_CONFLICT_NOT_ALWAYS_HELD]	= "a resource is held on some paths only",
 		[BPF_CONFLICT_NO_PLACE]		= "no place has the handle on all paths",
 		[BPF_CONFLICT_ORDER_DIFFERS]	= "the order of the releases differs",
-		[BPF_CONFLICT_CANNOT_UNWIND]	= "the frame cannot unwind",
+		[BPF_CONFLICT_CANNOT_UNWIND]	=
+			"the JIT or the helper that calls the function cannot unwind it",
+		[BPF_CONFLICT_NO_EXIT]		= "the function has no exit",
 		[BPF_CONFLICT_CALLER_SAVED]	= "a handle is in R0-R5 only",
 	};
 	int j;

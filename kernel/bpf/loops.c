@@ -351,7 +351,7 @@ next:
 
 /*
  * Without @flags: the jumps that leave a loop themselves. That tells where the verifier may add
- * may_goto. It takes the constants that hold with these edges to follow a flag.
+ * may_goto.
  * Once more after scalar evolution, which knows the jumps that count. The flags that were found
  * are remembered.
  */

@@ -434,6 +434,7 @@ enum bpf_pad_conflict {
 	BPF_CONFLICT_NO_PLACE,
 	BPF_CONFLICT_ORDER_DIFFERS,
 	BPF_CONFLICT_CANNOT_UNWIND,
+	BPF_CONFLICT_NO_EXIT,
 	BPF_CONFLICT_CALLER_SAVED,
 };
 
@@ -503,13 +504,6 @@ struct bpf_pad_plan {
 	/* emission: the pad is that many insns after the last one of the subprog */
 	u32 pad;
 	bool far;			/* 16 bits may not be enough to get there from the site */
-};
-
-/* Where may_goto that the verifier adds goes, see check_loop_guard() */
-enum bpf_guard_edge {
-	BPF_NO_GUARD_EDGE,
-	BPF_GUARD_LEAVES_SUBPROG,
-	BPF_GUARD_LEAVES_LOOP,
 };
 
 struct loop_stack_entry {
@@ -922,9 +916,7 @@ struct bpf_loop {
 	bool walk_failed;
 	/* functions of the program are called in the loop */
 	bool has_calls;
-	/* not rt_bounded: there are places for may_goto, see guard_to in bpf_insn_aux_data */
-	bool has_guards;
-	/* and it is going to be there, see bpf_flow_loop_gets_guards() */
+	/* not rt_bounded: it gets may_goto, see bpf_flow_loop_gets_guards() */
 	bool guarded;
 	/* a state went through it without the edges of may_goto, see bpf_flow_loop_gets_guards() */
 	bool no_guard_edges;
@@ -1008,10 +1000,6 @@ struct bpf_insn_aux_data {
 	u64 bb_end:1; /* last instruction of a basic block */
 	u64 loop_guard:1; /* may_goto is added in front of this instruction */
 	u64 guard_place:1; /* it's the place for may_goto if the loop needs one */
-	u64 guard_at_header:1; /* there is no better place than the head of the loop */
-	u64 guard_no_unwind:1; /* it cannot unwind from here, at least sometimes */
-	u64 guard_unset_reg:1; /* where it goes a register is read that is not set here */
-	u64 guard_edge_dropped:1; /* an edge of may_goto from here was dropped */
 	u64 need_scev:1;
 	/* a jump in a loop: the edge that is not taken, bit 0, or the other one leaves the loop */
 	u64 edge_leaves:2;
@@ -1073,8 +1061,6 @@ struct bpf_insn_aux_data {
 	 * stop, -1 if none was found. It doesn't stop the loops around that one either.
 	 */
 	s32 not_stopped;
-	/* where may_goto in front of this instruction goes */
-	s32 guard_to;
 	/* additional information about the loop if this instruction is a loop header */
 	struct bpf_loop *loop;
 	/* the sites at this instruction, as far as the round of the main pass got to them */
@@ -1696,7 +1682,7 @@ struct bpf_verifier_state *bpf_flow_keep_state(struct bpf_verifier_env *env,
 					       const struct bpf_verifier_state *st);
 int bpf_flow_deliver(struct bpf_verifier_env *env, struct bpf_verifier_state *st,
 		     int insn_idx, int prev_insn_idx);
-bool bpf_flow_guard_edge(struct bpf_verifier_env *env, int insn_idx, enum bpf_guard_edge edge);
+bool bpf_flow_guard_edge(struct bpf_verifier_env *env, int insn_idx);
 int bpf_flow_next(struct bpf_verifier_env *env, int *prev_insn_idx);
 void bpf_flow_print_way(struct bpf_verifier_env *env, u64 log_pos, int head, int i);
 int bpf_flow_call(struct bpf_verifier_env *env, struct bpf_verifier_state *caller,
@@ -2026,29 +2012,6 @@ const char *bpf_subprog_name(const struct bpf_verifier_env *env, int subprog);
 int bpf_jmp_offset(struct bpf_insn *insn);
 struct bpf_iarray *bpf_insn_successors(struct bpf_verifier_env *env, u32 idx);
 
-/*
- * Where the program goes from may_goto and from the checks that the verifier adds:
- * - May_goto in front of a jump goes where the jump goes, with the registers and the stack
- *   as they are in front of the jump. bpf_insn_successors() has that edge.
- * - A subprog that is out of budget is left at once, see unwind_frame(). No insn of it follows.
- * - May_goto in front of the head of a loop goes to where the loops around it are left: from
- *   @idx to what is returned here, -1 if there is none. No such edge. The registers and the
- *   stack are what they are before @idx.
- *
- * The main pass looks at the states that go there. What is computed from the graph before
- * the main pass has to take these edges into account where the main pass believes it:
- * - Against the direction of the edges, liveness: a register that is live at the target is
- *   live at @idx. Stack that is dead at @idx stays dead: a read of it at the target is
- *   rejected.
- * - In the direction of the edges, bpf_compute_const_regs() and compute_subprog_args(): what
- *   holds on all edges of the graph to the target doesn't hold on this one.
- */
-static inline int bpf_head_guard_target(const struct bpf_verifier_env *env, int idx)
-{
-	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[idx];
-
-	return aux->guard_at_header ? aux->guard_to : -1;
-}
 bool bpf_subprog_is_global(const struct bpf_verifier_env *env, int subprog);
 int bpf_unwound_retval(struct bpf_verifier_env *env, int subprog);
 bool bpf_prog_may_run_in_nmi(const struct bpf_verifier_env *env);

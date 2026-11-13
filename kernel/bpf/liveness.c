@@ -2136,12 +2136,6 @@ redo:
 		memcpy(at_out, at_in[i], sizeof(at_out));
 		memcpy(at_stack_out, &at_stack_in[(size_t)i * nslots], nslots * sizeof(*at_stack_out));
 
-		ti = bpf_head_guard_target(env, idx) - start;
-		if (ti >= 0)
-			changed |= arg_track_join_all(env, idx, start + ti, at_in[ti],
-						      &at_stack_in[(size_t)ti * nslots],
-						      at_out, at_stack_out, nslots);
-
 		arg_track_xfer(env, insn, idx, at_out, at_stack_out, nslots,
 			       at_stack_arg_entry, instance, callsites);
 		arg_track_log(env, insn, idx, at_in[i], &at_stack_in[(size_t)i * nslots], at_out,
@@ -2891,7 +2885,6 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 			u32 new_out = 0;
 			u32 new_in = 0;
 			u32 use;
-			int t;
 
 			succ = bpf_insn_successors(env, insn_idx);
 			for (int s = 0; s < succ->cnt; ++s)
@@ -2908,10 +2901,6 @@ int bpf_compute_live_registers(struct bpf_verifier_env *env)
 			if (bpf_is_callx(&insns[insn_idx]))
 				use |= callx_use;
 			new_in = (new_out & ~live->def) | use;
-			/* may_goto that is added at the head of a loop goes there */
-			t = bpf_head_guard_target(env, insn_idx);
-			if (t >= 0)
-				new_in |= state[t].in;
 			if (new_out != live->out || new_in != live->in) {
 				live->in = new_in;
 				live->out = new_out;

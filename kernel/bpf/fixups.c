@@ -611,11 +611,6 @@ static struct bpf_insn budget_exit_insn(struct bpf_verifier_env *env, struct bpf
  */
 #define BPF_GUARD_NEAR	2048
 
-static bool guard_leaves_subprog(const struct bpf_insn_aux_data *aux)
-{
-	return aux->loop_guard && !aux->guard_no_unwind;
-}
-
 /* Does the program leave the frame at the site of @plan, which is at insn @i? */
 static bool site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_pad_plan *plan)
 {
@@ -623,11 +618,11 @@ static bool site_is_used(struct bpf_verifier_env *env, int i, const struct bpf_p
 
 	switch (plan->kind) {
 	case BPF_SITE_GUARD:
-		return guard_leaves_subprog(&env->insn_aux_data[i]);
+		return env->insn_aux_data[i].loop_guard;
 	case BPF_SITE_RECURSION:
 		return bpf_find_containing_subprog(env, i)->recursive;
 	case BPF_SITE_CALL:
-		if (!plan->visited || plan->conflict)
+		if (!plan->visited)
 			return false;
 		for_each_set_bit(s, plan->callees, env->subprog_cnt)
 			if (env->subprog_info[s].can_unwind)
@@ -656,7 +651,7 @@ static void mark_subprogs_that_unwind(struct bpf_verifier_env *env)
 			if (sub->can_unwind || !sub->bail_unwinds)
 				continue;
 			for (i = sub->start; i < sub[1].start && !sub->can_unwind; i++) {
-				sub->can_unwind = guard_leaves_subprog(&aux[i]);
+				sub->can_unwind = aux[i].loop_guard;
 				for (plan = aux[i].pad_plans; plan; plan = plan->next)
 					sub->can_unwind |= site_is_used(env, i, plan);
 			}
@@ -693,7 +688,7 @@ static int append_pads(struct bpf_verifier_env *env, int s, struct bpf_insn *new
 
 	for (i = env->subprog_info[s].start; i <= last; i++) {
 		/* no state got there in the last round of the main pass: the empty plan will do */
-		if (guard_leaves_subprog(&aux[i]) && !bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
+		if (aux[i].loop_guard && !bpf_pad_plan_get(env, i, BPF_SITE_GUARD))
 			goto nomem;
 		for (plan = aux[i].pad_plans; plan; plan = plan->next) {
 			/* bpf_insert_recursion_checks() emits the pad of the check */
@@ -795,19 +790,17 @@ static int insert_unwind_gotos(struct bpf_verifier_env *env, const int *added)
 
 /*
  * Emit what the main pass decided about the sites: may_goto before the insns that it
- * marked, see check_loop_guard(), unwind_goto after calls, and the landing pads. It verified the
- * edge from the insn to where may_goto goes. What a pad does it did to the states that left the
- * frame at the site, see unwind_frame().
+ * marked, see check_loop_guard(), unwind_goto after calls, and the landing pads. What a pad does it
+ * did to the states that left the frame at the site, see unwind_frame().
  */
 int bpf_insert_sites(struct bpf_verifier_env *env)
 {
 	struct bpf_insn_aux_data *aux = env->insn_aux_data, *pad_aux;
 	int len = env->prog->len, i, s, to, n, err = 0;
 	const struct bpf_pad_plan *plan;
-	int *front = NULL, *added, *moved;
+	int *front = NULL, *added;
 	struct bpf_insn *patch, *insn;
 	bool indirect;
-	s64 off;
 
 	for (i = 0; i < len; i++)
 		if (aux[i].loop_guard || aux[i].pad_plans)
@@ -816,18 +809,14 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		return 0;
 	mark_subprogs_that_unwind(env);
 
-	/*
-	 * How many insns the pads after the subprog have. And how far the pads before the
-	 * subprog moved it: guard_to is from the time before.
-	 */
-	added = kvzalloc_objs(int, 2 * env->subprog_cnt, GFP_KERNEL_ACCOUNT);
+	/* How many insns the pads after the subprog have */
+	added = kvzalloc_objs(int, env->subprog_cnt, GFP_KERNEL_ACCOUNT);
 	patch = kvzalloc_objs(*patch, BPF_PAD_MAX_INSNS, GFP_KERNEL_ACCOUNT);
 	pad_aux = kvzalloc_objs(*pad_aux, BPF_PAD_MAX_INSNS, GFP_KERNEL_ACCOUNT);
 	if (!added || !patch || !pad_aux) {
 		err = -ENOMEM;
 		goto out;
 	}
-	moved = added + env->subprog_cnt;
 	for (s = 0; s < env->subprog_cnt && !err; s++) {
 		added[s] = append_pads(env, s, patch, pad_aux);
 		if (added[s] < 0)
@@ -839,9 +828,7 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		goto out;
 	aux = env->insn_aux_data;
 	len = env->prog->len;
-	for (s = 0, n = 0; s < env->subprog_cnt; s++) {
-		moved[s] = n;
-		n += added[s];
+	for (s = 0; s < env->subprog_cnt; s++) {
 		if (!added[s])
 			continue;
 		i = env->subprog_info[s + 1].start;
@@ -874,21 +861,8 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 		if (!aux[i].loop_guard)
 			continue;
 		s = bpf_find_containing_subprog(env, i) - env->subprog_info;
-		if (guard_leaves_subprog(&aux[i])) {
-			plan = bpf_pad_plan(&aux[i], BPF_SITE_GUARD);
-			n = emit_goto_pad(env, i, s, added[s], plan, 0, patch);
-		} else {
-			to = aux[i].guard_to + moved[s];
-			/* What is after moves with this patch. The others are not there yet. */
-			off = to > i ? to - i : to - i - 1;
-			if (off > S16_MAX || off < S16_MIN) {
-				verbose(env, "exit of the loop is too far from insn %d for may_goto\n", i);
-				err = -ERANGE;
-				break;
-			}
-			patch[0] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, off, 0);
-			n = 1;
-		}
+		plan = bpf_pad_plan(&aux[i], BPF_SITE_GUARD);
+		n = emit_goto_pad(env, i, s, added[s], plan, 0, patch);
 		front[i] = n;
 		patch[n] = env->prog->insnsi[i];
 		/* A jump to itself is a back edge. It goes through may_goto like the others. */
@@ -912,11 +886,8 @@ int bpf_insert_sites(struct bpf_verifier_env *env)
 	/*
 	 * bpf_do_misc_fixups() keeps the address of the count of may_goto in a register that is
 	 * dead at the may_goto. A new insn has no live_regs_before: all registers would be dead.
-	 * What is live in front of the insn is live in front of its guard. Nothing else is:
-	 *  - The guard of a jump goes where the jump goes.
-	 *  - What is live where the guard at the head of a loop goes is live at the head,
-	 *    see bpf_head_guard_target().
-	 *  - A landing pad reads places, which are live before the insn.
+	 * What is live in front of the insn is live in front of its guard. Nothing else is: a
+	 * landing pad reads places, which are live before the insn.
 	 */
 	aux = env->insn_aux_data;
 	for (i = 0, n = 0; i < len; i++) {

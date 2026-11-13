@@ -250,7 +250,7 @@ int bpf_compute_const_regs(struct bpf_verifier_env *env)
 	struct const_arg_info ci_out[MAX_BPF_REG];
 	struct bpf_iarray *succ;
 	bool changed;
-	int i, r, t;
+	int i, r;
 
 	/* kvzalloc zeroes memory, so all entries start as CONST_ARG_UNVISITED (0) */
 	ci_in = kvzalloc_objs(*ci_in, insn_cnt, GFP_KERNEL_ACCOUNT);
@@ -263,15 +263,6 @@ int bpf_compute_const_regs(struct bpf_verifier_env *env)
 
 		for (r = 0; r < MAX_BPF_REG; r++)
 			ci_in[start][r] = unknown;
-	}
-	/*
-	 * The program gets from the head of a loop to where the loop is left, once the loops are
-	 * known. That is not an edge of the graph.
-	 */
-	for (i = 0; i < insn_cnt; i++) {
-		t = bpf_head_guard_target(env, i);
-		for (r = 0; r < MAX_BPF_REG && t >= 0; r++)
-			ci_in[t][r] = unknown;
 	}
 
 redo:
@@ -559,9 +550,8 @@ static void leave_cond_jump(struct bpf_verifier_env *env, int h, int idx,
  * The jumps on the way know constants too: 'r7 = 0; if w1 != 0 goto a; ...; a: if r7 == 2 goto
  * head' leaves the loop when w1 is not 0.
  *
- * Every edge that the program has at run time counts, the edges of may_goto that the verifier
- * adds too. May_goto of the loop and of the loops around it leaves the loop. A nested loop can
- * get one in front of a jump that the numbers decide the other way. So a nested loop: never.
+ * Every edge that the program has at run time counts. May_goto that the verifier adds is none:
+ * the frame is left there, see unwind_frame(). A nested loop: never.
  *
  * What is kept is the answer for the two edges of each jump: insn_aux_data->edge_leaves.
  */
