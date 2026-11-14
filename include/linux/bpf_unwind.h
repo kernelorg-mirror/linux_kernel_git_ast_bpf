@@ -231,13 +231,18 @@ do {										\
  * authentication, like paciasp. clang has __builtin_dwarf_cfa() stand for the
  * frame pointer on arm64 and __builtin_sponentry() for the stack pointer at
  * entry. The shadow call stack holds a copy, which the epilogue prefers, when
- * it is on: a dynamic one stays off where there is pointer authentication.
+ * it is on: a dynamic one stays off where there is pointer authentication. A
+ * static one is on next to it and holds what the compiler pushed: gcc and clang
+ * from 21 on sign first, so the copy is the word of the frame record, clang up
+ * to 20 pushes first and pops last, so the copy is plain. KASAN has the shadow
+ * call stack poisoned, like the compiler the asm is not checked.
  */
 static __always_inline void bpf_unwind_leave(void)
 {
 	unsigned long *slot = (unsigned long *)__builtin_frame_address(0) + 1;
-	unsigned long from = ptrauth_strip_kernel_insn_pac(*slot);
-	unsigned long to = bpf_unwind_target(from);
+	unsigned long old = *slot;
+	unsigned long from = ptrauth_strip_kernel_insn_pac(old);
+	unsigned long to = bpf_unwind_target(from), sig = to;
 
 	WARN_ON_ONCE(to == from);
 #ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
@@ -250,17 +255,18 @@ static __always_inline void bpf_unwind_leave(void)
 #endif
 
 		asm("pacia1716" : "+r"(x17) : "r"(x16));
-		to = x17;
+		sig = x17;
 	}
 #endif
 	/* the store is the last before the return, see x86-64 above */
-	WRITE_ONCE(*slot, to);
+	WRITE_ONCE(*slot, sig);
 #ifdef CONFIG_SHADOW_CALL_STACK
 	if (scs_is_enabled()) {
-		unsigned long *scs;
+		unsigned long copy;
 
-		asm("mov %0, x18" : "=r"(scs));
-		WRITE_ONCE(scs[-1], to);
+		asm volatile("ldur %0, [x18, #-8]" : "=r"(copy));
+		asm volatile("stur %0, [x18, #-8]"
+			     : : "r"(copy == old ? sig : to) : "memory");
 	}
 #endif
 }
