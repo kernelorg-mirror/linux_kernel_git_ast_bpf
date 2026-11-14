@@ -49,7 +49,7 @@
 #include <linux/filter.h>
 #include <linux/stringify.h>
 
-#if defined(CONFIG_X86_64) && defined(CONFIG_CC_HAS_ASM_GOTO_OUTPUT)
+#if defined(CONFIG_X86_64) && !defined(CONFIG_UML) && defined(CONFIG_CC_HAS_ASM_GOTO_OUTPUT)
 
 #include <asm/asm.h>
 #include <asm/extable_fixup_types.h>
