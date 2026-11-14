@@ -179,16 +179,14 @@ static __always_inline void bpf_unwind_leave(void)
 #endif
 
 /*
- * r0 is x0, which only a register variable of the macro can name. So the macro
- * lands at a label of its own, assigns it there as on the way out, and goes on
- * to the pad. The arguments are evaluated before the register variables are
- * set: a call among them, instrumentation included, would clobber what the
- * variables hold, which the compiler does not keep across a call.
+ * r0 is x0, which only a register variable can name, and gcc does not keep what
+ * such a variable holds across a call. KCOV puts a call at the head of each
+ * block, and an asm goto ends its block, so C code after it reads x0 too late on
+ * either edge. Hence the asm moves x0 to r0 itself, behind the call and where
+ * the callback unwinds to, out of line. For the same reason the arguments are
+ * evaluated before the register variables are set.
  */
 #define __bpf_call_cb(type, fn, a1, a2, a3, a4, a5, r0, unwound)		\
-	___bpf_call_cb(__UNIQUE_ID(unwound), type, fn, a1, a2, a3, a4, a5, r0, unwound)
-
-#define ___bpf_call_cb(lbl, type, fn, a1, a2, a3, a4, a5, r0, unwound)		\
 do {										\
 	u64 __f = (u64)(long)(fn), __1 = (u64)(long)(a1), __2 = (u64)(long)(a2),	\
 	    __3 = (u64)(long)(a3), __4 = (u64)(long)(a4), __5 = (u64)(long)(a5);	\
@@ -207,21 +205,19 @@ do {										\
 										\
 	asm_goto_output(BPF_KCFI_CHECK(type)					\
 		 "	blr x15\n"						\
-		 "1:\n"								\
-		 __ASM_EXTABLE_RAW("1b", "%l[" __stringify(lbl) "]",		\
-				   __stringify(EX_TYPE_BPF), "0")			\
-		 : "=r"(__c0), "=r"(__c1), "=r"(__c2), "=r"(__c3), "=r"(__c4),	\
-		   "=r"(__c15)							\
+		 "1:	mov %[ret], x0\n"					\
+		 "	.subsection 1\n"					\
+		 "3:	mov %[ret], x0\n"					\
+		 "	b %l[" __stringify(unwound) "]\n"			\
+		 "	.previous\n"						\
+		 __ASM_EXTABLE_RAW("1b", "3b", __stringify(EX_TYPE_BPF), "0")	\
+		 : [ret] "=r"(r0), "=r"(__c0), "=r"(__c1), "=r"(__c2),		\
+		   "=r"(__c3), "=r"(__c4), "=r"(__c15)				\
 		 : "r"(__fn), "r"(__a0), "r"(__a1), "r"(__a2), "r"(__a3),	\
 		   "r"(__a4)							\
 		 : "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",	\
 		   "x14", "x16", "x17", BPF_CB_CLOBBER_X18 "x30", "memory", "cc"	\
-		 : lbl);							\
-	if (0) {								\
-lbl:		(r0) = __c0;							\
-		goto unwound;							\
-	}									\
-	(r0) = __c0;								\
+		 : unwound);							\
 } while (0)
 
 /*
