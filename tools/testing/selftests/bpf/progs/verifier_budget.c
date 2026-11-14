@@ -154,12 +154,25 @@ __naked void loop_in_main_retval(void)
 	);
 }
 
+/* 0 is BPF_OK: the packet would go on */
+SEC("lwt_in")
+__description("budget: a loop in the main prog of lwt ends it with BPF_DROP")
+__arch_x86_64
+__arch_arm64
+__success __retval(2)
+int loop_in_main_lwt(struct __sk_buff *skb)
+{
+	while (*(volatile unsigned long *)&one)
+		;
+	return 7;
+}
+
 /* The prog has no exit insn. Out of budget it is unwound all the same. */
 SEC("tc")
 __description("budget: a loop that is left only through bpf_throw()")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 int loop_left_through_throw(struct __sk_buff *skb)
 {
 	for (;;)
@@ -265,12 +278,12 @@ SEC("tc")
 __description("budget: a spin lock is held and the code behind the loop counts on its exit")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("exit")
 __xlated("r1 = 0x{{.*}}")
 __xlated("call unknown")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 int lock_in_global(void *ctx)
 {
@@ -520,7 +533,7 @@ SEC("tc")
 __description("budget: the subprog with the loop and its caller hold resources")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("unwind_goto pc+")
 __xlated("...")
@@ -530,7 +543,7 @@ __xlated("call kernel-function")
 __xlated("r1 = r6")
 __xlated("if r1 == 0x0 goto pc+1")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 __xlated("...")
 __xlated("r0 = 7")
@@ -547,7 +560,7 @@ __xlated("r1 = *(u64 *)(r10 -8)")
 __xlated("r1 += -8")
 __xlated("r2 = 0")
 __xlated("call unknown")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("unwind_exit")
 __naked void resources_in_two_frames(void)
 {
@@ -721,14 +734,14 @@ SEC("tc")
 __description("budget: objects of two types in the same register")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
-__xlated("r0 = 0{{$}}")
+__xlated("r0 = 2{{$}}")
 __xlated("exit")
 __xlated("r1 = r{{[6-9]}}")
 __xlated("r2 = 0x{{[0-9a-f]*[1-9a-f][0-9a-f]*}}")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 int objects_of_two_types(void *ctx)
 {
@@ -922,7 +935,7 @@ SEC("tc")
 __description("budget: an iterator in an RCU section, irq flags and a dynptr are held")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("r0 = 7")
 __xlated("exit")
@@ -937,7 +950,7 @@ __xlated("r1 = r10")
 __xlated("r1 += -16")
 __xlated("r2 = 0")
 __xlated("call unknown")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 __naked void objects_in_the_stack(void)
 {
@@ -982,7 +995,7 @@ SEC("tc")
 __description("budget: references are held on some paths or may be NULL")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("r0 = 7")
 __xlated("exit")
@@ -997,7 +1010,7 @@ __xlated("call unknown")
 __xlated("r1 = *(u64 *)(r10 -8)")
 __xlated("if r1 == 0x0 goto pc+1")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 __naked void references_or_null(void)
 {
@@ -1177,7 +1190,7 @@ SEC("tc")
 __description("budget: a node of a list is held on some paths, the object is what is dropped")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("r13 = *(u64 *)(r10 -8)")
 __xlated("r13 += -8")
@@ -1245,7 +1258,7 @@ SEC("tc")
 __description("budget: calls in a loop that starts at the first insn acquire, a jump goes past one")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __log_level(2)
 __msg("may_goto at 15: ref@10(*fp-24) if not 0 ref@10(*fp-16) if not 0 ref@0(*fp-8) if not 0 rcu=0 preempt=0")
 __xlated("...")
@@ -1307,7 +1320,7 @@ SEC("tc")
 __description("budget: a lock with irq flags that may fail is held on some paths")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("r2 += -16")
 __xlated("*(u64 *)(r10 -24) = r1")
@@ -1323,7 +1336,7 @@ __xlated("r1 = *(u64 *)(r10 -24)")
 __xlated("if r1 == 0x0 goto pc+2")
 __xlated("r2 = *(u64 *)(r10 -32)")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 __naked void res_lock_irq_flags_on_some_paths(void)
 {
@@ -1356,7 +1369,7 @@ SEC("tc")
 __description("budget: the prog is in one RCU section or in two")
 __arch_x86_64
 __arch_arm64
-__success __retval(0)
+__success __retval(2)
 __log_level(2)
 __msg("may_goto at 9: rcu@5(*fp-16) if not 0 rcu@0(*fp-8) if not 0 rcu=0 preempt=0")
 __xlated("...")

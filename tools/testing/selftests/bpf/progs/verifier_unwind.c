@@ -710,7 +710,7 @@ __success __retval(7)
 __xlated("0: call pc+4")
 __xlated("1: unwind_goto pc+1")
 __xlated("2: exit")
-__xlated("3: r0 = 0")
+__xlated("3: r0 = 2")
 __xlated("4: exit")
 __naked int global_no_unwind_goto(void)
 {
@@ -726,7 +726,7 @@ __description("unwind: no unwind_goto after a call of a static subprog")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__success __retval(0)
+__success __retval(2)
 __naked int static_no_unwind_goto(void)
 {
 	asm volatile (
@@ -1003,7 +1003,7 @@ __description("unwind: callback unwinds")
 __arch_x86_64
 __arch_arm64
 __load_if_JITed()
-__success __retval(0)
+__success __retval(2)
 __naked int callback_unwinds(void)
 {
 	asm volatile (

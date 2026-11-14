@@ -162,7 +162,7 @@ static long cb_waits(u32 i, long *sum)
 SEC("tc")
 __description("unwind cb: a loop in the callback of bpf_loop is out of time")
 __arch_x86_64 __arch_arm64 __load_if_JITed()
-__success __retval(0)
+__success __retval(2)
 int loop_in_cb(void *ctx)
 {
 	long sum = 7;
@@ -284,7 +284,7 @@ __naked int loop_cb_r0_known(void)
 SEC("tc")
 __description("unwind cb: a helper in the pad starts its rounds afresh")
 __arch_x86_64 __arch_arm64 __load_if_JITed()
-__success __retval(0)
+__success __retval(2)
 __naked int loop_cb_unwinds_then_loops(void)
 {
 	asm volatile (
@@ -434,7 +434,7 @@ static bool less_waits(struct bpf_rb_node *a, const struct bpf_rb_node *b)
 SEC("tc")
 __description("unwind cb: a loop in the comparator of bpf_rbtree_add is out of time")
 __arch_x86_64 __arch_arm64 __load_if_JITed()
-__success __retval(0)
+__success __retval(2)
 int loop_in_comparator(void *ctx)
 {
 	struct node_data *n;

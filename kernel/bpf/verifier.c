@@ -21938,9 +21938,16 @@ int bpf_flow_loop_enter(struct bpf_verifier_env *env, bool *backedge, bool *drop
 
 /*
  * What the program returns when the verifier unwinds it, see unwind_frame(). No code of the program
- * makes that value. Where check_return_code() has a range with 0 in it, 0 refuses or
- * changes nothing, but for an LSM hook that returns an errno: there 0 lets the operation go on.
- * A range without 0 is [1, 1]: hooks that cannot refuse.
+ * makes that value, so it is the one that refuses, drops or changes nothing. That is 0, but:
+ *
+ *	tc					TC_ACT_SHOT, 0 is TC_ACT_OK
+ *	lwt, flow dissector			BPF_DROP, 0 is BPF_OK
+ *	lsm, the hook returns an errno		-EPERM, 0 lets the operation go on
+ *	the range is [1, 1]			1, hooks that cannot refuse
+ *
+ * Two values can be wrong in a way that is not known at load time: a cls_bpf classifier that is not
+ * in direct-action mode takes 2 for a class, a stream parser of sk_skb takes 0 for a message that
+ * is not complete.
  * An extension returns into the program that it extends, with the value of that program.
  * A subprog is left with the same value: its callers may pass it on, see bpf_site_has_value().
  * The exception callback gets it and decides. A landing pad that the program has can replace it.
@@ -21950,6 +21957,19 @@ int bpf_unwound_retval(struct bpf_verifier_env *env)
 	struct bpf_prog *prog = env->prog;
 	struct bpf_retval_range range;
 
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_SCHED_CLS:
+	case BPF_PROG_TYPE_SCHED_ACT:
+		return TC_ACT_SHOT;
+	case BPF_PROG_TYPE_LWT_IN:
+	case BPF_PROG_TYPE_LWT_OUT:
+	case BPF_PROG_TYPE_LWT_XMIT:
+	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+		return BPF_DROP;
+	default:
+		break;
+	}
 	while (prog->type == BPF_PROG_TYPE_EXT)
 		prog = prog->aux->dst_prog;
 	if (get_func_retval_range(prog, &range) && range.minval < 0)

@@ -73,37 +73,37 @@ __naked void load_in_main(void)
 		:: __imm_addr(arena) : __clobber_all);
 }
 
-#define FAULT(sec, name, insns)							\
+#define FAULT(sec, val, name, insns)						\
 SEC(sec)									\
 __description("fault: " #name)							\
-__success __retval(0)								\
+__success __retval(val)								\
 __naked void name(void)								\
 {										\
 	asm volatile (NO_PAGE insns "r0 = 7; exit;" :: TASK_IMM : __clobber_all); \
 }
 
-FAULT("socket", store, "*(u32 *)(r8 + 0) = 1;")
+FAULT("socket", 0, store, "*(u32 *)(r8 + 0) = 1;")
 /* On x86-64 two native insns of it can fault */
-FAULT("socket", fetch_or, "r3 = 1; r3 = atomic_fetch_or((u64 *)(r8 + 0), r3);")
+FAULT("socket", 0, fetch_or, "r3 = 1; r3 = atomic_fetch_or((u64 *)(r8 + 0), r3);")
 /* 'w0 = w0' is added after the insn. The mark of the shared pad stays on the insn. */
-FAULT("socket", cmpxchg32, "r0 = 1; r1 = 2; w0 = cmpxchg32_32(r8 + 0, w0, w1); r9 = r0;")
+FAULT("socket", 0, cmpxchg32, "r0 = 1; r1 = 2; w0 = cmpxchg32_32(r8 + 0, w0, w1); r9 = r0;")
 /* .. and it comes after unwind_goto, not in front of it */
-FAULT("tc", cmpxchg32_task, ACQUIRE_TASK(r6)
+FAULT("tc", 2, cmpxchg32_task, ACQUIRE_TASK(r6)
       "w0 = 0; w2 = 1; w0 = cmpxchg32_32(r8 + 0, w0, w2); r9 = r0;" RELEASE_TASK(r6))
 /* R0-R5 are as before the access: they are places */
-FAULT("tc", task_in_r0, ACQUIRE_TASK(r0) "r2 = *(u32 *)(r8 + 0);" RELEASE_TASK(r0))
+FAULT("tc", 2, task_in_r0, ACQUIRE_TASK(r0) "r2 = *(u32 *)(r8 + 0);" RELEASE_TASK(r0))
 /* The register that the insn would load is the place of the task: the pad gets it as it was */
-FAULT("tc", xchg_of_the_task, ACQUIRE_TASK(r6)
+FAULT("tc", 2, xchg_of_the_task, ACQUIRE_TASK(r6)
       "r7 = r6; r6 = xchg_64(r8 + 0, r6);" RELEASE_TASK(r7))
 /* The frame is in the private stack, r9 on x86-64: the landing pad finds the task there */
-FAULT("raw_tp", private_stack, "r1 = 42; *(u64 *)(r10 - 512) = r1;" ACQUIRE_TASK(r6)
+FAULT("raw_tp", 0, private_stack, "r1 = 42; *(u64 *)(r10 - 512) = r1;" ACQUIRE_TASK(r6)
       "*(u64 *)(r10 - 8) = r6; r6 = 0; r2 = *(u32 *)(r8 + 0); r6 = *(u64 *)(r10 - 8);"
       RELEASE_TASK(r6))
 
 /* unwind_goto is an entry in the exception table: the native code has nothing after the load */
 SEC("tc")
 __description("fault: a task is held")
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("r2 = *(u32 *)(r8 +0)")
 __xlated("unwind_goto pc+4")
@@ -113,7 +113,7 @@ __xlated("r0 = 7")
 __xlated("exit")
 __xlated("r1 = r6")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 __arch_x86_64
 __jited("	movl	(%r14,%r12), %esi")
@@ -137,12 +137,12 @@ struct bpf_spin_lock lock_b SEC(".data.lock_b") __hidden;
 /* One insn takes one of two locks. What the prog keeps for its own unlock tells which. */
 SEC("tc")
 __description("fault: one of two locks in global variables is held")
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("exit")
 __xlated("r1 = r6")
 __xlated("call {{.*}}")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __naked void one_of_two_locks(void)
 {
 	asm volatile (
@@ -170,7 +170,7 @@ __naked void one_of_two_locks(void)
  */
 SEC("tc")
 __description("fault: a task is held on some paths, the pointer is NULL on the others")
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("r2 = *(u32 *)(r8 +0)")
 __xlated("unwind_goto pc+")
@@ -179,7 +179,7 @@ __xlated("exit")
 __xlated("r1 = r6")
 __xlated("if r1 == 0x0 goto pc+1")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __naked void task_or_null(void)
 {
 	asm volatile (
@@ -207,13 +207,13 @@ __naked void task_or_null(void)
  */
 SEC("tc")
 __description("fault: a task is held on some paths, the state that holds it comes first")
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("exit")
 __xlated("r1 = r6")
 __xlated("if r1 == 0x0 goto pc+1")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __naked void task_first_or_null(void)
 {
 	asm volatile (
@@ -273,7 +273,7 @@ static unsigned long loads(void)
 
 SEC("tc")
 __description("fault: a load in a subprog, the caller holds a task")
-__success __retval(0)
+__success __retval(2)
 __xlated("...")
 __xlated("call pc+")
 __xlated("unwind_goto pc+4")
@@ -281,11 +281,11 @@ __xlated("...")
 __xlated("exit")
 __xlated("r1 = r6")
 __xlated("call kernel-function")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("exit")
 __xlated("...")
 __xlated("exit")
-__xlated("r0 = 0")
+__xlated("r0 = 2")
 __xlated("unwind_exit")
 __naked void load_in_subprog(void)
 {
@@ -489,7 +489,7 @@ __noinline int global_fault(void)
 
 SEC("tc")
 __description("fault: a load in a global subprog, the caller holds an object")
-__success __retval(0)
+__success __retval(2)
 int cancel_arena_global(struct __sk_buff *ctx)
 {
 	struct foo *f;
