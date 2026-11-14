@@ -124,7 +124,8 @@ do {										\
 /*
  * The return address of the helper is the word below its canonical frame
  * address. The pad is in the frame that BPF code called, see above, so there is
- * a pad to go to: a miss is a bug, and the exception would be lost in a return.
+ * a pad to go to. It is the return address itself after 'unwind_goto +0': the
+ * JIT emits no code for unwind_goto, so the same address says nothing of a miss.
  * The store is the last thing before the return, into the frame of the function
  * itself, which a compiler may take for a dead store: hence WRITE_ONCE(), as
  * lkdtm writes its return address through a volatile pointer.
@@ -132,10 +133,8 @@ do {										\
 static __always_inline void bpf_unwind_leave(void)
 {
 	unsigned long *slot = (unsigned long *)__builtin_dwarf_cfa() - 1;
-	unsigned long to = bpf_unwind_target(*slot);
 
-	WARN_ON_ONCE(to == *slot);
-	WRITE_ONCE(*slot, to);
+	WRITE_ONCE(*slot, bpf_unwind_target(*slot));
 }
 
 #elif defined(CONFIG_ARM64) && defined(CONFIG_CC_HAS_ASM_GOTO_OUTPUT)
