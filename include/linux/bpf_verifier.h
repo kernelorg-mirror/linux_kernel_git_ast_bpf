@@ -445,13 +445,13 @@ enum bpf_pad_conflict {
 /*
  * A landing pad has a limit: that many sections of a class, that many entries, and that many insns:
  * per argument of a release two to load it, per entry a test, the calls, one to save the value,
- * four to leave.
+ * three to tell the struct_ops, four to leave.
  */
 #define BPF_PAD_MAX_SECTIONS	8
 #define BPF_PAD_MAX_ENTS	8
 #define BPF_PAD_MAX_ARGS	2
 #define BPF_PAD_MAX_INSNS	(BPF_PAD_MAX_ENTS * (2 * BPF_PAD_MAX_ARGS + 2) + \
-				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 5)
+				 BPF_PAD_NR_SECTIONS * BPF_PAD_MAX_SECTIONS + 8)
 #define BPF_PAD_MAX_CANDS	6
 /*
  * A function has no more hidden slots than a pad has entries. The insns around a call: per slot

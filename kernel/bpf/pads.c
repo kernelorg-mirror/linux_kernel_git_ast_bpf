@@ -1502,11 +1502,25 @@ static int release_ents(struct bpf_verifier_env *env, const struct bpf_pad_plan 
 	return n;
 }
 
-/* The calls of the pad of @plan clobber the value that it has to pass on */
-static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan)
+/*
+ * The kernel called @subprog, the main program or an async callback: its pads end the invocation.
+ * They tell a struct_ops that wants to know, see bpf_prog_report_unwound().
+ */
+static bool pad_reports(const struct bpf_verifier_env *env, int subprog)
+{
+	const struct bpf_struct_ops *st_ops = env->prog->aux->st_ops;
+
+	return st_ops && st_ops->unwound &&
+	       (!subprog || !env->subprog_info[subprog].bail_unwinds);
+}
+
+/* The calls of the pad of @plan, a site in @subprog, clobber the value that it has to pass on */
+static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
+			     int subprog)
 {
 	return bpf_site_has_value(env, plan->kind) &&
-	       (plan->nr_ents || plan->sections[BPF_PAD_RCU] || plan->sections[BPF_PAD_PREEMPT]);
+	       (plan->nr_ents || plan->sections[BPF_PAD_RCU] || plan->sections[BPF_PAD_PREEMPT] ||
+		pad_reports(env, subprog));
 }
 
 /*
@@ -1518,6 +1532,7 @@ static bool plan_saves_value(struct bpf_verifier_env *env, const struct bpf_pad_
 int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan, int subprog,
 		  struct bpf_insn *buf, struct bpf_insn_aux_data *aux)
 {
+	struct bpf_insn ld_aux[2] = { BPF_LD_IMM64(BPF_REG_1, (long)env->prog->aux) };
 	int value_off = env->subprog_info[subprog].value_off;
 	int src = bpf_site_value_reg(plan->kind), dst = BPF_REG_0;
 	int class, i, n = 0;
@@ -1525,7 +1540,7 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 	/* the main program hands the value to the exception callback */
 	if (!subprog && env->exception_callback_subprog)
 		dst = BPF_REG_1;
-	if (plan_saves_value(env, plan))
+	if (plan_saves_value(env, plan, subprog))
 		buf[n++] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, src, value_off);
 	n += release_ents(env, plan, PAD_TURN_RCU_ITERS, &buf[n], &aux[n]);
 	n += release_ents(env, plan, PAD_TURN_LOCKS, &buf[n], &aux[n]);
@@ -1533,7 +1548,12 @@ int bpf_pad_insns(struct bpf_verifier_env *env, const struct bpf_pad_plan *plan,
 		for (i = 0; i < plan->sections[class]; i++)
 			buf[n++] = release_call(class);
 	n += release_ents(env, plan, PAD_TURN_POINTERS, &buf[n], &aux[n]);
-	if (plan_saves_value(env, plan))
+	if (pad_reports(env, subprog)) {
+		buf[n++] = ld_aux[0];
+		buf[n++] = ld_aux[1];
+		buf[n++] = BPF_EMIT_KERNEL_CALL(bpf_prog_report_unwound);
+	}
+	if (plan_saves_value(env, plan, subprog))
 		buf[n++] = BPF_LDX_MEM(BPF_DW, dst, BPF_REG_FP, value_off);
 	else if (!bpf_site_has_value(env, plan->kind))
 		buf[n++] = BPF_MOV64_IMM(dst, bpf_unwound_retval(env));
@@ -2129,8 +2149,9 @@ int bpf_pads_settle(struct bpf_verifier_env *env)
 	for (i = 0; i < env->prog->len; i++) {
 		for (plan = env->insn_aux_data[i].pad_plans; plan; plan = plan->next) {
 			err = settle_plan(env, plan);
-			if (!err && plan_saves_value(env, plan))
-				err = take_value_word(env, bpf_find_containing_subprog(env, i));
+			sub = bpf_find_containing_subprog(env, i);
+			if (!err && plan_saves_value(env, plan, sub - env->subprog_info))
+				err = take_value_word(env, sub);
 			if (err < 0)
 				return err;
 			plan->conflict = err;
